@@ -1,0 +1,80 @@
+name: Windows x64 (scratch, run 2)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64 (build + examples)
+    runs-on: windows-2022
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 1 }
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Tools
+        run: |
+          cmake --version; ninja --version || choco install ninja -y; cl 2>&1 | head -1; nproc; df -h / | tail -1
+      - name: Configure
+        id: configure
+        continue-on-error: true
+        run: |
+          cmake -S llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/install" \
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=2
+      - name: Build clang and lld
+        id: clang
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        run: cmake --build build --target clang lld -- -k 0
+      - name: Install compiler
+        id: install
+        if: steps.clang.outcome == 'success'
+        continue-on-error: true
+        run: cmake --build build --target install-clang install-clang-resource-headers install-lld
+      - name: Build libc++ with the new compiler
+        id: runtimes
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          P="$PWD/install"
+          cmake -S runtimes -B build-rt -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$P" \
+            -DCMAKE_C_COMPILER="$P/bin/clang-cl.exe" -DCMAKE_CXX_COMPILER="$P/bin/clang-cl.exe" \
+            -DCMAKE_LINKER="$P/bin/lld-link.exe" \
+            -DLLVM_ENABLE_RUNTIMES="libcxx" -DLIBCXX_ENABLE_SHARED=OFF \
+            -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_BENCHMARKS=OFF -DLIBCXX_INSTALL_MODULES=ON
+          cmake --build build-rt --target install-cxx install-cxx-modules
+      - name: Examples
+        id: examples
+        if: steps.runtimes.outcome == 'success'
+        continue-on-error: true
+        run: |
+          P="$PWD/install"; cd scratch-examples
+          for f in hello reflect expansion contracts execution simd; do
+            echo "== $f"
+            "$P/bin/clang-cl.exe" /std:c++latest /EHsc -fuse-ld=lld -Xclang -nostdinc++ -imsvc "$P/include/c++/v1" \
+              $f.cpp /Fe:$f.exe -link "$P/lib/c++.lib" && ./$f.exe
+          done
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Windows x64"
+            echo "- configure: ${{ steps.configure.outcome }}"
+            echo "- build clang+lld: ${{ steps.clang.outcome }}"
+            echo "- compiler install: ${{ steps.install.outcome }}"
+            echo "- libc++ build: ${{ steps.runtimes.outcome }}"
+            echo "- examples: ${{ steps.examples.outcome }}"
+          } >> "$GITHUB_STEP_SUMMARY"
