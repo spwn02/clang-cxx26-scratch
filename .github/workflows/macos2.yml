@@ -1,0 +1,56 @@
+name: macOS arm64 (scratch, corrected)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 1 }
+      - name: Tools
+        run: |
+          brew install ninja || true
+          cmake --version; ninja --version; clang --version | head -1; sysctl -n hw.ncpu
+      - name: Configure
+        run: |
+          cmake -S llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/install" \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_BENCHMARKS=OFF -DLIBCXX_INSTALL_MODULES=ON \
+            -DLIBCXXABI_INCLUDE_TESTS=OFF
+      - name: Build clang and lld
+        run: ninja -C build clang lld
+      - name: List targets that exist
+        run: ninja -C build -t targets all | grep -E '^(runtimes|install-runtimes|install|install-cxx|install-cxxabi|install-cxx-modules|install-clang|install-lld)[:]' || true
+      - name: Build runtimes
+        run: ninja -C build runtimes
+      - name: Install
+        run: ninja -C build install
+      - name: Show install
+        run: |
+          ls install/bin | head -20; ls install/include/c++/v1 | head -5; ls install/lib | head -20
+          find install -name 'libc++.modules.json' -o -name 'std.cppm' | head
+      - name: Examples
+        run: |
+          P="$PWD/install"; cd scratch-examples; fail=0
+          for f in hello reflect expansion contracts execution simd; do
+            echo "== $f"
+            if "$P/bin/clang++" -std=c++26 -Wall -Wextra -Wpedantic -Werror -nostdlib++ -isystem "$P/include/c++/v1" \
+                 -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" $f.cpp -o $f && ./$f; then echo "PASS $f"; else echo "FAIL $f"; fail=1; fi
+          done
+          exit $fail
