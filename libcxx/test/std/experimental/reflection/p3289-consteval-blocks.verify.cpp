@@ -1,0 +1,48 @@
+//===----------------------------------------------------------------------===//
+//
+// Copyright 2024 Bloomberg Finance L.P.
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// UNSUPPORTED: c++03 || c++11 || c++14 || c++17 || c++20
+// ADDITIONAL_COMPILE_FLAGS:
+// ADDITIONAL_COMPILE_FLAGS:
+
+// <experimental/reflection>
+//
+// [reflection]
+
+#include <meta>
+
+
+                            // =====================
+                            // consteval_block_tuple
+                            // =====================
+
+namespace consteval_block_tuple {
+
+template<typename... Ts> struct Tuple {
+  struct storage;
+  consteval {
+    define_aggregate(^^storage, {data_member_spec(^^Ts, {.name="_"})...});
+  }
+  storage data;
+};
+
+Tuple<int, bool, char> tup;
+}  // namespace consteval_block_tuple
+
+                             // ==================
+                             // non_void_returning
+                             // ==================
+
+namespace non_void_returning {
+consteval { return 1; }  // expected-error {{should not return a value}}
+
+}  // namespace non_void_returning
+
+int main() { }

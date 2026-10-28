@@ -1,0 +1,330 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _LIBCPP___EXECUTION_RUN_LOOP_H
+#define _LIBCPP___EXECUTION_RUN_LOOP_H
+
+#include <__condition_variable/condition_variable.h>
+#include <__config>
+#include <__execution/completion_functions.h>
+#include <__execution/completion_signatures.h>
+#include <__execution/domain.h>
+#include <__execution/get_completion_signatures.h>
+#include <__execution/get_env.h>
+#include <__execution/get_forward_progress_guarantee.h>
+#include <__execution/get_scheduler.h>
+#include <__execution/get_stop_token.h>
+#include <__execution/operation_state.h>
+#include <__execution/scheduler.h>
+#include <__execution/sender.h>
+#include <__mutex/lock_guard.h>
+#include <__mutex/mutex.h>
+#include <__mutex/unique_lock.h>
+#include <__stop_token/stoppable_token.h>
+#include <__type_traits/is_nothrow_constructible.h>
+#include <__type_traits/is_same.h>
+#include <__type_traits/remove_cvref.h>
+#include <__utility/forward.h>
+#include <__utility/move.h>
+#include <cstddef>
+#include <exception>
+
+#if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
+#  pragma GCC system_header
+#endif
+
+_LIBCPP_PUSH_MACROS
+#include <__undef_macros>
+
+_LIBCPP_BEGIN_NAMESPACE_STD
+
+#if _LIBCPP_STD_VER >= 26 && _LIBCPP_HAS_THREADS
+
+namespace execution {
+
+class run_loop;
+class __run_loop_scheduler;
+class __run_loop_sender;
+
+// [exec.run.loop.types]
+// Not an aggregate (unlike the exposition text's bare-struct sketch): a class with a pure
+// virtual member function cannot be one, so a small constructor takes its place -- an
+// implementation detail invisible to anything outside this header.
+_LIBCPP_DIAGNOSTIC_PUSH
+_LIBCPP_CLANG_DIAGNOSTIC_IGNORED("-Wweak-vtables")
+struct __run_loop_opstate_base {
+  _LIBCPP_HIDE_FROM_ABI constexpr explicit __run_loop_opstate_base(run_loop* __loop) noexcept
+      : __loop(__loop), __next(nullptr) {}
+
+  virtual void __execute() noexcept = 0;
+  run_loop* __loop;
+  __run_loop_opstate_base* __next;
+
+protected:
+  _LIBCPP_HIDE_FROM_ABI ~__run_loop_opstate_base() = default;
+};
+_LIBCPP_DIAGNOSTIC_POP
+
+template <class _Rcvr>
+class __run_loop_opstate;
+
+// [exec.run.loop.types]: run-loop-scheduler.
+class __run_loop_scheduler {
+public:
+  using scheduler_concept = scheduler_tag;
+
+  _LIBCPP_HIDE_FROM_ABI constexpr explicit __run_loop_scheduler(run_loop* __loop) noexcept : __loop_(__loop) {}
+
+  _LIBCPP_HIDE_FROM_ABI friend constexpr bool operator==(const __run_loop_scheduler& __x,
+                                                          const __run_loop_scheduler& __y) noexcept {
+    return __x.__loop_ == __y.__loop_;
+  }
+
+  _LIBCPP_HIDE_FROM_ABI constexpr __run_loop_sender schedule() const noexcept;
+
+  // [exec.run.loop] does not pin down a forward progress guarantee for run-loop-scheduler.
+  // run_loop drives every scheduled item to completion on a single thread of execution (the
+  // one that calls run()), which is exactly the guarantee [intro.progress] describes as
+  // "parallel" (as opposed to "concurrent", which would require independent forward
+  // progress across agents that could block on each other) -- matching the answer other
+  // single-thread-executor sender implementations give for an equivalent scheduler.
+  _LIBCPP_HIDE_FROM_ABI constexpr forward_progress_guarantee query(get_forward_progress_guarantee_t) const noexcept {
+    return forward_progress_guarantee::parallel;
+  }
+
+  // [exec.sched]p6: the scheduler answers the completion queries of the attributes of schedule(*this) (also without an
+  // environment), the sender only completes with set_value and set_stopped.
+  template <class _Tag>
+    requires(is_same_v<_Tag, set_value_t> || is_same_v<_Tag, set_stopped_t>)
+  _LIBCPP_HIDE_FROM_ABI constexpr __run_loop_scheduler query(get_completion_scheduler_t<_Tag>) const noexcept {
+    return *this;
+  }
+  _LIBCPP_HIDE_FROM_ABI constexpr default_domain query(get_completion_domain_t<set_value_t>) const noexcept {
+    return {};
+  }
+
+private:
+  friend class __run_loop_sender;
+  run_loop* __loop_;
+};
+
+// [exec.run.loop.types]p5: the environment associated with schedule(run-loop-scheduler)
+// answers get_completion_scheduler<set_value_t>/get_completion_scheduler<set_stopped_t> with
+// the run-loop-scheduler instance schedule() was called on (run-loop-sender never completes
+// with set_error, so that tag is intentionally not answered here). Stores the scheduler by
+// value, so it's defined after __run_loop_scheduler rather than before it.
+class __run_loop_sndr_env {
+public:
+  _LIBCPP_HIDE_FROM_ABI constexpr explicit __run_loop_sndr_env(__run_loop_scheduler __sch) noexcept : __sch_(__sch) {}
+
+  template <class _Tag>
+    requires(is_same_v<_Tag, set_value_t> || is_same_v<_Tag, set_stopped_t>)
+  _LIBCPP_HIDE_FROM_ABI constexpr __run_loop_scheduler query(get_completion_scheduler_t<_Tag>) const noexcept {
+    return __sch_;
+  }
+
+private:
+  __run_loop_scheduler __sch_;
+};
+
+// [exec.run.loop.types]: run-loop-sender.
+class __run_loop_sender {
+public:
+  using sender_concept = sender_tag;
+
+  _LIBCPP_HIDE_FROM_ABI constexpr explicit __run_loop_sender(run_loop* __loop) noexcept : __loop_(__loop) {}
+
+  _LIBCPP_HIDE_FROM_ABI constexpr __run_loop_sndr_env get_env() const noexcept {
+    return __run_loop_sndr_env(__run_loop_scheduler(__loop_));
+  }
+
+  template <class _Rcvr>
+  _LIBCPP_HIDE_FROM_ABI constexpr __run_loop_opstate<remove_cvref_t<_Rcvr>> connect(_Rcvr&& __rcvr) const
+      noexcept(is_nothrow_constructible_v<remove_cvref_t<_Rcvr>, _Rcvr>);
+
+  // [exec.run.loop.types]p6: completion_signatures_of_t<run-loop-sender, E> is
+  // completion_signatures<set_value_t()> if unstoppable_token<stop_token_of_t<E>> is true,
+  // otherwise completion_signatures<set_value_t(), set_stopped_t()>. Genuinely
+  // Env-dependent, so -- matching <__execution/read_env.h>'s documented "dependent-sender-
+  // as-soft-failure behavior -- a single, non-variadic _Env
+  // parameter (rather than 0-or-1) means the zero-Env case simply has no viable overload
+  // instead of reporting dependent_sender_error.
+  template <class _Self, class _Env>
+  _LIBCPP_HIDE_FROM_ABI static consteval auto get_completion_signatures() {
+    if constexpr (unstoppable_token<stop_token_of_t<_Env>>) {
+      return completion_signatures<set_value_t()>{};
+    } else {
+      return completion_signatures<set_value_t(), set_stopped_t()>{};
+    }
+  }
+
+private:
+  run_loop* __loop_;
+};
+
+_LIBCPP_HIDE_FROM_ABI constexpr __run_loop_sender __run_loop_scheduler::schedule() const noexcept {
+  return __run_loop_sender(__loop_);
+}
+
+// [exec.run.loop.types]: run-loop-opstate<Rcvr>.
+template <class _Rcvr>
+class __run_loop_opstate final : private __run_loop_opstate_base {
+public:
+  using operation_state_concept = operation_state_tag;
+
+  template <class _Receiver>
+  _LIBCPP_HIDE_FROM_ABI constexpr __run_loop_opstate(run_loop* __loop, _Receiver&& __rcvr)
+      noexcept(is_nothrow_constructible_v<_Rcvr, _Receiver>)
+      : __run_loop_opstate_base(__loop), __rcvr_(std::forward<_Receiver>(__rcvr)) {}
+
+  __run_loop_opstate(const __run_loop_opstate&)            = delete;
+  __run_loop_opstate& operator=(const __run_loop_opstate&) = delete;
+
+  // [exec.run.loop.types]p10.3: start(o) is equivalent to `o.loop->push-back(addressof(o));`
+  // -- defined out-of-line below, after run_loop itself (a complete type here needs
+  // run_loop::__push_back to be a real, callable member).
+  _LIBCPP_HIDE_FROM_ABI constexpr void start() & noexcept;
+
+private:
+  // [exec.run.loop.types]p10.2: `get_stop_token(REC(o))`, directly on the receiver, as written
+  // (the wording is unchanged from P2300R10 and looks like a leftover of the pre-R5 design where
+  // receivers were queryable themselves). A stop token that is only exposed through
+  // get_env(rcvr) is therefore not consulted; likely a draft defect, kept literal on purpose.
+  _LIBCPP_HIDE_FROM_ABI_VIRTUAL void __execute() noexcept override {
+    if (std::get_stop_token(__rcvr_).stop_requested()) {
+      execution::set_stopped(std::move(__rcvr_));
+    } else {
+      execution::set_value(std::move(__rcvr_));
+    }
+  }
+
+  _Rcvr __rcvr_;
+};
+
+template <class _Rcvr>
+_LIBCPP_HIDE_FROM_ABI constexpr __run_loop_opstate<remove_cvref_t<_Rcvr>> __run_loop_sender::connect(_Rcvr&& __rcvr) const
+    noexcept(is_nothrow_constructible_v<remove_cvref_t<_Rcvr>, _Rcvr>) {
+  return __run_loop_opstate<remove_cvref_t<_Rcvr>>(__loop_, std::forward<_Rcvr>(__rcvr));
+}
+
+// [exec.run.loop]
+class run_loop {
+public:
+  // [exec.run.loop.ctor]p1: postconditions are count == 0, state == starting -- both are
+  // the default member initializers below, so the constructor body is empty. Written out
+  // (rather than `= default`) because `mutex`/`condition_variable`'s own default
+  // constructors are not themselves declared noexcept, and an explicitly-defaulted special
+  // member function's exception specification must match the implicit one exactly --
+  // an ordinary constructor with an explicit `noexcept` has no such constraint (a throw from
+  // a member's constructor here would call std::terminate, matching what `noexcept` means
+  // everywhere else).
+  _LIBCPP_HIDE_FROM_ABI run_loop() noexcept {}
+
+  run_loop(run_loop&&) = delete;
+
+  // [exec.run.loop.ctor]p2: terminate() unless count == 0 and state != running.
+  _LIBCPP_HIDE_FROM_ABI ~run_loop() {
+    if (__count_ != 0 || __state_ == __running) {
+      std::terminate();
+    }
+  }
+
+  _LIBCPP_HIDE_FROM_ABI __run_loop_scheduler get_scheduler() noexcept { return __run_loop_scheduler(this); }
+
+  // [exec.run.loop.members]p5-7.
+  _LIBCPP_HIDE_FROM_ABI void run() noexcept {
+    {
+      lock_guard<mutex> __lock(__mtx_);
+      if (__state_ == __starting) {
+        __state_ = __running;
+      }
+    }
+    while (__run_loop_opstate_base* __op = __pop_front()) {
+      __op->__execute();
+    }
+  }
+
+  // [exec.run.loop.members]p8-10. notify_one() is called while still holding __mtx_ (not
+  // after releasing it): releasing first would let a waiter that's already reacquired the
+  // lock inside cv.wait() return from run() and let ITS caller destroy this run_loop --
+  // including the condition_variable itself -- while this thread's notify_one() call is still
+  // in flight, a genuine use-after-free race. Only latent until parallel_scheduler existed:
+  // every prior run_loop user drove finish()/run() from the same thread that later destroyed
+  // the loop, so no second thread was ever around to race the notify against. First caught by
+  // a real ThreadSanitizer run exercising this_thread::sync_wait(schedule(parallel_scheduler)).
+  _LIBCPP_HIDE_FROM_ABI void finish() noexcept {
+    lock_guard<mutex> __lock(__mtx_);
+    __state_ = __finishing;
+    __cv_.notify_one();
+  }
+
+private:
+  template <class>
+  friend class __run_loop_opstate;
+
+  // [exec.run.loop.members]p1: blocks until either (count == 0 && state == finishing) --
+  // sets state to finished and returns nullptr -- or count > 0 -- pops and returns the front
+  // item, decrementing count.
+  _LIBCPP_HIDE_FROM_ABI __run_loop_opstate_base* __pop_front() noexcept {
+    unique_lock<mutex> __lock(__mtx_);
+    __cv_.wait(__lock, [this] { return __count_ > 0 || __state_ == __finishing; });
+    if (__count_ == 0) {
+      __state_ = __finished;
+      return nullptr;
+    }
+    __run_loop_opstate_base* __item = __head_;
+    __head_                         = __item->__next;
+    if (__head_ == nullptr) {
+      __tail_ = nullptr;
+    }
+    --__count_;
+    return __item;
+  }
+
+  // [exec.run.loop.members]p2-3: adds to the back, increments count, and synchronizes with
+  // the pop-front call that obtains this item. notify_one() is called under __mtx_ for the
+  // same use-after-free reason finish() does above -- a second thread calling push_back()
+  // concurrently with this run_loop's destruction is exactly the shape parallel_scheduler's
+  // worker threads can produce.
+  _LIBCPP_HIDE_FROM_ABI void __push_back(__run_loop_opstate_base* __item) noexcept {
+    lock_guard<mutex> __lock(__mtx_);
+    __item->__next = nullptr;
+    if (__tail_ != nullptr) {
+      __tail_->__next = __item;
+    } else {
+      __head_ = __item;
+    }
+    __tail_ = __item;
+    ++__count_;
+    __cv_.notify_one();
+  }
+
+  enum __state_t { __starting, __running, __finishing, __finished };
+
+  mutex __mtx_;
+  condition_variable __cv_;
+  __run_loop_opstate_base* __head_ = nullptr;
+  __run_loop_opstate_base* __tail_ = nullptr;
+  size_t __count_                  = 0;
+  __state_t __state_                = __starting;
+};
+
+template <class _Rcvr>
+_LIBCPP_HIDE_FROM_ABI constexpr void __run_loop_opstate<_Rcvr>::start() & noexcept {
+  __loop->__push_back(this);
+}
+
+} // namespace execution
+
+#endif // _LIBCPP_STD_VER >= 26 && _LIBCPP_HAS_THREADS
+
+_LIBCPP_END_NAMESPACE_STD
+
+_LIBCPP_POP_MACROS
+
+#endif // _LIBCPP___EXECUTION_RUN_LOOP_H

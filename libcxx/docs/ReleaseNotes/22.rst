@@ -1,0 +1,263 @@
+===========================================
+Libc++ 22.0.0 (In-Progress) Release Notes
+===========================================
+
+.. contents::
+   :local:
+   :depth: 2
+
+Written by the `Libc++ Team <https://libcxx.llvm.org>`_
+
+.. warning::
+
+   These are in-progress notes for the upcoming libc++ 22.0.0 release.
+   Release notes for previous releases can be found on
+   `the Download Page <https://releases.llvm.org/download.html>`_.
+
+Introduction
+============
+
+This document contains the release notes for the libc++ C++ Standard Library,
+part of the LLVM Compiler Infrastructure, release 22.0.0. Here we describe the
+status of libc++ in some detail, including major improvements from the previous
+release and new feature work. For the general LLVM release notes, see `the LLVM
+documentation <https://llvm.org/docs/ReleaseNotes.html>`_. All LLVM releases may
+be downloaded from the `LLVM releases web site <https://llvm.org/releases/>`_.
+
+For more information about libc++, please see the `Libc++ Web Site
+<https://libcxx.llvm.org>`_ or the `LLVM Web Site <https://llvm.org>`_.
+
+Note that if you are reading this file from a Git checkout or the
+main Libc++ web page, this document applies to the *next* release, not
+the current one. To see the release notes for a specific release, please
+see the `releases page <https://llvm.org/releases/>`_.
+
+What's New in Libc++ 22.0.0?
+==============================
+
+Implemented Papers
+------------------
+
+- P2592R3: Hashing support for ``std::chrono`` value classes (`Github <https://llvm.org/PR105358>`__)
+- P2321R2: ``zip`` (`Github <https://llvm.org/PR105169>`__)
+- P2988R12: ``std::optional<T&>`` (`Github <https://llvm.org/PR148131>`__)
+- P3044R2: sub-``string_view`` from ``string`` (`Github <https://llvm.org/PR148140>`__)
+- P3223R2: Making ``std::istream::ignore`` less surprising (`Github <https://llvm.org/PR148178>`__)
+- P3060R3: Add ``std::views::indices(n)`` (`Github <https://llvm.org/PR148175>`__)
+- P2404R3: Move-only types for ``equality_comparable_with``, ``totally_ordered_with``, and ``three_way_comparable_with``
+  (`Github <https://llvm.org/PR105210>`__)
+- P2641R4: Checking if a ``union`` alternative is active (``std::is_within_lifetime``)
+  (`Github <https://llvm.org/PR105381>`__)
+- P2835R7: Expose ``std::atomic_ref``'s object address (`Github <https://llvm.org/PR118377>`__)
+- P2944R3: Comparisons for ``reference_wrapper`` (`Github <https://llvm.org/PR105424>`__)
+- P3168R2: Give ``std::optional`` Range Support
+  (guarded by ``-fexperimental-library``, `Github <https://llvm.org/PR105430>`__)
+- P3567R2: ``flat_meow`` Fixes (`Github <https://llvm.org/PR162022>`__)
+- P3836R2: Make ``optional<T&>`` trivially copyable (`Github <https://llvm.org/PR171275>`__)
+- P1789R3: Library Support for Expansion Statements (`Github <https://llvm.org/PR167184>`__)
+
+Improvements and New Features
+-----------------------------
+
+- The performance of associative and unordered containers has been significantly improved. This is an overview of the
+  different functions and by up to how much they have been improved:
+
+  - ``map::map(const map&)``: 2.3x
+  - ``map::operator=(const map&)``: 11x
+  - ``unordered_set::unordered_set(const unordered_set&)``: 3.3x
+  - ``unordered_set::operator=(const unordered_set&)``: 5x
+  - ``erase`` of ``map`` and ``set``: 2x
+  - ``find(key)`` of ``map``, ``set``, ``multimap`` and ``multiset``: 2.3x
+  - ``(iterator, iterator)`` constructors of ``map``, ``set``, ``multimap`` and ``multiset``: 3x
+  - ``insert(iterator, iterator)`` of ``map``, ``set``, ``multimap`` and ``multiset``: 2.5x
+  - ``erase(iterator, iterator)`` of the unordered containers: 1.9x
+  - ``map::insert_or_assign``: 2x
+
+- The performance of many algorithms has been improved. This is an overview of the different functions and by up to how
+  much they have been improved:
+
+  - ``std::find`` for integral types: 2x
+  - ``std::for_each`` and ``ranges::for_each`` over the associative containers: 2x
+  - ``std::rotate``: 3x
+  - Some have been specifically optimized for segmented iterators:
+
+    - ``std::distance`` and ``std::ranges::distance`` on non-random-access iterators: 1600x
+    - ``{std,ranges}::{fill, fill_n}``: 10x
+    - ``std::{generate, generate_n}`` and ``std::ranges::generate_n``: 1.8x
+
+  - ``std::search_n`` for random access iterators now tries to skip elements.
+    In contrived cases improvements of 70,000x have been observed.
+
+- There have also been performance improvements in other library facilities:
+
+  - ``vector<bool>::reserve()``: 2x
+  - ``deque::append_range``: 3.4x
+  - ``num_get::do_get`` integral overloads: 2.8x
+  - Some reallocations are now avoided in ``std::filesystem::path::lexically_relative``: 1.7x
+  - ``ofstream::write`` passes large strings to system calls directly instead of copying them in chunks into a buffer
+  - ``std::align`` is now an inline function, which allows the compiler to better optimize calls to it
+
+- ``std::atomic::wait`` has been refactored to accept more types to use platform native wait functions directly.
+  This is guarded behind the ABI Macro ``_LIBCPP_ABI_ATOMIC_WAIT_NATIVE_BY_SIZE``.
+
+- Multiple internal types have been refactored to use ``[[no_unique_address]]``, resulting in faster compile times and
+  reduced debug information.
+
+Deprecations and Removals
+-------------------------
+
+- The minimally supported deployment target on macOS has been increased to 11.0.
+
+Potentially breaking changes
+----------------------------
+
+- The mathematical special functions of ``<cmath>`` now report a domain error ([sf.cmath.general]) for every argument
+  outside the domain their description specifies and wherever the function is not mathematically defined: the result
+  is a quiet NaN, ``errno`` is set to ``EDOM`` and ``FE_INVALID`` is raised as ``math_errhandling`` says. Before,
+  ``ellint_1``, ``ellint_2``, ``ellint_3``, ``legendre``, ``laguerre``, ``assoc_laguerre``, ``cyl_bessel_i``,
+  ``cyl_bessel_j``, ``sph_bessel`` and ``sph_neumann`` returned a number for arguments outside their domain, ``beta``
+  and ``sph_legendre`` reported ``ERANGE`` or no error, and ``riemann_zeta(1)``, ``comp_ellint_3(k, nu)`` with
+  ``nu > 1`` and ``ellint_3`` across a pole of its integrand returned a finite or infinite number. ``comp_ellint_1(1)``
+  and ``comp_ellint_3(k, 1)`` now return positive infinity instead of NaN.
+- ``assoc_legendre`` returns ``(1 - x^2)^(m/2) d^m/dx^m P_l(x)`` as [sf.cmath.assoc.legendre] defines it, without the
+  Condon-Shortley phase ``(-1)^m`` it used to include; the result differs in sign for odd ``m``. ``sph_legendre``
+  is unchanged (its definition carries the phase itself).
+- The comparison of a ``tuple`` with a tuple-like object and the comparison functions of ``chrono::leap_second`` are
+  declared at namespace scope as [tuple.rel] and [time.syn] specify; they used to be hidden friends (the resolutions
+  of LWG3882 and LWG4139, which are not in the draft). ``std::operator==(tuple, pair)`` and ``std::chrono::operator<``
+  can be named in a qualified call now.
+- ``std::atexit``, ``std::at_quick_exit``, ``std::qsort`` and ``std::bsearch`` are overloaded for callbacks with C and
+  with C++ language linkage ([support.start.term], [alg.c.library]), and ``std::signal`` accepts only a handler with C
+  language linkage; with the compiler of this release function types with different language linkages are different
+  types ([dcl.link]), so a handler passed to a C function such as ``signal``, ``pthread_create`` or ``sigaction`` has to
+  be declared ``extern "C"``.
+- Public names that are not in the C++ working draft (N5050) were removed so that ``std`` exposes the standard's
+  vocabulary only (``libcxx/utils/vocabulary_audit.py`` checks this):
+
+  - ``<scope>`` and ``std::scope_exit``/``scope_fail``/``scope_success`` are gone, and so are all the Technical
+    Specification headers (``<experimental/simd>``, ``<experimental/memory>``, ``<experimental/iterator>``,
+    ``<experimental/propagate_const>``, ``<experimental/scope>``, ``<experimental/type_traits>`` and
+    ``<experimental/utility>``) together with ``_LIBCPP_ENABLE_EXPERIMENTAL``: they are not part of C++26.
+  - ``<meta>``: ``annotate``, the two-argument ``annotations_of``, ``annotation_of_type``, ``reflect_invoke``,
+    ``reflect_value``, ``reflect_result``, ``value_of``, ``test_type``/``test_types``/``test_trait``, ``define_class``,
+    ``define_unscoped_enum``, ``has_complete_definition``, ``has_ellipsis_parameter``, ``is_access_specified``,
+    ``is_trivial_type`` and the one-argument ``members_of``/``bases_of``/``static_data_members_of``/
+    ``nonstatic_data_members_of`` were removed. ``std::meta::detail`` and ``std::meta::reflection_v2`` now have
+    reserved spellings.
+  - ``execution::change_coroutine_scheduler``, ``contracts::handle_observed_contract_violation``,
+    ``contracts::handle_enforced_contract_violation`` and the ``atomic_store_fmaximum``/``atomic_store_fminimum``
+    free functions were removed.
+  - The feature-test macros ``__cpp_lib_smart_ptr_default_init``, ``__cpp_lib_stdfloat``,
+    ``__cpp_lib_freestanding_atomic`` and ``__cpp_lib_span_at`` are no longer defined.
+  - The hidden-friend ``swap`` of ``stop_token``, ``stop_source`` and ``inplace_stop_token`` was removed (the draft only
+    declares the member ``swap``; ``std::swap`` still works), and
+    ``lazy_split_view::outer-iterator::value_type`` has no default constructor and no public constructor from an
+    ``outer-iterator`` any more.
+  - ``atomic<T>::atomic()`` is constrained on ``is_default_constructible_v<T>`` (LWG4169), ``as_bytes`` and
+    ``as_writable_bytes`` do not accept ``span<volatile T>`` (LWG4243), and the copy constructor of ``variant`` and the
+    assignment operators listed in ``libcxx/utils/overload_audit.py --noexcept`` are ``noexcept`` as specified
+    (LWG2991, LWG4245).
+  - ``generator::promise_type::yield_value(elements_of<R, Alloc>)`` is constrained on
+    ``convertible_to<range_reference_t<R>, yielded>`` as in the draft (a ``generator<int>`` can no longer yield
+    ``elements_of`` of a ``vector<int>``; use ``generator<const int&>``), ``enumerate_view::end()`` returns an iterator
+    only for forward ranges (LWG3919), ``has-arrow`` needs a ``const`` ``operator->`` (LWG4112),
+    ``possibly-const-range`` prefers the ``const`` range (LWG4027), the ``condition_variable`` and
+    ``condition_variable_any`` timed waits take the time point or duration by value (LWG4301), the
+    ``packaged_task`` constructors have the invocability *Mandates* (LWG4154), ``ranges::replace`` and
+    ``ranges::replace_if`` have the draft default template arguments (LWG4444), and
+    ``task::promise_type::return_value`` has the default template argument ``V = T`` (LWG4345).
+  - Mandates of the "Mandating the Standard Library" papers are checked with ``static_assert`` (P1460R1 to P1723R2),
+    for example: the ``move_only_function`` and ``copyable_function`` constructors no longer use constructibility of
+    the callable as a constraint (it is a *Mandates*, so a non-constructible callable is a hard error instead of
+    being SFINAE-friendly) and their ``operator=(F&&)`` is unconstrained, ``is_sufficiently_aligned`` needs a
+    power-of-two alignment, ``ckd_add``, ``ckd_sub`` and ``ckd_mul`` need signed or unsigned integer types,
+``reduce`` and ``transform_reduce`` need all four ``binary_op`` argument combinations to produce ``T``,
+    ``cmp_equal`` and the other integer comparison functions and ``in_range`` need signed or unsigned integer types,
+    ``vector<bool, Allocator>`` needs ``Allocator::value_type`` to be ``bool``, ``get_money`` and ``put_money`` need
+    ``long double`` or a ``basic_string``, and ``is_permutation`` needs both ranges to have the same value type. Code
+    that violated them (for instance ``is_permutation`` over a ``MoveOnly`` range and an ``int`` array) is now
+    ill-formed. In C++26 ``locale::encoding()`` returns ``text_encoding``, so ``<locale>`` includes ``<text_encoding>``.
+  - The ``<simd>`` load, store, gather and scatter functions have the Constraints and Mandates of [simd.loadstore]
+    and [simd.permute.memory] (LWG4420), ``task_scheduler`` has no move operations (a moved-from ``task_scheduler``
+    is a copy; LWG4445), ``unique_ptr::operator*`` has the Constraints and Mandates of LWG4148,
+    ``uninitialized_move`` and ``uninitialized_move_n`` use *deref-move* (LWG3918), and the ``<cmath>`` functions
+    ``fmaximum``, ``fminimum``, ``fmaximum_num``, ``fminimum_num``, ``hypot`` and ``lerp`` accept every extended
+    floating-point type (``float128_t`` also for ``ilogb``, ``lrint``, ``llrint``, ``lround``, ``llround``,
+    ``scalbln`` and ``nexttoward``).
+  - ``atomic_thread_fence``, ``atomic_signal_fence``, ``kill_dependency``, the ``arg`` and ``proj`` overloads for
+    arithmetic arguments, the converting assignment of ``common_iterator`` and the ``frexp``, ``modf``, ``remquo`` and
+    ``nexttoward`` overloads for the extended floating-point types are ``constexpr`` (``overload_audit.py
+    --constexpr`` compares every constexpr declaration of the draft with the library).
+
+- The algorithm for ``multi{map,set}::find`` has been modified such that it doesn't necessarily return an iterator to
+  the first equal element in the container. This was never guaranteed by the Standard, but libc++ previously happened to
+  always return the first equal element, like other implementations do. Starting with this release, code relying on the
+  first element being returned from ``find`` will be broken, and ``lower_bound`` or ``equal_range`` should be used
+  instead.
+
+- The algorithms for ``std::{map,set}`` ``lower_bound`` and ``upper_bound`` operations were modified such that their
+  result changed for comparators that are not a strict weak order. Being a strict weak order was always a requirement
+  of the Standard and still is, however in this release libc++ changed the behavior of ``std::{map,set}`` for such
+  comparators. Since this may be tricky to work around in some cases, an escape hatch is provided in this release:
+  defining ``_LIBCPP_ENABLE_LEGACY_TREE_LOWER_UPPER_BOUND`` will revert to the historical implementation of
+  these operations. That escape hatch will be removed in LLVM 23.
+
+- The ABI flag ``_LIBCPP_ABI_NO_REVERSE_ITERATOR_SECOND_MEMBER`` has been split off from
+  ``_LIBCPP_ABI_NO_ITERATOR_BASES``. If you are using this flag and care about ABI stability, you should set
+  ``_LIBCPP_ABI_NO_REVERSE_ITERATOR_SECOND_MEMBER`` as well.
+
+- ``-fexperimental-library`` and ``libc++experimental.a`` are gone. The C++17 parallel algorithms and execution
+  policies, the C++20 time zone database (``chrono::tzdb``, ``zoned_time``, leap seconds, formatting and parsing),
+  ``<syncstream>`` and ``optional``'s range support are standard features: they are part of the library in the
+  language modes that have them, without any flag, and the time zone sources are part of ``libc++``.
+
+- Hardening: the assertion semantics ``ignore`` and ``observe`` (and ``__log_hardening_failure``) are removed; a
+  hardened implementation must use a terminating semantic. In C++26 a violated hardened precondition under the
+  ``enforce`` semantic is a contract violation ([intro.compliance.general]): the replaceable contract-violation
+  handler runs, then the program terminates; ``quick-enforce`` still traps.
+
+- The contract extensions that the draft does not have were removed: ``[[clang::contract_semantic]]``,
+  ``[[clang::contract_message]]``, ``[[clang::contract_emission]]``, ``assertion_kind::manual`` and ``cassert``,
+  ``detection_mode::unspecified``. The only contract option is ``-fcontract-evaluation-semantic=``.
+
+- Library behavior changes that follow the C++26 wording: ``from_chars`` leaves ``value`` unmodified when the result
+  is out of range (it stored ``±HUGE_VAL`` or zero); ``span<volatile T>`` is ill-formed for a class type ``T``
+  because ``span::const_iterator`` is ``std::const_iterator<iterator>``; ``polymorphic_allocator::construct`` uses
+  uses-allocator construction with ``*this`` as a const allocator (C++20 and later); ``std::rcu_domain`` has no
+  default constructor (use ``rcu_default_domain()``); ``std::div``, ``ldiv`` and ``lldiv`` are constexpr in C++23
+  and ``__cpp_lib_constexpr_cmath`` is defined.
+
+New in this release (conformance): ``span::cbegin``/``cend``, ``from_chars`` for ``long double`` matching the
+specified pattern in the C locale, constexpr ``atomic<T>`` and ``atomic_ref<T>`` for trivially copyable class types
+(the atomic load, store, exchange and compare-exchange builtins are constant evaluated), constexpr throwing of the
+``Throws:`` exceptions of the library (P3068R6), the remaining C23 functions of ``<cstring>`` and ``<cstdlib>``,
+``philox_engine`` and the hosted-only stream operators of ``<random>`` in freestanding mode.
+
+Announcements About Future Releases
+-----------------------------------
+
+ABI Affecting Changes
+---------------------
+
+- The ABI flag ``_LIBCPP_ABI_NO_REVERSE_ITERATOR_SECOND_MEMBER`` has been split off from
+  ``_LIBCPP_ABI_NO_ITERATOR_BASES``. If you are using this flag and care about ABI stability, you should set
+  ``_LIBCPP_ABI_NO_REVERSE_ITERATOR_SECOND_MEMBER`` as well.
+
+- The internal types ``__map_value_compare``, ``__unordered_map_hasher``, ``__unordered_map_equal``,
+  ``__hash_map_hasher`` and ``__hash_map_equal`` have been refactored to use ``_LIBCPP_COMPRESSED_ELEMENT`` instead of
+  potentially inheriting from the types they wrap. At this point in time we are not aware of any ABI changes caused by
+  this.
+
+- ``ranges::iota_view`` is now aware of ``__int128``. This causes ``iota_view::difference_type`` to change from
+  ``long long`` to ``__int128`` in some cases.
+
+- ``std::allocator`` is now trivially default constructible. The behaviour can be reverted by defining
+  ``_LIBCPP_DEPRECATED_ABI_NON_TRIVIAL_ALLOCATOR``. Please inform the libc++ team if you need this flag, since it will
+  be removed in LLVM 24 if there is no evidence that it's required.
+
+- ``bitset::operator[]`` now returns ``bool``, making libc++ conforming. The behaviour can be reverted by defining
+  ``_LIBCPP_DEPRECATED_ABI_BITSET_CONST_SUBSCRIPT_RETURN_REF``. Please inform the libc++ team if you need this flag,
+  since it will be removed in LLVM 24 if there is no evidence that it's required.
+
+Build System Changes
+--------------------

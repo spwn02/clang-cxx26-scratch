@@ -1,0 +1,64 @@
+// -*- C++ -*-
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _LIBCPP___ASSERTION_HANDLER
+#define _LIBCPP___ASSERTION_HANDLER
+
+#if __cplusplus < 201103L && defined(_LIBCPP_USE_FROZEN_CXX03_HEADERS)
+#  include <__cxx03/__config>
+#  include <__cxx03/__verbose_abort>
+#  include <__cxx03/__verbose_trap>
+#else
+#  include <__config>
+#  include <__hardened_violation>
+#  include <__verbose_abort>
+#  include <__verbose_trap>
+#endif
+
+#if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
+#  pragma GCC system_header
+#endif
+
+#if __cplusplus < 201103L && defined(_LIBCPP_USE_FROZEN_CXX03_HEADERS)
+
+// Keep the old implementation that doesn't support assertion semantics for backward compatibility with the frozen C++03
+// mode.
+#  if _LIBCPP_HARDENING_MODE == _LIBCPP_HARDENING_MODE_DEBUG
+#    define _LIBCPP_ASSERTION_HANDLER(message) _LIBCPP_VERBOSE_ABORT("%s", message)
+#  else
+#    define _LIBCPP_ASSERTION_HANDLER(message) _LIBCPP_VERBOSE_TRAP(message)
+#  endif // _LIBCPP_HARDENING_MODE == _LIBCPP_HARDENING_MODE_DEBUG
+
+#else
+
+// The assertion semantics of hardened preconditions are the terminating ones of the evaluation semantics of C++26
+// Contracts ([intro.compliance.general]):
+// - `quick-enforce` terminates the program as fast as possible (via trapping);
+// - `enforce` runs the contract-violation handler (C++26) and then terminates the program.
+#  if _LIBCPP_ASSERTION_SEMANTIC == _LIBCPP_ASSERTION_SEMANTIC_QUICK_ENFORCE
+#    define _LIBCPP_ASSERTION_HANDLER(message) _LIBCPP_VERBOSE_TRAP(message)
+
+#  elif _LIBCPP_ASSERTION_SEMANTIC == _LIBCPP_ASSERTION_SEMANTIC_ENFORCE
+#    if _LIBCPP_STD_VER >= 26
+#      define _LIBCPP_ASSERTION_HANDLER(message) ::std::__handle_hardened_violation(message, __FILE__, __builtin_FUNCTION(), __LINE__)
+#    else
+#      define _LIBCPP_ASSERTION_HANDLER(message) _LIBCPP_VERBOSE_ABORT("%s", message)
+#    endif
+
+#  else
+
+#    error _LIBCPP_ASSERTION_SEMANTIC must be set to one of the following values: \
+_LIBCPP_ASSERTION_SEMANTIC_QUICK_ENFORCE, \
+_LIBCPP_ASSERTION_SEMANTIC_ENFORCE
+
+#  endif // _LIBCPP_ASSERTION_SEMANTIC == _LIBCPP_ASSERTION_SEMANTIC_QUICK_ENFORCE
+
+#endif // __cplusplus < 201103L && defined(_LIBCPP_USE_FROZEN_CXX03_HEADERS)
+
+#endif // _LIBCPP___ASSERTION_HANDLER

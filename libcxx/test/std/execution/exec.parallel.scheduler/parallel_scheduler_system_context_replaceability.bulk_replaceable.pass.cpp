@@ -1,0 +1,243 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// UNSUPPORTED: c++03, c++11, c++14, c++17, c++20, c++23
+// UNSUPPORTED: no-threads
+
+// <execution>
+//
+// [exec.par.scheduler]: bulk_chunked and bulk_unchunked over a parallel
+// scheduler dispatch through the replaceable backend, including its completion
+// paths. The replacement is defined with a qualified-id because the facility
+// is in libc++'s inline ABI namespace.
+
+#include <cassert>
+#include <exception>
+#include <execution>
+#include <memory>
+#include <span>
+#include <thread>
+#include <vector>
+#include "test_macros.h"
+
+namespace ex  = std::execution;
+namespace scr = std::execution::parallel_scheduler_replacement;
+
+namespace {
+enum class completion { value, error, stopped };
+
+class recording_backend final : public scr::parallel_scheduler_backend {
+public:
+  int schedule_calls = 0;
+  int chunked_calls = 0;
+  int unchunked_calls = 0;
+  int executes = 0;
+  size_t last_count = 0;
+  completion result = completion::value;
+
+  void schedule(scr::receiver_proxy& proxy, std::span<std::byte>) noexcept override {
+    ++schedule_calls;
+    proxy.set_value();
+  }
+
+  void schedule_bulk_chunked(size_t count, scr::bulk_item_receiver_proxy& proxy, std::span<std::byte>) noexcept override {
+    ++chunked_calls;
+    complete(count, proxy, true);
+  }
+
+  void schedule_bulk_unchunked(size_t count, scr::bulk_item_receiver_proxy& proxy, std::span<std::byte>) noexcept override {
+    ++unchunked_calls;
+    complete(count, proxy, false);
+  }
+
+private:
+  void complete(size_t count, scr::bulk_item_receiver_proxy& proxy, bool chunked) noexcept {
+    last_count = count;
+    if (result == completion::error) {
+      proxy.set_error(std::make_exception_ptr(42));
+      return;
+    }
+    if (result == completion::stopped) {
+      proxy.set_stopped();
+      return;
+    }
+    if (chunked) {
+      if (count != 0) {
+        ++executes;
+        proxy.execute(0, count);
+      }
+    } else {
+      for (size_t i = 0; i < count; ++i) {
+        ++executes;
+        proxy.execute(i, i + 1);
+      }
+    }
+    proxy.set_value();
+  }
+};
+} // namespace
+
+std::shared_ptr<scr::parallel_scheduler_backend> scr::query_parallel_scheduler_backend() {
+  static std::shared_ptr<scr::parallel_scheduler_backend> backend = std::make_shared<recording_backend>();
+  return backend;
+}
+
+int main(int, char**) {
+  auto backend = std::static_pointer_cast<recording_backend>(scr::query_parallel_scheduler_backend());
+  auto sch = ex::get_parallel_scheduler();
+
+  {
+    std::vector<int> hits(17);
+    auto result = std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_chunked(ex::par, 17, [&](int b, int e) {
+                                                for (int i = b; i < e; ++i)
+                                                  ++hits[i];
+                                              }));
+    assert(result.has_value());
+    for (int hit : hits)
+      assert(hit == 1);
+    assert(backend->chunked_calls == 1);
+    assert(backend->unchunked_calls == 0);
+  }
+
+  {
+    std::vector<int> hits(17);
+    auto result = std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_unchunked(ex::par, 17, [&](int i) {
+                                                ++hits[i];
+                                              }));
+    assert(result.has_value());
+    for (int hit : hits)
+      assert(hit == 1);
+    assert(backend->chunked_calls == 1);
+    assert(backend->unchunked_calls == 1);
+  }
+
+  // bulk composes through bulk_chunked.
+  {
+    int calls = 0;
+    auto result = std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk(ex::par, 5, [&](int) { ++calls; }));
+    assert(result.has_value());
+    assert(calls == 5);
+    assert(backend->chunked_calls == 2);
+  }
+
+  // The backend sees zero-size work too and completes it without execute.
+  {
+    int calls = 0;
+    auto result = std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_unchunked(ex::par, 0, [&](int) { ++calls; }));
+    assert(result.has_value());
+    assert(calls == 0);
+    assert(backend->unchunked_calls == 2);
+  }
+
+  // Errors thrown by the bulk function pass through the operation as set_error.
+#ifndef TEST_HAS_NO_EXCEPTIONS
+  {
+    bool caught = false;
+    try {
+      (void)std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_chunked(ex::par, 1, [](int, int) { throw 17; }));
+    } catch (int value) {
+      caught = value == 17;
+    }
+    assert(caught);
+    assert(backend->chunked_calls == 3);
+  }
+#else
+  {
+    (void)std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_chunked(ex::par, 1, [](int, int) {}));
+    assert(backend->chunked_calls == 3);
+  }
+#endif
+
+  // The backend's own error and stop completions must reach the receiver.
+#ifndef TEST_HAS_NO_EXCEPTIONS
+  {
+    backend->result = completion::error;
+    bool caught = false;
+    try {
+      (void)std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_unchunked(ex::par, 1, [](int) { assert(false); }));
+    } catch (int value) {
+      caught = value == 42;
+    }
+    assert(caught);
+    assert(backend->unchunked_calls == 3);
+  }
+#else
+  {
+    (void)std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_unchunked(ex::par, 1, [](int) {}));
+    assert(backend->unchunked_calls == 3);
+  }
+#endif
+  {
+    backend->result = completion::stopped;
+    auto result = std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_chunked(ex::par, 1, [](int, int) { assert(false); }));
+    assert(!result.has_value());
+    assert(backend->chunked_calls == 4);
+  }
+
+  backend->result = completion::value;
+
+  // [exec.par.scheduler]: "p" is true only for parallel_policy and parallel_unsequenced_policy. The backend is
+  // asked for `shape` items when p and for one item otherwise, and that one execute call runs the whole range.
+  {
+    backend->executes = 0;
+    int calls = 0, lo = -1, hi = -1;
+    auto result = std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_chunked(ex::seq, 9, [&](int b, int e) {
+                                                ++calls;
+                                                lo = b;
+                                                hi = e;
+                                              }));
+    assert(result.has_value());
+    assert(backend->last_count == 1 && backend->executes == 1);
+    assert(calls == 1 && lo == 0 && hi == 9);
+  }
+  {
+    backend->executes = 0;
+    std::vector<int> hits(9);
+    auto result = std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_unchunked(ex::seq, 9, [&](int i) {
+                                                ++hits[i];
+                                              }));
+    assert(result.has_value());
+    assert(backend->last_count == 1 && backend->executes == 1);
+    for (int hit : hits)
+      assert(hit == 1);
+  }
+  {
+    backend->executes = 0;
+    std::vector<int> hits(9);
+    auto result = std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk(ex::unseq, 9, [&](int i) { ++hits[i]; }));
+    assert(result.has_value());
+    assert(backend->last_count == 1 && backend->executes == 1);
+    for (int hit : hits)
+      assert(hit == 1);
+  }
+  {
+    backend->executes = 0;
+    std::vector<int> hits(9);
+    auto result = std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_unchunked(ex::par, 9, [&](int i) {
+                                                ++hits[i];
+                                              }));
+    assert(result.has_value());
+    assert(backend->last_count == 9 && backend->executes == 9);
+    for (int hit : hits)
+      assert(hit == 1);
+  }
+  {
+    backend->executes = 0;
+    int lo = -1, hi = -1;
+    auto result = std::this_thread::sync_wait(ex::schedule(sch) | ex::bulk_chunked(ex::par_unseq, 9, [&](int b, int e) {
+                                                lo = b;
+                                                hi = e;
+                                              }));
+    assert(result.has_value());
+    assert(backend->last_count == 9 && backend->executes == 1);
+    assert(lo == 0 && hi == 9);
+  }
+
+  assert(backend->schedule_calls == 12);
+  return 0;
+}

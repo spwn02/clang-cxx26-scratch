@@ -1,0 +1,345 @@
+// RUN: %clang_cc1 -std=c++98 %s -verify=expected -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++11 %s -verify=expected,since-cxx11 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++14 %s -verify=expected,since-cxx11 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++17 %s -verify=expected,since-cxx11 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++20 %s -verify=expected,since-cxx11 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++23 %s -verify=expected,since-cxx11 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++2c %s -verify=expected,since-cxx11 -fexceptions -fcxx-exceptions -pedantic-errors
+
+namespace cwg1710 { // cwg1710: 22
+// The 'template' keyword is optional for the terminal name of a class-or-decltype; it is still required
+// for a name that is a component of a nested-name-specifier.
+template <typename T> struct D1 : T::template B<int>::template C<int> {};
+template <typename T> struct D2 : T::B<int>::template C<int> {};
+// expected-error@-1 {{use 'template' keyword to treat 'B' as a dependent template name}}
+template <typename T> struct D3 : T::template B<int>::C<int> {};
+template <typename T> struct D4 : T::B<int>::C<int> {};
+// expected-error@-1 {{use 'template' keyword to treat 'B' as a dependent template name}}
+} // namespace cwg1710
+
+namespace cwg1715 { // cwg1715: 3.9
+#if __cplusplus >= 201103L
+  struct B {
+    template<class T> B(T, typename T::Q);
+  };
+
+  class S {
+    using Q = int;
+    template<class T> friend B::B(T, typename T::Q);
+  };
+
+  struct D : B {
+    using B::B;
+  };
+  struct E : B { // #cwg1715-E
+    template<class T> E(T t, typename T::Q q) : B(t, q) {} // #cwg1715-E-ctor
+  };
+
+  B b(S(), 1);
+  D d(S(), 2);
+  E e(S(), 3);
+  // since-cxx11-error@-1 {{no matching constructor for initialization of 'E'}}
+  //   since-cxx11-note@#cwg1715-E-ctor {{candidate template ignored: substitution failure [with T = S]: 'Q' is a private member of 'cwg1715::S'}}
+  //   since-cxx11-note@#cwg1715-E {{candidate constructor (the implicit copy constructor) not viable: requires 1 argument, but 2 were provided}}
+  //   since-cxx11-note@#cwg1715-E {{candidate constructor (the implicit move constructor) not viable: requires 1 argument, but 2 were provided}}
+#endif
+} // namespace cwg1715
+
+namespace cwg1719 { // cwg1719: 19
+#if __cplusplus >= 201103L
+struct CStruct {
+  int one;
+  int two;
+};
+
+struct CStruct2 {
+  int one;
+  int two;
+};
+
+struct CStructWithQualifiers {
+  const int one;
+  volatile int two;
+};
+
+static_assert(__is_layout_compatible(CStruct, const CStruct2), "");
+static_assert(__is_layout_compatible(CStruct, volatile CStruct2), "");
+static_assert(__is_layout_compatible(const CStruct, volatile CStruct2), "");
+static_assert(__is_layout_compatible(int, const int), "");
+static_assert(__is_layout_compatible(int, volatile int), "");
+static_assert(__is_layout_compatible(const int, volatile int), "");
+static_assert(__is_layout_compatible(CStruct, CStructWithQualifiers), "");
+static_assert(__is_layout_compatible(int[], const volatile int[]), "");
+#endif
+} // namespace cwg1719
+
+namespace cwg1722 { // cwg1722: 9
+#if __cplusplus >= 201103L
+void f() {
+  const auto lambda = [](int x) { return x + 1; };
+  // Without the DR applied, this static_assert would fail.
+  static_assert(
+      noexcept((int (*)(int))(lambda)),
+      "Lambda-to-function-pointer conversion is expected to be noexcept");
+}
+#endif
+} // namespace cwg1722
+
+namespace cwg1734 { // cwg1734: yes
+#if __cplusplus >= 201103L
+struct A {
+    A(const A&) = delete;
+};
+// A is trivially copyable: the implicitly-declared copy assignment operator is
+// an eligible trivial special member function.
+static_assert(__is_trivially_copyable(A), "");
+
+struct B {
+    B(const B&) = delete;
+    B& operator=(const B&) = delete;
+};
+// B is not trivially copyable because it lacks an eligible copy constructor,
+// move constructor, copy assignment operator, and move assignment operator.
+static_assert(!__is_trivially_copyable(B), "");
+
+struct C {
+    C(C&&) = delete;
+};
+static_assert(!__is_trivially_copyable(C), "");
+#endif
+} // namespace cwg1734
+
+namespace cwg1736 { // cwg1736: 3.9
+#if __cplusplus >= 201103L
+struct S {
+  template <class T> S(T t) {
+    struct L : S {
+      using S::S;
+    };
+    typename T::type value;
+    // since-cxx11-error@-1 {{type 'int' cannot be used prior to '::' because it has no members}}
+    //   since-cxx11-note@#cwg1736-l {{in instantiation of function template specialization 'cwg1736::S::S<int>' requested here}}
+    //   since-cxx11-note@#cwg1736-s {{in instantiation of function template specialization 'cwg1736::S::S<cwg1736::Q>' requested here}}
+    L l(value); // #cwg1736-l
+  }
+};
+struct Q { typedef int type; } q;
+S s(q); // #cwg1736-s
+#endif
+} // namespace cwg1736
+
+namespace cwg1738 { // cwg1738: sup P0136R1
+#if __cplusplus >= 201103L
+struct A {
+  template <typename T>
+  A(int, T) {}
+};
+
+struct B : A {
+  using A::A;
+};
+
+// P0136R1: the inherited constructor template is not a declaration of B, so
+// the declarator does not correspond to a declaration nominable in B
+// ([dcl.meaning.general]) and the explicit instantiation is ill-formed.
+template B::B(int, double);
+// since-cxx11-error@-1 {{explicit instantiation of 'B' does not refer to a function template, variable template, member function, member class, or static data member}}
+#endif
+} // namespace cwg1738
+
+// cwg1748 is in cwg1748.cpp
+
+namespace cwg1753 { // cwg1753: 11
+  typedef int T;
+  struct A { typedef int T; };
+  namespace B { typedef int T; }
+
+  void f(T n) {
+    n.~T();
+    n.T::~T();
+
+    n.cwg1753::~T();
+    // expected-error@-1 {{'cwg1753' does not refer to a type name in pseudo-destructor expression; expected the name of type 'T' (aka 'int')}}
+    n.cwg1753::T::~T();
+
+    n.A::~T();
+    // expected-error@-1 {{the type of object expression ('T' (aka 'int')) does not match the type being destroyed ('A') in pseudo-destructor expression}}
+    n.A::T::~T();
+
+    n.B::~T();
+    // expected-error@-1 {{'B' does not refer to a type name in pseudo-destructor expression; expected the name of type 'T' (aka 'int')}}
+    n.B::T::~T();
+
+  #if __cplusplus >= 201103L
+    n.decltype(n)::~T();
+    // since-cxx11-error@-1 {{'decltype(n)' (aka 'int') is not a class, namespace, or enumeration}}
+    n.T::~decltype(n)();
+    // since-cxx11-error@-1 {{expected a class name after '~' to name a destructor}}
+    n.~decltype(n)(); // OK
+  #endif
+  }
+} // namespace cwg1753
+
+namespace cwg1756 { // cwg1756: 3.7
+#if __cplusplus >= 201103L
+  // Direct-list-initialization of a non-class object
+  
+  int a{0};
+  
+  struct X { operator int(); } x;
+  int b{x};
+#endif
+} // namespace cwg1756
+
+namespace cwg1758 { // cwg1758: 3.7
+#if __cplusplus >= 201103L
+  // Explicit conversion in copy/move list initialization
+
+  struct X { X(); };
+  struct Y { explicit operator X(); } y;
+  X x{y};
+
+  struct A {
+    A() {}
+    A(const A &) {}
+  };
+  struct B {
+    operator A() { return A(); }
+  } b;
+  A a{b};
+#endif
+} // namespace cwg1758
+
+namespace cwg1762 { // cwg1762: 14
+#if __cplusplus >= 201103L
+  float operator ""_E(const char *);
+  float operator ""E(const char *);
+  // since-cxx11-error@-1 {{invalid suffix on literal; C++11 requires a space between literal and identifier}}
+  // since-cxx11-warning@-2 {{user-defined literal suffixes not starting with '_' are reserved; no literal will invoke this operator}}
+#endif
+} // namespace cwg1762
+
+// cwg1772 is in cwg177x.cpp
+
+namespace cwg1778 { // cwg1778: 9
+  // Superseded by P1286R2.
+#if __cplusplus >= 201103L
+  struct A { A() noexcept(true) = default; };
+  struct B { B() noexcept(false) = default; };
+  static_assert(noexcept(A()), "");
+  static_assert(!noexcept(B()), "");
+
+  struct C { A a; C() noexcept(false) = default; };
+  struct D { B b; D() noexcept(true) = default; };
+  static_assert(!noexcept(C()), "");
+  static_assert(noexcept(D()), "");
+#endif
+} // namespace cwg1778
+
+// cwg1779 is in cwg177x.cpp
+
+namespace cwg1794 { // cwg1794: 2.7
+                    // NB: dup 1710
+#if __cplusplus >= 201103L
+template <template <typename> class Template> struct Internal {
+  template <typename Arg> using Bind = Template<Arg>;
+};
+
+template <template <typename> class Template, typename Arg>
+using Instantiate = Template<Arg>;
+
+template <template <typename> class Template, typename Argument>
+using Bind = Instantiate<Internal<Template>::template Bind, Argument>;
+#endif
+} // namespace cwg1794
+// cwg1700: na
+// cwg1703: na
+// cwg1713: na
+// cwg1714: na
+// cwg1720: na
+// cwg1725: na
+// cwg1727: na
+// cwg1731: na
+// cwg1743: na
+// cwg1745: na
+// cwg1749: na
+// cwg1754: na
+// cwg1761: na
+// cwg1768: na
+// cwg1783: na
+// cwg1785: na
+// cwg1792: na
+// cwg1798: na
+// cwg1741: na
+// cwg1797: na
+// cwg1751: na
+// cwg1776: na
+// cwg1752: na
+// cwg1759: na
+// cwg1774: na
+// cwg1775: na
+// cwg1784: na
+// cwg1787: na
+// cwg1796: na
+// cwg1750: na
+// cwg1705: na
+// cwg1786: na
+// cwg1724: na
+// cwg1777: na
+
+#if __cplusplus >= 201402L
+namespace cwg1729 { // cwg1729: yes
+// Declarations of a variable template match by template-head and type.
+template<typename T> extern T var0;
+template<typename T> T var0 = T();
+template<typename T> auto var1 = T();
+template<typename T> extern int var1;
+// expected-error@-1 {{redeclaration of 'var1' with a different type: 'int' vs 'auto'}}
+//   expected-note@-3 {{previous definition is here}}
+} // namespace cwg1729
+#endif
+
+#if __cplusplus >= 201103L
+namespace cwg1740 { // cwg1740: yes
+// A '(' after 'noexcept' always begins the noexcept-specifier.
+void (*fp2)() noexcept, (*fp)() noexcept (fp2 = 0);
+// since-cxx11-error@-1 {{expected ')'}}
+//   since-cxx11-note@-2 {{to match this '('}}
+// since-cxx11-error@-3 {{conversion from 'void (*)() noexcept' to 'bool' is not allowed in a converted constant expression}}
+} // namespace cwg1740
+#endif
+
+#if __cplusplus >= 201103L
+namespace cwg1771 { // cwg1771: yes
+// The name before '::' (also when it is a simple-template-id) is looked up
+// considering only namespaces, types, and templates whose specializations are
+// types, so the function template L::A is ignored.
+namespace N {
+  namespace L { template<int> void A(); } // #cwg1771-L
+  namespace M { template<int> struct A { static int y; typedef int t; }; } // #cwg1771-M
+  using namespace L;
+  using namespace M;
+}
+template<int *> struct B {};
+B<&N::A<0>::y> b;
+N::A<0>::t t1;
+void f() { N::A<0>::t t2; (void)t2; }
+// Without a following '::' the name is an ordinary template-name.
+void g() { N::A<0>(); }
+// expected-error@-1 {{reference to 'A' is ambiguous}}
+//   expected-note@#cwg1771-M {{candidate found by name lookup is 'cwg1771::N::M::A'}}
+//   expected-note@#cwg1771-L {{candidate found by name lookup is 'cwg1771::N::L::A'}}
+
+// Two type templates are still ambiguous.
+namespace O {
+  namespace P { template<int> struct A { typedef int t; }; } // #cwg1771-P
+  namespace Q { template<int> struct A { typedef int t; }; } // #cwg1771-Q
+  using namespace P;
+  using namespace Q;
+}
+O::A<0>::t t3;
+// expected-error@-1 {{reference to 'A' is ambiguous}}
+//   expected-note@#cwg1771-Q {{candidate found by name lookup is 'cwg1771::O::Q::A'}}
+//   expected-note@#cwg1771-P {{candidate found by name lookup is 'cwg1771::O::P::A'}}
+} // namespace cwg1771
+#endif

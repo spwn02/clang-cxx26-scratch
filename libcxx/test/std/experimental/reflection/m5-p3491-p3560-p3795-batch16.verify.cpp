@@ -1,0 +1,48 @@
+//===----------------------------------------------------------------------===//
+// M5 diagnostic coverage: P3491R3, P3560R2, and P3795R2
+//===----------------------------------------------------------------------===//
+
+// UNSUPPORTED: c++03 || c++11 || c++14 || c++17 || c++20
+// ADDITIONAL_COMPILE_FLAGS:
+
+#include <array>
+#include <meta>
+#include <string>
+
+namespace batch16 {
+
+// 3491-04: each array element must be reflectable as a constant expression.
+int runtime_value();
+constexpr auto bad_array = std::define_static_array(
+    std::array{runtime_value()});
+// expected-error@-2 {{must be initialized by a constant expression}}
+// expected-error@-3 {{call to consteval function 'std::define_static_array<std::array<int, 1>>' is not a constant expression}}
+
+// 3491-05: array elements must be structural, not merely copyable.
+struct non_structural {
+private:
+  int value = 0; // expected-warning {{private field 'value' is not used}}
+public:
+  constexpr non_structural() = default;
+};
+constexpr auto non_structural_array = std::define_static_array(
+    std::array{non_structural{}});
+// expected-error@-2 {{constexpr variable 'non_structural_array' must be initialized by a constant expression}}
+// expected-error@-3 {{call to consteval function 'std::define_static_array<std::array<batch16::non_structural, 1>>' is not a constant expression}}
+// P3491R3: the structural-type requirement is a Mandates (a hard error at the call).
+// expected-error@*:* {{define_static_array requires a structural element type}}
+// expected-error@*:* {{reflect_constant_array requires a structural element type}}
+// expected-error@meta:* {{reflect_constant requires a cv-unqualified structural non-reference type}}
+
+// 3795-04: generated-member annotations retain source annotation constraints.
+struct Annotated;
+consteval {
+  define_aggregate(^^Annotated, {
+      data_member_spec(^^int, {.name = "bad",
+                               .annotations = {std::meta::reflect_constant(
+                                   std::string{"not structural"})}})});
+}
+// expected-error@meta:* {{reflect_constant requires a cv-unqualified structural non-reference type}}
+// expected-error@-7 {{evaluating expression of a consteval block must be a constant expression}}
+
+} // namespace batch16

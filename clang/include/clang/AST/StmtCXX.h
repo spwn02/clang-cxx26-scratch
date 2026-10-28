@@ -1,0 +1,986 @@
+//===--- StmtCXX.h - Classes for representing C++ statements ----*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file defines the C++ statement AST node classes.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_CLANG_AST_STMTCXX_H
+#define LLVM_CLANG_AST_STMTCXX_H
+
+#include "clang/AST/DeclarationName.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/NestedNameSpecifier.h"
+#include "clang/AST/Stmt.h"
+#include "llvm/Support/Compiler.h"
+
+namespace clang {
+
+class VarDecl;
+class ResultNameDecl;
+class UnnamedGlobalConstantDecl;
+
+/// CXXCatchStmt - This represents a C++ catch block.
+///
+class CXXCatchStmt : public Stmt {
+  SourceLocation CatchLoc;
+  /// The exception-declaration of the type.
+  VarDecl *ExceptionDecl;
+  /// The handler block.
+  Stmt *HandlerBlock;
+
+public:
+  CXXCatchStmt(SourceLocation catchLoc, VarDecl *exDecl, Stmt *handlerBlock)
+  : Stmt(CXXCatchStmtClass), CatchLoc(catchLoc), ExceptionDecl(exDecl),
+    HandlerBlock(handlerBlock) {}
+
+  CXXCatchStmt(EmptyShell Empty)
+  : Stmt(CXXCatchStmtClass), ExceptionDecl(nullptr), HandlerBlock(nullptr) {}
+
+  SourceLocation getBeginLoc() const LLVM_READONLY { return CatchLoc; }
+  SourceLocation getEndLoc() const LLVM_READONLY {
+    return HandlerBlock->getEndLoc();
+  }
+
+  SourceLocation getCatchLoc() const { return CatchLoc; }
+  VarDecl *getExceptionDecl() const { return ExceptionDecl; }
+  QualType getCaughtType() const;
+  Stmt *getHandlerBlock() const { return HandlerBlock; }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CXXCatchStmtClass;
+  }
+
+  child_range children() { return child_range(&HandlerBlock, &HandlerBlock+1); }
+
+  const_child_range children() const {
+    return const_child_range(&HandlerBlock, &HandlerBlock + 1);
+  }
+
+  friend class ASTStmtReader;
+};
+
+/// CXXTryStmt - A C++ try block, including all handlers.
+///
+class CXXTryStmt final : public Stmt,
+                         private llvm::TrailingObjects<CXXTryStmt, Stmt *> {
+
+  friend TrailingObjects;
+  friend class ASTStmtReader;
+
+  SourceLocation TryLoc;
+  unsigned NumHandlers;
+  size_t numTrailingObjects(OverloadToken<Stmt *>) const { return NumHandlers; }
+
+  CXXTryStmt(SourceLocation tryLoc, CompoundStmt *tryBlock,
+             ArrayRef<Stmt *> handlers);
+  CXXTryStmt(EmptyShell Empty, unsigned numHandlers)
+    : Stmt(CXXTryStmtClass), NumHandlers(numHandlers) { }
+
+  Stmt *const *getStmts() const { return getTrailingObjects(); }
+  Stmt **getStmts() { return getTrailingObjects(); }
+
+public:
+  static CXXTryStmt *Create(const ASTContext &C, SourceLocation tryLoc,
+                            CompoundStmt *tryBlock, ArrayRef<Stmt *> handlers);
+
+  static CXXTryStmt *Create(const ASTContext &C, EmptyShell Empty,
+                            unsigned numHandlers);
+
+  SourceLocation getBeginLoc() const LLVM_READONLY { return getTryLoc(); }
+
+  SourceLocation getTryLoc() const { return TryLoc; }
+  SourceLocation getEndLoc() const {
+    return getStmts()[NumHandlers]->getEndLoc();
+  }
+
+  CompoundStmt *getTryBlock() {
+    return cast<CompoundStmt>(getStmts()[0]);
+  }
+  const CompoundStmt *getTryBlock() const {
+    return cast<CompoundStmt>(getStmts()[0]);
+  }
+
+  unsigned getNumHandlers() const { return NumHandlers; }
+  CXXCatchStmt *getHandler(unsigned i) {
+    return cast<CXXCatchStmt>(getStmts()[i + 1]);
+  }
+  const CXXCatchStmt *getHandler(unsigned i) const {
+    return cast<CXXCatchStmt>(getStmts()[i + 1]);
+  }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CXXTryStmtClass;
+  }
+
+  child_range children() {
+    return child_range(getStmts(), getStmts() + getNumHandlers() + 1);
+  }
+
+  const_child_range children() const {
+    return const_child_range(getStmts(), getStmts() + getNumHandlers() + 1);
+  }
+};
+
+/// CXXForRangeStmt - This represents C++0x [stmt.ranged]'s ranged for
+/// statement, represented as 'for (range-declarator : range-expression)'
+/// or 'for (init-statement range-declarator : range-expression)'.
+///
+/// This is stored in a partially-desugared form to allow full semantic
+/// analysis of the constituent components. The original syntactic components
+/// can be extracted using getLoopVariable and getRangeInit.
+class CXXForRangeStmt : public Stmt {
+  enum { INIT, RANGE, BEGINSTMT, ENDSTMT, COND, INC, LOOPVAR, BODY, END };
+  // SubExprs[RANGE] is an expression or declstmt.
+  // SubExprs[COND] and SubExprs[INC] are expressions.
+  Stmt *SubExprs[END];
+  SourceLocation ForLoc;
+  SourceLocation CoawaitLoc;
+  SourceLocation ColonLoc;
+  SourceLocation RParenLoc;
+
+  friend class ASTStmtReader;
+public:
+  CXXForRangeStmt(Stmt *InitStmt, DeclStmt *Range, DeclStmt *Begin,
+                  DeclStmt *End, Expr *Cond, Expr *Inc, DeclStmt *LoopVar,
+                  Stmt *Body, SourceLocation FL, SourceLocation CAL,
+                  SourceLocation CL, SourceLocation RPL);
+  CXXForRangeStmt(EmptyShell Empty) : Stmt(CXXForRangeStmtClass, Empty) { }
+
+  Stmt *getInit() { return SubExprs[INIT]; }
+  VarDecl *getLoopVariable();
+  Expr *getRangeInit();
+
+  const Stmt *getInit() const { return SubExprs[INIT]; }
+  const VarDecl *getLoopVariable() const;
+  const Expr *getRangeInit() const;
+
+
+  DeclStmt *getRangeStmt() { return cast<DeclStmt>(SubExprs[RANGE]); }
+  DeclStmt *getBeginStmt() {
+    return cast_or_null<DeclStmt>(SubExprs[BEGINSTMT]);
+  }
+  DeclStmt *getEndStmt() { return cast_or_null<DeclStmt>(SubExprs[ENDSTMT]); }
+  Expr *getCond() { return cast_or_null<Expr>(SubExprs[COND]); }
+  Expr *getInc() { return cast_or_null<Expr>(SubExprs[INC]); }
+  DeclStmt *getLoopVarStmt() { return cast<DeclStmt>(SubExprs[LOOPVAR]); }
+  Stmt *getBody() { return SubExprs[BODY]; }
+
+  const DeclStmt *getRangeStmt() const {
+    return cast<DeclStmt>(SubExprs[RANGE]);
+  }
+  const DeclStmt *getBeginStmt() const {
+    return cast_or_null<DeclStmt>(SubExprs[BEGINSTMT]);
+  }
+  const DeclStmt *getEndStmt() const {
+    return cast_or_null<DeclStmt>(SubExprs[ENDSTMT]);
+  }
+  const Expr *getCond() const {
+    return cast_or_null<Expr>(SubExprs[COND]);
+  }
+  const Expr *getInc() const {
+    return cast_or_null<Expr>(SubExprs[INC]);
+  }
+  const DeclStmt *getLoopVarStmt() const {
+    return cast<DeclStmt>(SubExprs[LOOPVAR]);
+  }
+  const Stmt *getBody() const { return SubExprs[BODY]; }
+
+  void setInit(Stmt *S) { SubExprs[INIT] = S; }
+  void setRangeInit(Expr *E) { SubExprs[RANGE] = reinterpret_cast<Stmt*>(E); }
+  void setRangeStmt(Stmt *S) { SubExprs[RANGE] = S; }
+  void setBeginStmt(Stmt *S) { SubExprs[BEGINSTMT] = S; }
+  void setEndStmt(Stmt *S) { SubExprs[ENDSTMT] = S; }
+  void setCond(Expr *E) { SubExprs[COND] = reinterpret_cast<Stmt*>(E); }
+  void setInc(Expr *E) { SubExprs[INC] = reinterpret_cast<Stmt*>(E); }
+  void setLoopVarStmt(Stmt *S) { SubExprs[LOOPVAR] = S; }
+  void setBody(Stmt *S) { SubExprs[BODY] = S; }
+
+  SourceLocation getForLoc() const { return ForLoc; }
+  SourceLocation getCoawaitLoc() const { return CoawaitLoc; }
+  SourceLocation getColonLoc() const { return ColonLoc; }
+  SourceLocation getRParenLoc() const { return RParenLoc; }
+
+  SourceLocation getBeginLoc() const LLVM_READONLY { return ForLoc; }
+  SourceLocation getEndLoc() const LLVM_READONLY {
+    return SubExprs[BODY]->getEndLoc();
+  }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CXXForRangeStmtClass;
+  }
+
+  // Iterators
+  child_range children() {
+    return child_range(&SubExprs[0], &SubExprs[END]);
+  }
+
+  const_child_range children() const {
+    return const_child_range(&SubExprs[0], &SubExprs[END]);
+  }
+};
+
+/// Representation of a Microsoft __if_exists or __if_not_exists
+/// statement with a dependent name.
+///
+/// The __if_exists statement can be used to include a sequence of statements
+/// in the program only when a particular dependent name does not exist. For
+/// example:
+///
+/// \code
+/// template<typename T>
+/// void call_foo(T &t) {
+///   __if_exists (T::foo) {
+///     t.foo(); // okay: only called when T::foo exists.
+///   }
+/// }
+/// \endcode
+///
+/// Similarly, the __if_not_exists statement can be used to include the
+/// statements when a particular name does not exist.
+///
+/// Note that this statement only captures __if_exists and __if_not_exists
+/// statements whose name is dependent. All non-dependent cases are handled
+/// directly in the parser, so that they don't introduce a new scope. Clang
+/// introduces scopes in the dependent case to keep names inside the compound
+/// statement from leaking out into the surround statements, which would
+/// compromise the template instantiation model. This behavior differs from
+/// Visual C++ (which never introduces a scope), but is a fairly reasonable
+/// approximation of the VC++ behavior.
+class MSDependentExistsStmt : public Stmt {
+  SourceLocation KeywordLoc;
+  bool IsIfExists;
+  NestedNameSpecifierLoc QualifierLoc;
+  DeclarationNameInfo NameInfo;
+  Stmt *SubStmt;
+
+  friend class ASTReader;
+  friend class ASTStmtReader;
+
+public:
+  MSDependentExistsStmt(SourceLocation KeywordLoc, bool IsIfExists,
+                        NestedNameSpecifierLoc QualifierLoc,
+                        DeclarationNameInfo NameInfo,
+                        CompoundStmt *SubStmt)
+  : Stmt(MSDependentExistsStmtClass),
+    KeywordLoc(KeywordLoc), IsIfExists(IsIfExists),
+    QualifierLoc(QualifierLoc), NameInfo(NameInfo),
+    SubStmt(reinterpret_cast<Stmt *>(SubStmt)) { }
+
+  /// Retrieve the location of the __if_exists or __if_not_exists
+  /// keyword.
+  SourceLocation getKeywordLoc() const { return KeywordLoc; }
+
+  /// Determine whether this is an __if_exists statement.
+  bool isIfExists() const { return IsIfExists; }
+
+  /// Determine whether this is an __if_exists statement.
+  bool isIfNotExists() const { return !IsIfExists; }
+
+  /// Retrieve the nested-name-specifier that qualifies this name, if
+  /// any.
+  NestedNameSpecifierLoc getQualifierLoc() const { return QualifierLoc; }
+
+  /// Retrieve the name of the entity we're testing for, along with
+  /// location information
+  DeclarationNameInfo getNameInfo() const { return NameInfo; }
+
+  /// Retrieve the compound statement that will be included in the
+  /// program only if the existence of the symbol matches the initial keyword.
+  CompoundStmt *getSubStmt() const {
+    return reinterpret_cast<CompoundStmt *>(SubStmt);
+  }
+
+  SourceLocation getBeginLoc() const LLVM_READONLY { return KeywordLoc; }
+  SourceLocation getEndLoc() const LLVM_READONLY {
+    return SubStmt->getEndLoc();
+  }
+
+  child_range children() {
+    return child_range(&SubStmt, &SubStmt+1);
+  }
+
+  const_child_range children() const {
+    return const_child_range(&SubStmt, &SubStmt + 1);
+  }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == MSDependentExistsStmtClass;
+  }
+};
+
+/// Represents the body of a coroutine. This wraps the normal function
+/// body and holds the additional semantic context required to set up and tear
+/// down the coroutine frame.
+class CoroutineBodyStmt final
+    : public Stmt,
+      private llvm::TrailingObjects<CoroutineBodyStmt, Stmt *> {
+  enum SubStmt {
+    Body,          ///< The body of the coroutine.
+    Promise,       ///< The promise statement.
+    InitSuspend,   ///< The initial suspend statement, run before the body.
+    FinalSuspend,  ///< The final suspend statement, run after the body.
+    OnException,   ///< Handler for exceptions thrown in the body.
+    OnFallthrough, ///< Handler for control flow falling off the body.
+    Allocate,      ///< Coroutine frame memory allocation.
+    Deallocate,    ///< Coroutine frame memory deallocation.
+    ResultDecl,    ///< Declaration holding the result of get_return_object.
+    ReturnValue,   ///< Return value for thunk function: p.get_return_object().
+    ReturnStmt,    ///< Return statement for the thunk function.
+    ReturnStmtOnAllocFailure, ///< Return statement if allocation failed.
+    FirstParamMove ///< First offset for move construction of parameter copies.
+  };
+  unsigned NumParams;
+
+  friend class ASTStmtReader;
+  friend class ASTReader;
+  friend TrailingObjects;
+
+  Stmt **getStoredStmts() { return getTrailingObjects(); }
+
+  Stmt *const *getStoredStmts() const { return getTrailingObjects(); }
+
+public:
+
+  struct CtorArgs {
+    Stmt *Body = nullptr;
+    Stmt *Promise = nullptr;
+    Expr *InitialSuspend = nullptr;
+    Expr *FinalSuspend = nullptr;
+    Stmt *OnException = nullptr;
+    Stmt *OnFallthrough = nullptr;
+    Expr *Allocate = nullptr;
+    Expr *Deallocate = nullptr;
+    Stmt *ResultDecl = nullptr;
+    Expr *ReturnValue = nullptr;
+    Stmt *ReturnStmt = nullptr;
+    Stmt *ReturnStmtOnAllocFailure = nullptr;
+    ArrayRef<Stmt *> ParamMoves;
+  };
+
+private:
+
+  CoroutineBodyStmt(CtorArgs const& Args);
+
+public:
+  static CoroutineBodyStmt *Create(const ASTContext &C, CtorArgs const &Args);
+  static CoroutineBodyStmt *Create(const ASTContext &C, EmptyShell,
+                                   unsigned NumParams);
+
+  bool hasDependentPromiseType() const {
+    return getPromiseDecl()->getType()->isDependentType();
+  }
+
+  /// Retrieve the body of the coroutine as written. This will be either
+  /// a CompoundStmt. If the coroutine is in function-try-block, we will
+  /// wrap the CXXTryStmt into a CompoundStmt to keep consistency.
+  CompoundStmt *getBody() const {
+    return cast<CompoundStmt>(getStoredStmts()[SubStmt::Body]);
+  }
+
+  Stmt *getPromiseDeclStmt() const {
+    return getStoredStmts()[SubStmt::Promise];
+  }
+  VarDecl *getPromiseDecl() const {
+    return cast<VarDecl>(cast<DeclStmt>(getPromiseDeclStmt())->getSingleDecl());
+  }
+
+  Stmt *getInitSuspendStmt() const {
+    return getStoredStmts()[SubStmt::InitSuspend];
+  }
+  Stmt *getFinalSuspendStmt() const {
+    return getStoredStmts()[SubStmt::FinalSuspend];
+  }
+
+  Stmt *getExceptionHandler() const {
+    return getStoredStmts()[SubStmt::OnException];
+  }
+  Stmt *getFallthroughHandler() const {
+    return getStoredStmts()[SubStmt::OnFallthrough];
+  }
+
+  Expr *getAllocate() const {
+    return cast_or_null<Expr>(getStoredStmts()[SubStmt::Allocate]);
+  }
+  Expr *getDeallocate() const {
+    return cast_or_null<Expr>(getStoredStmts()[SubStmt::Deallocate]);
+  }
+  Stmt *getResultDecl() const { return getStoredStmts()[SubStmt::ResultDecl]; }
+  Expr *getReturnValueInit() const {
+    return cast<Expr>(getStoredStmts()[SubStmt::ReturnValue]);
+  }
+  Expr *getReturnValue() const {
+    auto *RS = dyn_cast_or_null<clang::ReturnStmt>(getReturnStmt());
+    return RS ? RS->getRetValue() : nullptr;
+  }
+  Stmt *getReturnStmt() const { return getStoredStmts()[SubStmt::ReturnStmt]; }
+  Stmt *getReturnStmtOnAllocFailure() const {
+    return getStoredStmts()[SubStmt::ReturnStmtOnAllocFailure];
+  }
+  ArrayRef<Stmt const *> getParamMoves() const {
+    return {getStoredStmts() + SubStmt::FirstParamMove, NumParams};
+  }
+
+  SourceLocation getBeginLoc() const LLVM_READONLY {
+    return getBody() ? getBody()->getBeginLoc()
+                     : getPromiseDecl()->getBeginLoc();
+  }
+  SourceLocation getEndLoc() const LLVM_READONLY {
+    return getBody() ? getBody()->getEndLoc() : getPromiseDecl()->getEndLoc();
+  }
+
+  child_range children() {
+    return child_range(getStoredStmts(),
+                       getStoredStmts() + SubStmt::FirstParamMove + NumParams);
+  }
+
+  const_child_range children() const {
+    return const_child_range(getStoredStmts(), getStoredStmts() +
+                                                   SubStmt::FirstParamMove +
+                                                   NumParams);
+  }
+
+  child_range childrenExclBody() {
+    return child_range(getStoredStmts() + SubStmt::Body + 1,
+                       getStoredStmts() + SubStmt::FirstParamMove + NumParams);
+  }
+
+  const_child_range childrenExclBody() const {
+    return const_child_range(getStoredStmts() + SubStmt::Body + 1,
+                             getStoredStmts() + SubStmt::FirstParamMove +
+                                 NumParams);
+  }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CoroutineBodyStmtClass;
+  }
+};
+
+/// Represents a 'co_return' statement in the C++ Coroutines TS.
+///
+/// This statament models the initialization of the coroutine promise
+/// (encapsulating the eventual notional return value) from an expression
+/// (or braced-init-list), followed by termination of the coroutine.
+///
+/// This initialization is modeled by the evaluation of the operand
+/// followed by a call to one of:
+///   <promise>.return_value(<operand>)
+///   <promise>.return_void()
+/// which we name the "promise call".
+class CoreturnStmt : public Stmt {
+  SourceLocation CoreturnLoc;
+
+  enum SubStmt { Operand, PromiseCall, Count };
+  Stmt *SubStmts[SubStmt::Count];
+
+  bool IsImplicit : 1;
+
+  friend class ASTStmtReader;
+public:
+  CoreturnStmt(SourceLocation CoreturnLoc, Stmt *Operand, Stmt *PromiseCall,
+               bool IsImplicit = false)
+      : Stmt(CoreturnStmtClass), CoreturnLoc(CoreturnLoc),
+        IsImplicit(IsImplicit) {
+    SubStmts[SubStmt::Operand] = Operand;
+    SubStmts[SubStmt::PromiseCall] = PromiseCall;
+  }
+
+  CoreturnStmt(EmptyShell) : CoreturnStmt({}, {}, {}) {}
+
+  SourceLocation getKeywordLoc() const { return CoreturnLoc; }
+
+  /// Retrieve the operand of the 'co_return' statement. Will be nullptr
+  /// if none was specified.
+  Expr *getOperand() const { return static_cast<Expr*>(SubStmts[Operand]); }
+
+  /// Retrieve the promise call that results from this 'co_return'
+  /// statement. Will be nullptr if either the coroutine has not yet been
+  /// finalized or the coroutine has no eventual return type.
+  Expr *getPromiseCall() const {
+    return static_cast<Expr*>(SubStmts[PromiseCall]);
+  }
+
+  bool isImplicit() const { return IsImplicit; }
+  void setIsImplicit(bool value = true) { IsImplicit = value; }
+
+  SourceLocation getBeginLoc() const LLVM_READONLY { return CoreturnLoc; }
+  SourceLocation getEndLoc() const LLVM_READONLY {
+    return getOperand() ? getOperand()->getEndLoc() : getBeginLoc();
+  }
+
+  child_range children() {
+    return child_range(SubStmts, SubStmts + SubStmt::Count);
+  }
+
+  const_child_range children() const {
+    return const_child_range(SubStmts, SubStmts + SubStmt::Count);
+  }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CoreturnStmtClass;
+  }
+};
+
+/// CXXExpansionStmt - Base class for a C++ expansion statement (P1306).
+///
+class CXXExpansionStmt : public Stmt {
+protected:
+  /// \brief The subexpressions of an expansion include the expansion variable,
+  /// the tuple, pack, or init-list being expanded, and the expansion body.
+  enum {
+    INIT,    ///< Init statement.
+    TPARAM,  ///< The dependent reference to the template parameter.
+    VAR ,    ///< The variable bound to each instance of the expansion.
+    SIZE,    ///< Determines number of expansions (possibly null).
+    BODY,    ///< The uninstantiated expansion body.
+    END
+  };
+  Stmt *SubStmts[END];
+
+  Stmt **Expansions;
+
+  SourceLocation TemplateKWLoc;
+  SourceLocation ForLoc;
+  SourceLocation LParenLoc;
+  SourceLocation ColonLoc;
+  SourceLocation RParenLoc;
+
+  CXXExpansionStmt(StmtClass SC, Stmt *Init, DeclStmt *ExpansionVar,
+                   Expr *SizeExpr, SourceLocation TemplateKWLoc,
+                   SourceLocation ForLoc, SourceLocation LParenLoc,
+                   SourceLocation ColonLoc, SourceLocation RParenLoc,
+                   Expr *TParamRef);
+  CXXExpansionStmt(StmtClass SC, EmptyShell Empty) : Stmt(SC) { }
+
+  Stmt *const *getStmts() const { return SubStmts; }
+  Stmt **getStmts() { return SubStmts; }
+
+public:
+  SourceLocation getBeginLoc() const LLVM_READONLY {
+    return getTemplateKWLoc();
+  }
+
+  SourceLocation getTemplateKWLoc() const LLVM_READONLY { return TemplateKWLoc; }
+  SourceLocation getForLoc() const LLVM_READONLY { return ForLoc; }
+  SourceLocation getLParenLoc() const LLVM_READONLY { return LParenLoc; }
+  SourceLocation getColonLoc() const LLVM_READONLY { return ColonLoc; }
+  SourceLocation getRParenLoc() const LLVM_READONLY { return RParenLoc; }
+
+  SourceLocation getEndLoc() const LLVM_READONLY {
+    return getBody()->getEndLoc();
+  }
+
+  Stmt *getInit() { return SubStmts[INIT]; }
+  const Stmt *getInit() const {
+    return const_cast<CXXExpansionStmt *>(this)->getInit();
+  }
+
+  DeclStmt *getExpansionVarStmt() { return cast<DeclStmt>(SubStmts[VAR]); }
+  const DeclStmt *getExpansionVarStmt() const {
+    return const_cast<CXXExpansionStmt *>(this)->getExpansionVarStmt();
+  }
+
+
+  Expr *getSizeExpr() {
+    return SubStmts[SIZE] ? cast<Expr>(SubStmts[SIZE]) : nullptr;
+  }
+  const Expr *getSizeExpr() const {
+    return const_cast<CXXExpansionStmt *>(this)->getSizeExpr();
+  }
+  void setSizeExpr(Expr *SizeExpr) { SubStmts[SIZE] = SizeExpr; }
+
+  Stmt *getBody() { return SubStmts[BODY]; }
+  const Stmt *getBody() const {
+    return const_cast<CXXExpansionStmt *>(this)->getBody();
+  }
+  void setBody(Stmt *Body) { SubStmts[BODY] = Body; }
+
+  VarDecl *getExpansionVariable();
+  const VarDecl *getExpansionVariable() const {
+    return const_cast<CXXExpansionStmt *>(this)->getExpansionVariable();
+  }
+
+  Expr *getTParamRef() { return cast<Expr>(SubStmts[TPARAM]); }
+  const Expr *getTParamRef() const {
+    return const_cast<CXXExpansionStmt *>(this)->getTParamRef();
+  }
+
+  unsigned getNumInstantiations() const;
+  bool hasDependentSize() const;
+
+  Stmt *getInstantiation(size_t Idx) const {
+    return Expansions ? Expansions[Idx] : nullptr;
+  }
+  void setInstantiations(Stmt **Stmts) { Expansions = Stmts; }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() >= firstCXXExpansionStmtConstant &&
+           T->getStmtClass() <= lastCXXExpansionStmtConstant;
+  }
+
+  child_range children() {
+    return child_range(getStmts(), getStmts() + END);
+  }
+
+  const_child_range children() const {
+    return const_child_range(getStmts(), getStmts() + END);
+  }
+
+  friend class ASTStmtReader;
+};
+
+/// CXXIndeterminateExpansionStmt - Expansion over a type-dependent expression.
+///
+/// When the range of an expansion statement is type-dependent, it won't be
+/// possible to resolve it to a destructurable or an iterable expansion until
+/// instantiation (more: different instantiations might take either form).
+///
+/// This Stmt acts as a "placeholder" node, which TreeTransform will make into
+/// either a CXXDestructurableExpansionStmt or a CXXIterableExpansionStmt.
+///
+class CXXIndeterminateExpansionStmt final : public CXXExpansionStmt {
+private:
+  CXXIndeterminateExpansionStmt(Stmt *Init, DeclStmt *ExpansionVar,
+                                SourceLocation TemplateKWLoc,
+                                SourceLocation ForLoc, SourceLocation LParenLoc,
+                                SourceLocation ColonLoc,
+                                SourceLocation RParenLoc, Expr *TParamRef)
+      : CXXExpansionStmt(CXXIndeterminateExpansionStmtClass, Init,
+                         ExpansionVar, nullptr, TemplateKWLoc, ForLoc,
+                         LParenLoc, ColonLoc, RParenLoc, TParamRef) { }
+
+  CXXIndeterminateExpansionStmt(EmptyShell Empty)
+      : CXXExpansionStmt(CXXIndeterminateExpansionStmtClass, Empty) { }
+
+public:
+  static CXXIndeterminateExpansionStmt *Create(const ASTContext &C, Stmt *Init,
+                                               DeclStmt *ExpansionVar,
+                                               SourceLocation TemplateKWLoc,
+                                               SourceLocation ForLoc,
+                                               SourceLocation LParenLoc,
+                                               SourceLocation ColonLoc,
+                                               SourceLocation RParenLoc,
+                                               Expr *TParamRef);
+
+  static CXXIndeterminateExpansionStmt *Create(const ASTContext &C,
+                                               EmptyShell Empty);
+  bool hasDependentSize() const;
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CXXIndeterminateExpansionStmtClass;
+  }
+
+  friend class ASTStmtReader;
+};
+
+/// CXXIterableExpansionStmt - Expansion over a iterable expression.
+///
+class CXXIterableExpansionStmt final : public CXXExpansionStmt {
+  unsigned NumInstantiations;
+
+private:
+  CXXIterableExpansionStmt(Stmt *Init, DeclStmt *ExpansionVar, Expr *SizeExpr,
+                           unsigned NumInstantiations,
+                           SourceLocation TemplateKWLoc, SourceLocation ForLoc,
+                           SourceLocation LParenLoc, SourceLocation ColonLoc,
+                           SourceLocation RParenLoc, Expr *TParamRef)
+      : CXXExpansionStmt(CXXIterableExpansionStmtClass, Init,
+                         ExpansionVar, SizeExpr, TemplateKWLoc, ForLoc,
+                         LParenLoc, ColonLoc, RParenLoc, TParamRef),
+        NumInstantiations(NumInstantiations) { }
+
+  CXXIterableExpansionStmt(EmptyShell Empty)
+      : CXXExpansionStmt(CXXIterableExpansionStmtClass, Empty) { }
+
+public:
+  static CXXIterableExpansionStmt *Create(const ASTContext &C, Stmt *Init,
+                                          DeclStmt *ExpansionVar,
+                                          Expr *SizeExpr,
+                                          unsigned NumInstantiations,
+                                          SourceLocation TemplateKWLoc,
+                                          SourceLocation ForLoc,
+                                          SourceLocation LParenLoc,
+                                          SourceLocation ColonLoc,
+                                          SourceLocation RParenLoc,
+                                          Expr *TParamRef);
+
+  static CXXIterableExpansionStmt *Create(const ASTContext &C,
+                                          EmptyShell Empty);
+
+  bool hasDependentSize() const;
+  unsigned getNumInstantiations() const;
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CXXIterableExpansionStmtClass;
+  }
+
+  friend class ASTStmtReader;
+};
+
+/// CXXDestructurableExpansionStmt - Expansion over a destructurable expression.
+///
+class CXXDestructurableExpansionStmt final : public CXXExpansionStmt {
+private:
+  CXXDestructurableExpansionStmt(Stmt *Init, DeclStmt *ExpansionVar,
+                                 SourceLocation TemplateKWLoc,
+                                 SourceLocation ForLoc,
+                                 SourceLocation LParenLoc,
+                                 SourceLocation ColonLoc,
+                                 SourceLocation RParenLoc, Expr *TParamRef)
+      : CXXExpansionStmt(CXXDestructurableExpansionStmtClass, Init,
+                         ExpansionVar, nullptr, TemplateKWLoc, ForLoc,
+                         LParenLoc, ColonLoc, RParenLoc, TParamRef) { }
+
+  CXXDestructurableExpansionStmt(EmptyShell Empty)
+      : CXXExpansionStmt(CXXDestructurableExpansionStmtClass, Empty) { }
+
+public:
+  static CXXDestructurableExpansionStmt *Create(const ASTContext &C, Stmt *Init,
+                                                DeclStmt *ExpansionVar,
+                                                SourceLocation TemplateKWLoc,
+                                                SourceLocation ForLoc,
+                                                SourceLocation LParenLoc,
+                                                SourceLocation ColonLoc,
+                                                SourceLocation RParenLoc,
+                                                Expr *TParamRef);
+
+  static CXXDestructurableExpansionStmt *Create(const ASTContext &C,
+                                                EmptyShell Empty);
+
+  bool hasDependentSize() const;
+  unsigned getNumInstantiations() const;
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CXXDestructurableExpansionStmtClass;
+  }
+
+  friend class ASTStmtReader;
+};
+
+/// CXXInitListExpansionStmt - Expansion over an expansion-init-list.
+///
+class CXXInitListExpansionStmt final : public CXXExpansionStmt {
+private:
+  CXXInitListExpansionStmt(Stmt *Init, DeclStmt *ExpansionVar,
+                           SourceLocation TemplateKWLoc, SourceLocation ForLoc,
+                           SourceLocation LParenLoc, SourceLocation ColonLoc,
+                           SourceLocation RParenLoc, Expr *TParamRef)
+      : CXXExpansionStmt(CXXInitListExpansionStmtClass, Init, ExpansionVar,
+                         nullptr, TemplateKWLoc, ForLoc, LParenLoc,
+                         ColonLoc, RParenLoc, TParamRef) { }
+
+  CXXInitListExpansionStmt(EmptyShell Empty)
+      : CXXExpansionStmt(CXXInitListExpansionStmtClass, Empty) { }
+
+public:
+  static CXXInitListExpansionStmt *Create(const ASTContext &C, Stmt *Init,
+                                          DeclStmt *ExpansionVar,
+                                          SourceLocation TemplateKWLoc,
+                                          SourceLocation ForLoc,
+                                          SourceLocation LParenLoc,
+                                          SourceLocation ColonLoc,
+                                          SourceLocation RParenLoc,
+                                          Expr *TParamRef);
+
+  static CXXInitListExpansionStmt *Create(const ASTContext &C,
+                                          EmptyShell Empty);
+
+  bool hasDependentSize() const;
+  unsigned getNumInstantiations() const;
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CXXInitListExpansionStmtClass;
+  }
+
+  friend class ASTStmtReader;
+};
+
+class SemaContractHelper;
+
+class ContractStmt final
+    : public Stmt,
+      private llvm::TrailingObjects<ContractStmt, Stmt *, const Attr *> {
+
+  // A Note on attributes:
+  // Contracts allow attribute to apppear in two places:
+  //   [[#1]] pre [[#2]] ( ... )
+  //
+  // Unlike most statements, contracts will have meaning ful attributes. For
+  // example, one which overrides the message in diagnostics.
+  //
+  // Because these attributes apply directly to the contract and it's semantics
+  // we store them directly in the contract statement. This is different from
+  // other statements, which use AttributedStmt to wrap the statement.
+  // However, the wrapping behavior makes it non-trivial for a contract to
+  // access its attributes.
+  //
+  // NOTE: We should consider only storing attributes of the form [[#2]] here.
+
+  friend class ASTStmtReader;
+  friend TrailingObjects;
+  friend class SemaContractHelper;
+
+  unsigned numTrailingObjects(OverloadToken<Stmt *>) const {
+    return ContractAssertBits.HasResultName + 1;
+  }
+
+  Stmt **getStmtPtr() { return getTrailingObjects<Stmt *>(); }
+
+  unsigned numTrailingObjects(OverloadToken<const Attr *>) const {
+    return ContractAssertBits.NumAttrs;
+  }
+
+  const Attr **getAttrPtr() { return getTrailingObjects<const Attr *>(); }
+
+  SourceLocation KeywordLoc;
+
+  ArrayRef<Stmt *> getSubStmts() const {
+    return llvm::ArrayRef(getTrailingObjects<Stmt *>(),
+                          numTrailingObjects(OverloadToken<Stmt *>{}));
+  }
+
+  MutableArrayRef<Stmt *> getSubStmts() {
+    return llvm::MutableArrayRef(getTrailingObjects<Stmt *>(),
+                                 numTrailingObjects(OverloadToken<Stmt *>{}));
+  }
+
+  void setResultName(DeclStmt *D) {
+    assert(hasResultName() && "no result name decl");
+    getSubStmts().front() = D;
+  }
+
+  void setCondition(Expr *E) {
+    assert(E && "no condition");
+    getSubStmts().back() = E;
+  }
+
+  void copyAttrs(ArrayRef<const Attr *> Attrs) {
+    assert(Attrs.size() == ContractAssertBits.NumAttrs &&
+           "wrong number of attributes");
+    std::copy(Attrs.begin(), Attrs.end(), getAttrPtr());
+  }
+
+  ContractStmt(ContractKind CK, SourceLocation KeywordLoc, Expr *Condition,
+               DeclStmt *RN, ArrayRef<const Attr *> Attrs = {})
+      : Stmt(ContractStmtClass), KeywordLoc(KeywordLoc) {
+    ContractAssertBits.ContractKind = static_cast<unsigned>(CK);
+    ContractAssertBits.HasResultName = RN != nullptr;
+    ContractAssertBits.NumAttrs = Attrs.size();
+    if (RN)
+      setResultName(RN);
+    setCondition(Condition);
+    if (!Attrs.empty())
+      copyAttrs(Attrs);
+  }
+
+  ContractStmt(EmptyShell Empty, ContractKind Kind, bool HasResultName,
+               unsigned NumAttrs = 0)
+      : Stmt(ContractStmtClass, Empty) {
+    ContractAssertBits.ContractKind = static_cast<unsigned>(Kind);
+    ContractAssertBits.HasResultName = HasResultName;
+    ContractAssertBits.NumAttrs = NumAttrs;
+    if (NumAttrs != 0)
+      std::fill_n(getAttrPtr(), NumAttrs, nullptr);
+  }
+
+public:
+  static ContractStmt *Create(const ASTContext &C, ContractKind Kind,
+                              SourceLocation KeywordLoc, Expr *Condition,
+                              DeclStmt *ResultNameDecl,
+                              ArrayRef<const Attr *> Attrs = {});
+
+  static ContractStmt *CreateEmpty(const ASTContext &C, ContractKind Kind,
+                                   bool HasResultName, unsigned NumAttrs);
+
+  bool hasResultName() const { return ContractAssertBits.HasResultName; }
+
+  DeclStmt *getResultNameDeclStmt() const {
+    return hasResultName() ? static_cast<DeclStmt *>(getSubStmts().front())
+                           : nullptr;
+  }
+
+  ResultNameDecl *getResultName() const;
+
+  Expr *getCond() { return static_cast<Expr *>(getSubStmts().back()); }
+  const Expr *getCond() const {
+    return const_cast<ContractStmt *>(this)->getCond();
+  }
+
+public:
+  // Convert the contract semantic to a string for use in diagnostics.
+  static StringRef SemanticAsString(ContractEvaluationSemantic Semantic);
+  static ContractEvaluationSemantic *StringAsSemantic(StringRef Str);
+
+  // Convert the contract kind (pre, post, or contract_assert) to a string
+  static StringRef ContractKindAsString(ContractKind Kind);
+
+  /// Return the source text associated with this contract.
+  std::string getSourceText(const ASTContext &Ctx) const;
+
+  /// Return the message for use in building the contract violation
+  /// diagnostic. It may be different than the source text.
+  std::string getMessage(const ASTContext &Ctx) const;
+
+  /// Return the type of the contract.
+  /// It's one of 'pre', 'post', 'contract_assert'.
+  ContractKind getContractKind() const {
+    return static_cast<ContractKind>(ContractAssertBits.ContractKind);
+  }
+
+  StringRef getContractKindString() const {
+    return ContractStmt::ContractKindAsString(getContractKind());
+  }
+
+  /// Calculate the evaluation semantic for a specific contract.
+  ///
+  /// This takes into account the default evaluation semantic for all contracts,
+  /// as well as any attributes on the specific contract itself.
+  ContractEvaluationSemantic getSemantic(const ASTContext &Ctx) const;
+
+  StringRef getSemanticString(const ASTContext &Ctx) const {
+    return ContractStmt::SemanticAsString(getSemantic(Ctx));
+  }
+
+  ArrayRef<const Attr *> getAttrs() const {
+    return llvm::ArrayRef(getTrailingObjects<const Attr *>(),
+                          ContractAssertBits.NumAttrs);
+  }
+  // Access attributes of a particular type.
+  template <class T> const T *getAttrAs() const;
+
+  SourceLocation getKeywordLoc() const { return KeywordLoc; }
+  SourceLocation getBeginLoc() const LLVM_READONLY { return KeywordLoc; }
+  SourceLocation getExpressionLoc() const LLVM_READONLY {
+    return getSubStmts().back()->getBeginLoc();
+  }
+  SourceLocation getEndLoc() const LLVM_READONLY {
+    assert(!KeywordLoc.isInvalid() &&
+           "Trying to get end location on an invalid node");
+    return getSubStmts().back()->getEndLoc();
+  }
+
+  child_range children() { return getSubStmts(); }
+  const_child_range children() const { return getSubStmts(); }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == ContractStmtClass;
+  }
+};
+
+template <class T> const T *ContractStmt::getAttrAs() const {
+  for (auto *A : getAttrs()) {
+    if (const T *TA = dyn_cast<T>(A)) {
+      return TA;
+    }
+  }
+  return nullptr;
+}
+
+}  // end namespace clang
+
+#endif

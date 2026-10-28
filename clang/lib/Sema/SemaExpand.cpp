@@ -1,0 +1,805 @@
+//===--- SemaExpand.cpp - Semantic Analysis for Expansion Statements-------===//
+//
+// Copyright 2024 Bloomberg Finance L.P.
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+//  This file implements semantic analysis for expansion statements.
+//
+//===----------------------------------------------------------------------===//
+
+#include "clang/AST/Decl.h"
+#include "clang/AST/DynamicRecursiveASTVisitor.h"
+#include "clang/AST/Type.h"
+#include "clang/Basic/DiagnosticParse.h"
+#include "clang/Basic/DiagnosticSema.h"
+#include "clang/Lex/Preprocessor.h"
+#include "clang/Sema/EnterExpressionEvaluationContext.h"
+#include "clang/Sema/Initialization.h"
+#include "clang/Sema/Lookup.h"
+#include "clang/Sema/Overload.h"
+#include "clang/Sema/Sema.h"
+#include "clang/Sema/Template.h"
+#include "llvm/Support/SaveAndRestore.h"
+
+
+using namespace clang;
+using namespace sema;
+
+namespace {
+
+VarDecl *ExtractVarDecl(Stmt *S) {
+  if (auto *DS = dyn_cast_or_null<DeclStmt>(S); S)
+    if (Decl *D = DS->getSingleDecl(); D && !D->isInvalidDecl())
+      return dyn_cast<VarDecl>(D);
+  return nullptr;
+}
+
+unsigned ExtractParmVarDeclDepth(Expr *E) {
+  if (auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    if (auto *PVD = cast<NonTypeTemplateParmDecl>(DRE->getDecl()))
+      return PVD->getDepth();
+  } else if (auto *SNTTPE = cast<SubstNonTypeTemplateParmExpr>(E)) {
+    if (auto *PVD = cast<NonTypeTemplateParmDecl>(SNTTPE->getAssociatedDecl()))
+      return PVD->getDepth();
+  }
+  return 0;
+}
+
+ExprResult makeIterableExpansionSizeExpr(Sema &S, VarDecl *RangeVar) {
+  auto Ctx = Sema::ExpressionEvaluationContext::PotentiallyEvaluated;
+  if (RangeVar->isConstexpr())
+    Ctx = Sema::ExpressionEvaluationContext::ImmediateFunctionContext;
+  EnterExpressionEvaluationContext ExprEvalCtx(S, Ctx);
+
+  SourceLocation RangeLoc = RangeVar->getBeginLoc();
+
+  DeclarationNameInfo BeginName(&S.PP.getIdentifierTable().get("begin"),
+                                RangeLoc);
+  LookupResult BeginLR(S, BeginName, Sema::LookupMemberName);
+  {
+    if (auto *RD = RangeVar->getType().getNonReferenceType()->getAsCXXRecordDecl())
+      S.LookupQualifiedName(BeginLR, RD);
+  }
+
+  DeclarationNameInfo EndName(&S.PP.getIdentifierTable().get("end"), RangeLoc);
+  LookupResult EndLR(S, EndName, Sema::LookupMemberName);
+  {
+    if (auto *RD = RangeVar->getType().getNonReferenceType()->getAsCXXRecordDecl())
+      S.LookupQualifiedName(EndLR, RD);
+  }
+
+  Expr *VarRef;
+  {
+    DeclarationNameInfo Name(RangeVar->getDeclName(), RangeVar->getBeginLoc());
+    // A DeclRefExpr's type must never itself be a reference type (see the
+    // sibling VarRef construction in tryMakeCXXIterableExpansionSelectExpr,
+    // which already strips it via 'Range->getType()' being non-reference to
+    // begin with). RangeVar's *declared* type is now a genuine reference
+    // (see the 'getAutoRRefDeductType()' comment above) rather than the
+    // by-value const copy it used to be, so it must be stripped here too --
+    // otherwise Sema::BuildDeclRefExpr crashes
+    // ("Expressions can't have reference type", Expr::setType).
+    VarRef = S.BuildDeclRefExpr(RangeVar, RangeVar->getType().getNonReferenceType(),
+                                VK_LValue, Name, nullptr, RangeVar);
+  }
+  assert(VarRef);
+
+  ExprResult BeginResult;
+  {
+    OverloadCandidateSet CandidateSet(RangeLoc,
+                                      OverloadCandidateSet::CSK_Normal);
+    Sema::ForRangeStatus Status =
+        S.BuildForRangeBeginEndCall(RangeLoc, RangeLoc, BeginName, BeginLR,
+                                    &CandidateSet, VarRef, &BeginResult);
+    if (Status != Sema::FRS_Success)
+      return ExprError();
+    assert(!BeginResult.isInvalid());
+  }
+  Expr *Begin = BeginResult.get();
+
+  ExprResult EndResult;
+  {
+    OverloadCandidateSet CandidateSet(RangeLoc,
+                                      OverloadCandidateSet::CSK_Normal);
+    Sema::ForRangeStatus Status =
+        S.BuildForRangeBeginEndCall(RangeLoc, RangeLoc, EndName, EndLR,
+                                    &CandidateSet, VarRef, &EndResult);
+    if (Status != Sema::FRS_Success)
+      return ExprError();
+    assert(!EndResult.isInvalid());
+  }
+  Expr *End = EndResult.get();
+
+  OverloadedOperatorKind Op = OO_Minus;
+  DeclarationName OpName(S.Context.DeclarationNames.getCXXOperatorName(Op));
+
+  Expr *Args[2] = {EndResult.get(), BeginResult.get()};
+  OverloadCandidateSet CandidateSet(RangeLoc,
+                                    OverloadCandidateSet::CSK_Operator);
+  S.AddArgumentDependentLookupCandidates(OpName, RangeLoc, Args, nullptr,
+                                         CandidateSet);
+
+  UnresolvedSet<4> Fns;
+  S.AddFunctionCandidates(Fns, Args, CandidateSet);
+
+  return S.MaybeCreateExprWithCleanups(
+      S.CreateOverloadedBinOp(RangeLoc, BO_Sub, Fns, End, Begin));
+}
+
+// Returns 'true' if the 'Range' is an iterable expression, and 'false'
+// otherwise. If 'true', then 'Result' contains the resulting
+// 'CXXIterableExpansionSelectExpr' (or error).
+bool tryMakeCXXIterableExpansionSelectExpr(
+    Sema &S, Expr *Range, Expr *TParamRef, VarDecl *ExpansionVar,
+    ArrayRef<MaterializeTemporaryExpr *> LifetimeExtendTemps,
+    ExprResult &SelectResult) {
+  auto Ctx = Sema::ExpressionEvaluationContext::PotentiallyEvaluated;
+  if (ExpansionVar->isConstexpr())
+    Ctx = Sema::ExpressionEvaluationContext::ImmediateFunctionContext;
+  EnterExpressionEvaluationContext ExprEvalCtx(S, Ctx);
+
+  if (Range->getType()->isArrayType())
+    return false;
+  SourceLocation RangeLoc = Range->getExprLoc();
+
+  DeclarationNameInfo BeginName(&S.PP.getIdentifierTable().get("begin"),
+                                RangeLoc);
+  LookupResult BeginLR(S, BeginName, Sema::LookupMemberName);
+  {
+    if (auto *RD = Range->getType().getNonReferenceType()->getAsCXXRecordDecl())
+      S.LookupQualifiedName(BeginLR, RD);
+  }
+
+  VarDecl *RangeVar;
+  Expr *VarRef;
+  {
+    assert(isa<ExpansionStmtDecl>(S.CurContext));
+    DeclContext *DC = S.CurContext;
+    while (isa<ExpansionStmtDecl>(DC))
+      DC = DC->getParent();
+
+    IdentifierInfo *II = &S.PP.getIdentifierTable().get("__range");
+    // The hidden '__range' used to always be a const-qualified BY-VALUE
+    // copy ('Range->getType().withConst()'), constructed here unconditionally
+    // -- via the AddInitializerToDecl call below -- before this function has
+    // even determined whether the type is iterable (that's decided later, by
+    // the begin()/end() lookups). For a range type with a deleted or
+    // inaccessible copy constructor (e.g. a std::tuple holding a
+    // std::unique_ptr), that copy attempt is a hard, non-SFINAE diagnostic
+    // that fires regardless of whether this iterable path ultimately
+    // applies, permanently corrupting a 'template for' over such a type even
+    // though the destructurable path below never needed a copy at all (see
+    // issue #181).
+    //
+    // An lvalue range denotes the original object and must not be copied:
+    // besides making mutations visible, preserving its cv-qualification
+    // allows the usual begin()/end() overload resolution. Keep the existing
+    // by-value path for non-lvalues, whose lifetime and constant-evaluation
+    // behavior is relied on by prvalue reflection ranges. In particular,
+    // this also avoids instantiating a copy for non-copyable tuple-like
+    // ranges, where this function is tried before destructuring (issue #181).
+    QualType CopyQT = Range->getType().withConst();
+    // 'void' can't be copy-constructed OR referenced (deducing 'auto&&'
+    // against it is its own hard error, "cannot form a reference to
+    // 'void'"), so it must use the plain by-value spelling regardless of the
+    // check below -- it was never going to succeed as a range either way,
+    // and this just preserves whatever diagnostic it was already going to
+    // produce elsewhere (e.g. an unresolved-overloaded-function recovery
+    // expression) instead of pre-empting it with a less specific one.
+    bool CanCopyConstruct = Range->getType()->isVoidType();
+    if (!CanCopyConstruct && !Range->isLValue()) {
+      InitializedEntity Entity = InitializedEntity::InitializeTemporary(CopyQT);
+      InitializationKind Kind = InitializationKind::CreateCopy(
+          Range->getBeginLoc(), Range->getBeginLoc());
+      InitializationSequence Seq(S, Entity, Kind, Range);
+      CanCopyConstruct = !Seq.Failed();
+    }
+    // [stmt.expand]: the range variable is 'decltype(auto) range =
+    // (expansion-initializer)', so an lvalue range always denotes the
+    // original object by reference. For a constexpr expansion variable the
+    // reference must be constexpr-referenceable (P2686R5): a static object or
+    // an automatic object of the same function parameter scope; anything else
+    // is ill-formed rather than silently iterating a copy.
+    // An xvalue range gives 'T&&' (decltype((xvalue)) is 'T&&'): it denotes the
+    // original object too. Only a prvalue is materialized by value.
+    bool BindByReference = Range->isLValue();
+    bool BindByRvalueReference = Range->isXValue();
+    QualType QT =
+        BindByRvalueReference
+            ? S.BuildReferenceType(Range->getType(), /*SpelledAsLValue=*/false,
+                                   Range->getBeginLoc(), DeclarationName())
+        : !BindByReference
+            ? CopyQT
+            : S.BuildReferenceType(Range->getType(), /*SpelledAsLValue=*/true,
+                                   Range->getBeginLoc(), DeclarationName());
+    TypeSourceInfo *TSI = S.Context.getTrivialTypeSourceInfo(QT);
+
+    RangeVar = VarDecl::Create(S.Context, DC, Range->getBeginLoc(),
+                               Range->getBeginLoc(), II, QT, TSI, SC_Auto);
+    // Range-based for's analogous synthesized __range/__begin/__end marks
+    // itself implicit (Sema::BuildCXXForRangeStmt, SemaStmt.cpp); this one
+    // didn't, which is why clang-tidy's bugprone-reserved-identifier and
+    // readability-identifier-naming (both gate solely on Decl::isImplicit())
+    // flagged every `template for` loop's synthesized __range, forcing a
+    // NOLINT around ordinary user code (docs/CONTRACTS_HARDENING.md M5).
+    // Deliberately not also calling setCXXForRangeImplicitVar(true): that
+    // flag carries range-for-specific semantics consumed elsewhere in
+    // Sema/CodeGen; isImplicit() alone is what both tidy checks need.
+    RangeVar->setImplicit();
+    if (ExpansionVar->isConstexpr())
+      RangeVar->setConstexpr(true);
+    // Lvalue references need no lifetime extension. The non-lvalue path
+    // remains by-value, so its source temporary is not the range variable.
+    if (!BindByReference && !BindByRvalueReference && !CanCopyConstruct &&
+        !LifetimeExtendTemps.empty()) {
+      InitializedEntity Entity =
+          InitializedEntity::InitializeVariable(RangeVar);
+      for (auto *MTE : LifetimeExtendTemps)
+        MTE->setExtendingDecl(RangeVar, Entity.allocateManglingNumber());
+    }
+
+    S.AddInitializerToDecl(RangeVar, Range, false);
+    if (RangeVar->isInvalidDecl()) {
+      SelectResult = ExprError();
+      return true;
+    }
+
+    DeclarationNameInfo Name(II, Range->getBeginLoc());
+    VarRef = S.BuildDeclRefExpr(RangeVar,
+                                RangeVar->getType().getNonReferenceType(),
+                                VK_LValue, Name, nullptr, RangeVar);
+  }
+
+  ExprResult BeginResult;
+  {
+    OverloadCandidateSet CandidateSet(RangeLoc,
+                                      OverloadCandidateSet::CSK_Normal);
+    Sema::ForRangeStatus Status =
+        S.BuildForRangeBeginEndCall(RangeLoc, RangeLoc, BeginName, BeginLR,
+                                    &CandidateSet, VarRef, &BeginResult);
+    if (Status != Sema::FRS_Success)
+      return false;
+    assert(!BeginResult.isInvalid());
+  }
+  Expr *Begin = BeginResult.get();
+
+  // Assume an error, unless we write something else.
+  SelectResult = ExprError();
+
+  OverloadedOperatorKind Op = OO_Plus;
+  DeclarationName OpName(S.Context.DeclarationNames.getCXXOperatorName(Op));
+
+  Expr *Args[2] = {Begin, TParamRef};
+  OverloadCandidateSet CandidateSet(RangeLoc,
+                                    OverloadCandidateSet::CSK_Operator);
+  S.AddArgumentDependentLookupCandidates(OpName, RangeLoc, Args, nullptr,
+                                         CandidateSet);
+
+  UnresolvedSet<4> Fns;
+  S.AddFunctionCandidates(Fns, Args, CandidateSet);
+
+  ExprResult ER = S.CreateOverloadedBinOp(RangeLoc, BO_Add, Fns, Begin,
+                                          TParamRef);
+  if (ER.isInvalid())
+    return true;
+  Expr *UnaryArg[1] = {ER.get()};
+
+  Op = OO_Star;
+  OpName = S.Context.DeclarationNames.getCXXOperatorName(Op);
+
+  CandidateSet.clear(OverloadCandidateSet::CSK_Operator);
+  S.AddArgumentDependentLookupCandidates(OpName, RangeLoc, UnaryArg, nullptr,
+                                         CandidateSet);
+
+  Fns.clear();
+  S.AddFunctionCandidates(Fns, UnaryArg, CandidateSet);
+
+  ExprResult Impl = S.CreateOverloadedUnaryOp(RangeLoc, UO_Deref, Fns,
+                                              ER.get());
+  if (Impl.isInvalid())
+    return true;
+
+  SelectResult = S.BuildCXXIterableExpansionSelectExpr(RangeVar, Impl.get());
+  return true;
+}
+
+ExprResult makeCXXDestructurableExpansionSelectExpr(
+    Sema &S, Expr *Range, Expr *TParamRef, VarDecl *ExpansionVar,
+    ArrayRef<MaterializeTemporaryExpr *> LifetimeExtendTemps) {
+  auto Ctx = Sema::ExpressionEvaluationContext::PotentiallyEvaluated;
+  if (ExpansionVar->isConstexpr())
+    Ctx = Sema::ExpressionEvaluationContext::ImmediateFunctionContext;
+  EnterExpressionEvaluationContext ExprEvalCtx(S, Ctx);
+
+  UnsignedOrNone Arity = S.GetDecompositionElementCount(Range->getType(),
+                                                        Range->getBeginLoc());
+  if (!Arity) {
+    // The count query can fail silently for scalar and union types. Use the
+    // structured binding diagnostic for these invalid expansion initializers.
+    const CXXRecordDecl *RD = Range->getType()->getAsCXXRecordDecl();
+    if (!RD || RD->isUnion())
+      S.Diag(Range->getBeginLoc(), diag::err_decomp_decl_unbindable_type)
+          << DeclarationName() << !RD << Range->getType();
+    return ExprError();
+  }
+
+  QualType QT = S.Context.getAutoDeductType();
+  if (ExpansionVar->getType()->isReferenceType())
+    // 'SpelledAsLValue' must track the expansion variable's own declared
+    // reference kind: 'auto&' needs a hidden binding of lvalue-reference
+    // type, but 'auto&&' needs an rvalue-reference (forwarding) type. This
+    // was previously hardcoded to 'true' unconditionally, which is
+    // indistinguishable from 'auto&' for any consumer of the resulting
+    // reference type -- in particular, it forced every hidden binding built
+    // here to be a plain lvalue reference even when the user wrote 'auto&&',
+    // so binding to a genuine prvalue range (e.g. 'template for (auto&&
+    // elem : SomeTuple{})') hard-errored with "non-const lvalue reference
+    // ... cannot bind to a temporary" instead of correctly binding via
+    // rvalue-reference/forwarding semantics (see issue #181).
+    QT = S.BuildReferenceType(
+        QT, !ExpansionVar->getType()->isRValueReferenceType(),
+        Range->getBeginLoc(), DeclarationName());
+
+  SmallVector<BindingDecl *, 4> Bindings;
+  for (size_t k = 0; k < *Arity; ++k) {
+    Bindings.push_back(BindingDecl::Create(S.Context, S.CurContext,
+                                           Range->getBeginLoc(),
+                                           /*IdentifierInfo=*/nullptr, QT));
+  }
+
+  TypeSourceInfo *TSI = S.Context.getTrivialTypeSourceInfo(QT);
+  DecompositionDecl *DD = DecompositionDecl::Create(S.Context, S.CurContext,
+                                                    Range->getBeginLoc(),
+                                                    Range->getBeginLoc(),
+                                                    QT, TSI,
+                                                    SC_Auto, Bindings);
+  if (ExpansionVar->isConstexpr())
+    DD->setConstexpr(true);
+
+  if (!LifetimeExtendTemps.empty()) {
+    InitializedEntity Entity = InitializedEntity::InitializeVariable(DD);
+    for (auto *MTE : LifetimeExtendTemps)
+      MTE->setExtendingDecl(DD, Entity.allocateManglingNumber());
+  }
+
+  S.AddInitializerToDecl(DD, Range, false);
+
+  return CXXDestructurableExpansionSelectExpr::Create(S.Context, DD,
+                                                      TParamRef, ExpansionVar);
+}
+}  // close anonymous namespace
+
+StmtResult Sema::ActOnCXXExpansionStmt(
+    NonTypeTemplateParmDecl *NTTP, SourceLocation TemplateKWLoc,
+    SourceLocation ForLoc, SourceLocation LParenLoc, Stmt *Init,
+    Stmt *ExpansionVarStmt, SourceLocation ColonLoc, Expr *Range,
+    SourceLocation RParenLoc, BuildForRangeKind Kind,
+    ArrayRef<MaterializeTemporaryExpr *> LifetimeExtendTemps) {
+  if (!Range || Kind == BFRK_Check)
+    return StmtError();
+
+  // Build a 'DeclRefExpr' designating the template parameter '__N'.
+  ExprResult ER = BuildDeclRefExpr(NTTP, Context.getSizeType(), VK_PRValue,
+                                   ColonLoc);
+  if (ER.isInvalid())
+    return StmtError();
+  Expr *TParamRef = ER.get();
+
+  VarDecl *ExpansionVar = ExtractVarDecl(ExpansionVarStmt);
+  if (!ExpansionVar)
+    return StmtError();
+
+  ER = BuildCXXExpansionSelectExpr(Range, TParamRef, ExpansionVar,
+                                   LifetimeExtendTemps);
+  if (ER.isInvalid())
+    return StmtError();
+  Expr *Select = ER.get();
+
+  assert(!ExpansionVar->getInit());
+  AddInitializerToDecl(ExpansionVar, Select, false);
+  if (ExpansionVar->isInvalidDecl())
+    return StmtError();
+
+  return BuildCXXExpansionStmt(TemplateKWLoc, ForLoc, LParenLoc, Init,
+                               ExpansionVarStmt, ColonLoc, RParenLoc,
+                               TParamRef);
+}
+
+StmtResult Sema::BuildCXXExpansionStmt(SourceLocation TemplateKWLoc,
+                                       SourceLocation ForLoc,
+                                       SourceLocation LParenLoc, Stmt *Init,
+                                       Stmt *ExpansionVarStmt,
+                                       SourceLocation ColonLoc,
+                                       SourceLocation RParenLoc,
+                                       Expr *TParamRef) {
+  VarDecl *ExpansionVar = ExtractVarDecl(ExpansionVarStmt);
+  if (!ExpansionVar)
+    return StmtError();
+  Expr *Select = ExpansionVar->getInit();
+  assert(Select);
+
+  if (auto *WithCleanups = dyn_cast<ExprWithCleanups>(Select))
+    Select = WithCleanups->getSubExpr();
+
+  if (isa<CXXExpansionInitListSelectExpr>(Select)) {
+    return BuildCXXInitListExpansionStmt(TemplateKWLoc, ForLoc, LParenLoc,
+                                         Init, ExpansionVarStmt, ColonLoc,
+                                         RParenLoc, TParamRef);
+  } else if (isa<CXXIndeterminateExpansionSelectExpr>(Select)) {
+    return BuildCXXIndeterminateExpansionStmt(TemplateKWLoc, ForLoc, LParenLoc,
+                                              Init, ExpansionVarStmt, ColonLoc,
+                                              RParenLoc, TParamRef);
+  } else if (isa<CXXDestructurableExpansionSelectExpr>(Select)) {
+    return BuildCXXDestructurableExpansionStmt(TemplateKWLoc, ForLoc, LParenLoc,
+                                               Init, ExpansionVarStmt, ColonLoc,
+                                               RParenLoc, TParamRef);
+  } else if (auto *IESE = dyn_cast<CXXIterableExpansionSelectExpr>(Select)) {
+    ExprResult Size = makeIterableExpansionSizeExpr(*this, IESE->getRangeVar());
+    if (Size.isInvalid()) {
+      Diag(IESE->getExprLoc(), diag::err_compute_expansion_size_index) << 0;
+      return StmtError();
+    }
+    return BuildCXXIterableExpansionStmt(TemplateKWLoc, ForLoc, LParenLoc, Init,
+                                         ExpansionVarStmt, ColonLoc, RParenLoc,
+                                         TParamRef, Size.get());
+  }
+  llvm_unreachable("unknown expansion select expression");
+}
+
+StmtResult
+Sema::BuildCXXIndeterminateExpansionStmt(SourceLocation TemplateKWLoc,
+                                         SourceLocation ForLoc,
+                                         SourceLocation LParenLoc,
+                                         Stmt *Init, Stmt *ExpansionVarStmt,
+                                         SourceLocation ColonLoc,
+                                         SourceLocation RParenLoc,
+                                         Expr *TParamRef) {
+  return CXXIndeterminateExpansionStmt::Create(
+          Context, Init, cast<DeclStmt>(ExpansionVarStmt), TemplateKWLoc,
+          ForLoc, LParenLoc, ColonLoc, RParenLoc, TParamRef);
+}
+
+StmtResult
+Sema::BuildCXXIterableExpansionStmt(SourceLocation TemplateKWLoc,
+                                    SourceLocation ForLoc,
+                                    SourceLocation LParenLoc,
+                                    Stmt *Init, Stmt *ExpansionVarStmt,
+                                    SourceLocation ColonLoc,
+                                    SourceLocation RParenLoc,
+                                    Expr *TParamRef, Expr *SizeExpr) {
+  unsigned NumExpansions = 0;
+  if (!SizeExpr->isValueDependent()) {
+    Expr::EvalResult ER;
+    SmallVector<PartialDiagnosticAt, 4> Notes;
+    ER.Diag = &Notes;
+
+    if (SizeExpr->EvaluateAsInt(ER, Context, Expr::SE_NoSideEffects,
+                                /*InConstantContext=*/true))
+      NumExpansions = ER.Val.getInt().getZExtValue();
+    else {
+      Diag(SizeExpr->getExprLoc(), diag::err_compute_expansion_size_index) << 0;
+      for (auto D : Notes)
+        Diag(D.first, D.second);
+
+      return StmtError();
+    }
+  }
+
+  return CXXIterableExpansionStmt::Create(
+          Context, Init, cast<DeclStmt>(ExpansionVarStmt), SizeExpr,
+          NumExpansions, TemplateKWLoc, ForLoc, LParenLoc, ColonLoc, RParenLoc,
+          TParamRef);
+}
+
+StmtResult
+Sema::BuildCXXDestructurableExpansionStmt(SourceLocation TemplateKWLoc,
+                                          SourceLocation ForLoc,
+                                          SourceLocation LParenLoc,
+                                          Stmt *Init, Stmt *ExpansionVarStmt,
+                                          SourceLocation ColonLoc,
+                                          SourceLocation RParenLoc,
+                                          Expr *TParamRef) {
+  return CXXDestructurableExpansionStmt::Create(
+          Context, Init, cast<DeclStmt>(ExpansionVarStmt), TemplateKWLoc,
+          ForLoc, LParenLoc, ColonLoc, RParenLoc, TParamRef);
+}
+
+StmtResult Sema::BuildCXXInitListExpansionStmt(SourceLocation TemplateKWLoc,
+                                               SourceLocation ForLoc,
+                                               SourceLocation LParenLoc,
+                                               Stmt *Init,
+                                               Stmt *ExpansionVarStmt,
+                                               SourceLocation ColonLoc,
+                                               SourceLocation RParenLoc,
+                                               Expr *TParamRef) {
+  return CXXInitListExpansionStmt::Create(Context, Init,
+                                          cast<DeclStmt>(ExpansionVarStmt),
+                                          TemplateKWLoc, ForLoc, LParenLoc,
+                                          ColonLoc, RParenLoc, TParamRef);
+}
+
+ExprResult Sema::BuildCXXExpansionSelectExpr(
+    Expr *Range, Expr *TParamRef, VarDecl *ExpansionVar,
+    ArrayRef <MaterializeTemporaryExpr *> LifetimeExtendTemps) {
+  if (Range->hasPlaceholderType() && !Range->isTypeDependent()) {
+    ExprResult R = CheckPlaceholderExpr(Range);
+    if (R.isInvalid())
+      return ExprError();
+    Range = R.get();
+  }
+
+  if (!Range->isTypeDependent()) {
+    QualType RangeTy = Range->getType().getNonReferenceType();
+    if (RangeTy->isFunctionType() ||
+        (RangeTy->isPointerType() &&
+         RangeTy->getPointeeType()->isFunctionType())) {
+      ExprResult R = Range;
+      tryToRecoverWithCall(
+          R, PDiag(diag::err_expansion_stmt_range_is_function) << RangeTy,
+          /*ForceComplete=*/false);
+      return ExprError();
+    }
+  }
+
+  if (Range->containsErrors())
+    return ExprError();
+
+  // The braced list is wrapped in ExprWithCleanups when an element creates a
+  // temporary with a non-trivial destructor, e.g. {std::string("a"), ...}. The
+  // elements are used as the initializers of the expansion variable of each
+  // instantiation, so the wrapper is of no use here.
+  Expr *RangeNoCleanups = Range;
+  if (auto *WithCleanups = dyn_cast<ExprWithCleanups>(RangeNoCleanups))
+    RangeNoCleanups = WithCleanups->getSubExpr();
+  if (auto *EILE = dyn_cast<CXXExpansionInitListExpr>(RangeNoCleanups))
+    return BuildCXXExpansionInitListSelectExpr(EILE, TParamRef);
+
+  if (Range->isTypeDependent())
+    return BuildCXXIndeterminateExpansionSelectExpr(Range, TParamRef,
+                                                    ExpansionVar,
+                                                    LifetimeExtendTemps);
+
+  // Ordinary range-based for (Sema::BuildCXXForRangeStmt, SemaStmt.cpp)
+  // explicitly completes the range's type before doing any begin()/end()
+  // member lookup on it. This code never did, and member lookup into an
+  // as-yet-uninstantiated class (e.g. a std::tuple<...> reached only via a
+  // reference parameter, never otherwise odr-used before this loop) hits an
+  // assertion in Sema::LookupQualifiedName ("Declaration context must
+  // already be complete!") in an assertions-enabled build -- and would
+  // silently misbehave in a release build. See issue #181: a range whose
+  // type isn't independently forced complete elsewhere in the same
+  // definition triggers this unconditionally, regardless of the expansion
+  // variable's declared form (auto/auto&/auto&&/const auto&).
+  //
+  // Scoped to record types only (the only kind LookupQualifiedName's
+  // completeness assertion ever cares about): a non-class, non-array type
+  // like 'void' is inherently incomplete and can never be completed, so
+  // diagnosing it here as though it *could* have been completed pre-empts
+  // -- with a worse, less specific message -- whatever this Range expression
+  // would otherwise have produced downstream (e.g. an unresolved-overloaded-
+  // function recovery expression legitimately typed 'void').
+  if (Range->getType()->isRecordType() &&
+      RequireCompleteType(Range->getExprLoc(), Range->getType(),
+                          diag::err_for_range_incomplete_type))
+    return ExprError();
+
+  ExprResult IterableExprResult;
+  if (tryMakeCXXIterableExpansionSelectExpr(*this, Range, TParamRef,
+                                            ExpansionVar, LifetimeExtendTemps,
+                                            IterableExprResult))
+    return IterableExprResult;
+
+  return makeCXXDestructurableExpansionSelectExpr(*this, Range, TParamRef,
+                                                  ExpansionVar,
+                                                  LifetimeExtendTemps);
+}
+
+ExprResult
+Sema::BuildCXXIndeterminateExpansionSelectExpr(
+    Expr *Range, Expr *TParamRef, VarDecl *ExpansionVar,
+    ArrayRef<MaterializeTemporaryExpr *> LifetimeExtendTemps) {
+  return CXXIndeterminateExpansionSelectExpr::Create(Context, Range, TParamRef,
+                                                     ExpansionVar,
+                                                     LifetimeExtendTemps);
+}
+
+ExprResult
+Sema::BuildCXXIterableExpansionSelectExpr(VarDecl *RangeVar, Expr *Impl) {
+  if (Impl->isValueDependent())
+    return CXXIterableExpansionSelectExpr::Create(Context, RangeVar, Impl);
+
+  return Impl;
+}
+
+ExprResult
+Sema::BuildCXXDestructurableExpansionSelectExpr(DecompositionDecl *DD,
+                                                Expr *Idx,
+                                                VarDecl *ExpansionVar) {
+  if (Idx->isValueDependent())
+    return CXXDestructurableExpansionSelectExpr::Create(Context, DD, Idx,
+                                                        ExpansionVar);
+
+  Expr::EvalResult ER;
+  if (!Idx->EvaluateAsInt(ER, Context))
+    return ExprError();
+  unsigned I = ER.Val.getInt().getZExtValue();
+  assert(I < DD->bindings().size());
+
+  MarkAnyDeclReferenced(Idx->getBeginLoc(), DD, true);
+  if (auto *BD = DD->bindings()[I]; auto *HVD = BD->getHoldingVar())
+    return HVD->getInit();
+  else
+    return BD->getBinding();
+}
+
+ExprResult
+Sema::BuildCXXExpansionInitListSelectExpr(CXXExpansionInitListExpr *Range,
+                                          Expr *Idx) {
+  // Use 'CXXExpansionInitListSelectExpr' as a placeholder until tree transform.
+  if (Range->containsPack() || Idx->isValueDependent())
+    return CXXExpansionInitListSelectExpr::Create(Context, Range, Idx);
+  ArrayRef<Expr *> SubExprs = Range->getSubExprs();
+
+  // Evaluate the index.
+  Expr::EvalResult ER;
+
+  SmallVector<PartialDiagnosticAt, 4> Notes;
+  ER.Diag = &Notes;
+
+  if (!Idx->EvaluateAsInt(ER, Context)) {
+    Diag(Idx->getExprLoc(), diag::err_compute_expansion_size_index) << 1;
+    for (auto D : Notes)
+      Diag(D.first, D.second);
+
+    return ExprError();
+  }
+  size_t I = ER.Val.getInt().getZExtValue();
+  assert(I < SubExprs.size());
+
+  return SubExprs[I];
+}
+
+StmtResult Sema::FinishCXXExpansionStmt(Stmt *Heading, Stmt *Body) {
+  if (!Heading || !Body)
+    return StmtError();
+
+  // Diagnose identifier labels.
+  struct DiagnoseLabels : DynamicRecursiveASTVisitor {
+    Sema &SemaRef;
+    DiagnoseLabels(Sema &S) : SemaRef(S) {}
+    bool VisitLabelStmt(LabelStmt *S) override {
+      SemaRef.Diag(S->getIdentLoc(), diag::err_expanded_identifier_label);
+      return false;
+    }
+  } Visitor(*this);
+  if (!Visitor.TraverseStmt(Body))
+    return StmtError();
+
+  CXXExpansionStmt *Expansion = cast<CXXExpansionStmt>(Heading);
+  Expansion->setBody(Body);
+
+  if (Expansion->hasDependentSize())
+    return Expansion;
+
+  // Return an empty statement if the range is empty.
+  if (Expansion->getNumInstantiations() == 0)
+     return Expansion;
+
+  // Create a compound statement binding loop and body.
+  Stmt *VarAndBody[] = {Expansion->getExpansionVarStmt(), Body};
+  Stmt *CombinedBody = CompoundStmt::Create(Context, VarAndBody,
+                                            FPOptionsOverride(),
+                                            Expansion->getBeginLoc(),
+                                            Expansion->getEndLoc());
+
+  ExpansionStmtDecl *StmtDecl = cast<ExpansionStmtDecl>(CurContext);
+  // Substitute only this expansion's index. An enclosing expansion may
+  // still be dependent, so retain its context until its own substitution.
+  // Otherwise lambdas in this body appear nondependent even when their
+  // capture fields still have the expansion variable's undeduced type.
+  DeclContext *DC = CurContext->getParent();
+
+  // Expand the body for each instantiation.
+  SmallVector<Stmt *, 4> Instantiations;
+  while (Instantiations.size() < Expansion->getNumInstantiations()) {
+
+    ContextRAII CtxGuard(*this, DC, /*NewThis=*/false);
+    ExpansionStmtSynthesisRAII ExpansionGuard(*this, !DC->isDependentContext());
+
+    TemplateArgument TArgs[] = {
+        { Context, llvm::APSInt::get(Instantiations.size()),
+          Context.getSizeType() }
+    };
+    MultiLevelTemplateArgumentList MTArgList(StmtDecl, TArgs, true);
+    MTArgList.addOuterRetainedLevels(
+            ExtractParmVarDeclDepth(Expansion->getTParamRef()));
+
+    LocalInstantiationScope LIScope(*this, /*CombineWithOuterScope=*/true);
+    InstantiatingTemplate Inst(*this, Body->getBeginLoc(), Expansion, TArgs,
+                               Body->getSourceRange());
+    // No instantiation context was entered: a fatal error was diagnosed
+    // already (the limit of the errors), and nothing can be instantiated.
+    if (Inst.isInvalid())
+      return StmtError();
+
+    StmtResult Instantiation = SubstStmt(CombinedBody, MTArgList);
+
+    if (Instantiation.isInvalid())
+      return StmtError();
+    Instantiations.push_back(Instantiation.get());
+  }
+
+  // Allocate a more permanent buffer to hold pointers to Stmts.
+  Stmt **StmtStorage = new (Context) Stmt *[Instantiations.size()];
+  std::memcpy(StmtStorage, Instantiations.data(),
+              Instantiations.size() * sizeof(Stmt *));
+
+  // Attach Stmt buffer to the CXXExpansionStmt, and return.
+  Expansion->setInstantiations(StmtStorage);
+  return Expansion;
+}
+
+ExprResult Sema::ActOnCXXExpansionInitList(SourceLocation LBraceLoc,
+                                           MultiExprArg SubExprs,
+                                           SourceLocation RBraceLoc) {
+  return BuildCXXExpansionInitList(LBraceLoc, SubExprs, RBraceLoc);
+}
+
+ExprResult Sema::BuildCXXExpansionInitList(SourceLocation LBraceLoc,
+                                           MultiExprArg SubExprs,
+                                           SourceLocation RBraceLoc) {
+  Expr **SubExprList = new (Context) Expr *[SubExprs.size()];
+  std::memcpy(SubExprList, SubExprs.data(), SubExprs.size() * sizeof(Expr *));
+
+  return CXXExpansionInitListExpr::Create(Context, SubExprList,
+                                          SubExprs.size(), LBraceLoc,
+                                          RBraceLoc);
+}
+
+Decl *Sema::ActOnExpansionStmtDeclaration(Scope *S, unsigned TParamDepth,
+                                          SourceLocation TemplateKWLoc) {
+  // Compute how many layers of template parameters wrap this statement.
+  unsigned TemplateDepth = TParamDepth;
+
+  // Create a template parameter '__N'.
+  IdentifierInfo *ParmName = &Context.Idents.get("__N");
+  QualType ParmTy = Context.getSizeType();
+  TypeSourceInfo *ParmTI = Context.getTrivialTypeSourceInfo(ParmTy,
+                                                            TemplateKWLoc);
+
+  NonTypeTemplateParmDecl *TParam =
+        NonTypeTemplateParmDecl::Create(Context,
+                                        Context.getTranslationUnitDecl(),
+                                        TemplateKWLoc, TemplateKWLoc,
+                                        TemplateDepth, /*Position=*/0, ParmName,
+                                        ParmTy, false, ParmTI);
+
+  return BuildExpansionStmtDeclaration(TemplateKWLoc, TParam);
+}
+
+Decl *Sema::BuildExpansionStmtDeclaration(SourceLocation TemplateKWLoc,
+                                          NonTypeTemplateParmDecl *NTTP) {
+  // Set here rather than where NTTP is first created (ActOnExpansionStmt
+  // Declaration above): this is the chokepoint shared with template
+  // instantiation -- TemplateDeclInstantiator::VisitExpansionStmtDecl
+  // (SemaTemplateInstantiateDecl.cpp) builds a fresh NTTP via
+  // VisitNonTypeTemplateParmDecl, which does not copy implicit-ness, and
+  // then calls this function. Same clang-tidy false-positive as __range
+  // above (docs/CONTRACTS_HARDENING.md M5).
+  NTTP->setImplicit();
+
+  TemplateParameterList *TParamList =
+        TemplateParameterList::Create(Context, TemplateKWLoc, TemplateKWLoc,
+                                      {NTTP}, TemplateKWLoc, nullptr);
+
+  Decl *Result = ExpansionStmtDecl::Create(Context, CurContext, TemplateKWLoc,
+                                           nullptr, TParamList);
+
+  CurContext->addDecl(Result);
+  return Result;
+}

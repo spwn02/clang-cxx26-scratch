@@ -1,0 +1,193 @@
+// -*- C++ -*-
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _LIBCPP___RANGES_SIZE_H
+#define _LIBCPP___RANGES_SIZE_H
+
+#include <__concepts/arithmetic.h>
+#include <__concepts/class_or_enum.h>
+#include <__config>
+#include <__cstddef/ptrdiff_t.h>
+#include <__cstddef/size_t.h>
+#include <__iterator/concepts.h>
+#include <__iterator/iterator_traits.h>
+#include <__ranges/access.h>
+#include <__type_traits/common_type.h>
+#include <__type_traits/decay.h>
+#include <__type_traits/make_signed.h>
+#include <__type_traits/make_unsigned.h>
+#include <__type_traits/remove_cvref.h>
+#include <__utility/auto_cast.h>
+#include <__utility/declval.h>
+
+#if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
+#  pragma GCC system_header
+#endif
+
+_LIBCPP_BEGIN_NAMESPACE_STD
+
+#if _LIBCPP_STD_VER >= 20
+
+namespace ranges {
+template <class>
+inline constexpr bool disable_sized_range = false;
+} // namespace ranges
+
+// [range.prim.size]
+
+namespace ranges {
+namespace __size {
+void size() = delete;
+
+template <class _Tp>
+concept __size_enabled = !disable_sized_range<remove_cvref_t<_Tp>>;
+
+template <class _Tp>
+concept __member_size = __size_enabled<_Tp> && requires(_Tp&& __t) {
+  { _LIBCPP_AUTO_CAST(__t.size()) } -> __integer_like;
+};
+
+template <class _Tp>
+concept __unqualified_size =
+    __size_enabled<_Tp> && !__member_size<_Tp> && __class_or_enum<remove_cvref_t<_Tp>> && requires(_Tp&& __t) {
+      { _LIBCPP_AUTO_CAST(size(__t)) } -> __integer_like;
+    };
+
+template <class _Tp>
+concept __difference =
+    !__member_size<_Tp> && !__unqualified_size<_Tp> && __class_or_enum<remove_cvref_t<_Tp>> && requires(_Tp&& __t) {
+      { ranges::begin(__t) } -> forward_iterator;
+      { ranges::end(__t) } -> sized_sentinel_for<decltype(ranges::begin(std::declval<_Tp>()))>;
+    };
+
+struct __fn {
+  // `[range.prim.size]`: the array case (for rvalues).
+  template <class _Tp, size_t _Sz>
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI constexpr size_t operator()(_Tp (&&)[_Sz]) const noexcept {
+    return _Sz;
+  }
+
+  // `[range.prim.size]`: the array case (for lvalues).
+  template <class _Tp, size_t _Sz>
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI constexpr size_t operator()(_Tp (&)[_Sz]) const noexcept {
+    return _Sz;
+  }
+
+  // `[range.prim.size]`: `auto(t.size())` is a valid expression.
+  template <__member_size _Tp>
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI constexpr __integer_like auto operator()(_Tp&& __t) const
+      noexcept(noexcept(_LIBCPP_AUTO_CAST(__t.size()))) {
+    return _LIBCPP_AUTO_CAST(__t.size());
+  }
+
+  // `[range.prim.size]`: `auto(size(t))` is a valid expression.
+  template <__unqualified_size _Tp>
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI constexpr __integer_like auto operator()(_Tp&& __t) const
+      noexcept(noexcept(_LIBCPP_AUTO_CAST(size(__t)))) {
+    return _LIBCPP_AUTO_CAST(size(__t));
+  }
+
+  // [range.prim.size]: the `to-unsigned-like` case.
+  template <__difference _Tp>
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI constexpr auto operator()(_Tp&& __t) const
+      noexcept(noexcept(std::__to_unsigned_like(ranges::end(__t) - ranges::begin(__t))))
+          -> decltype(std::__to_unsigned_like(ranges::end(__t) - ranges::begin(__t))) {
+    return std::__to_unsigned_like(ranges::end(__t) - ranges::begin(__t));
+  }
+};
+
+} // namespace __size
+
+inline namespace __cpo {
+inline constexpr auto size = __size::__fn{};
+} // namespace __cpo
+} // namespace ranges
+
+// [range.prim.ssize]
+
+namespace ranges {
+namespace __ssize {
+struct __fn {
+  template <class _Tp>
+    requires requires(_Tp&& __t) { ranges::size(__t); }
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI constexpr __signed_integer_like auto operator()(_Tp&& __t) const
+      noexcept(noexcept(ranges::size(__t))) {
+    // common_type_t<ptrdiff_t, make-signed-like-t<decltype(ranges::size(t))>> ([range.prim.ssize])
+    using _Signed = __make_signed_like_t<decltype(ranges::size(__t))>;
+    if constexpr (integral<_Signed> && sizeof(ptrdiff_t) > sizeof(_Signed))
+      return static_cast<ptrdiff_t>(ranges::size(__t));
+    else if constexpr (integral<_Signed>)
+      return static_cast<_Signed>(ranges::size(__t));
+    else
+      return static_cast<common_type_t<ptrdiff_t, _Signed>>(static_cast<_Signed>(ranges::size(__t)));
+  }
+};
+} // namespace __ssize
+
+inline namespace __cpo {
+inline constexpr auto ssize = __ssize::__fn{};
+} // namespace __cpo
+} // namespace ranges
+
+#if _LIBCPP_STD_VER >= 26
+namespace ranges {
+namespace __reserve_hint {
+void reserve_hint() = delete;
+
+// [range.prim.size.hint]
+template <class _Tp>
+concept __sized = requires(_Tp&& __t) { ranges::size(__t); };
+
+template <class _Tp>
+concept __member = requires(_Tp&& __t) {
+  { auto(__t.reserve_hint()) } -> __integer_like;
+};
+
+template <class _Tp>
+concept __adl = __class_or_enum<remove_cvref_t<_Tp>> && requires(_Tp&& __t) {
+  { auto(reserve_hint(__t)) } -> __integer_like;
+};
+
+struct __fn {
+  // "If ranges::size(E) is a valid expression, ranges::reserve_hint(E) is expression-equivalent to
+  // ranges::size(E)": the result is integer-like, which includes integer-class types.
+  template <class _Tp>
+    requires __sized<_Tp>
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI constexpr auto operator()(_Tp&& __t) const noexcept(noexcept(ranges::size(__t))) {
+    return ranges::size(__t);
+  }
+
+  template <class _Tp>
+    requires(!__sized<_Tp> && __member<_Tp>)
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI constexpr auto operator()(_Tp&& __t) const
+      noexcept(noexcept(auto(__t.reserve_hint()))) {
+    return auto(__t.reserve_hint());
+  }
+
+  template <class _Tp>
+    requires(!__sized<_Tp> && !__member<_Tp> && __adl<_Tp>)
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI constexpr auto operator()(_Tp&& __t) const
+      noexcept(noexcept(auto(reserve_hint(__t)))) {
+    return auto(reserve_hint(__t));
+  }
+};
+} // namespace __reserve_hint
+
+inline namespace __cpo {
+inline constexpr auto reserve_hint = __reserve_hint::__fn{};
+} // namespace __cpo
+
+} // namespace ranges
+#endif // _LIBCPP_STD_VER >= 26
+
+#endif // _LIBCPP_STD_VER >= 20
+
+_LIBCPP_END_NAMESPACE_STD
+
+#endif // _LIBCPP___RANGES_SIZE_H

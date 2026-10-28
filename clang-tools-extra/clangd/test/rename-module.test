@@ -1,0 +1,139 @@
+# A module is renamed from its name in a module declaration or an import
+# declaration: the declaration and every import in the project change.
+#
+# Windows have different escaping modes.
+# UNSUPPORTED: system-windows
+#
+# RUN: rm -fr %t
+# RUN: mkdir -p %t
+# RUN: split-file %s %t
+#
+# RUN: sed -e "s|DIR|%/t|g" %t/compile_commands.json.tmpl > %t/compile_commands.json.tmp
+# RUN: sed -e "s|CLANG_CC|%clang|g" %t/compile_commands.json.tmp > %t/compile_commands.json
+# RUN: sed -e "s|DIR|%/t|g" %t/rename.jsonrpc.tmpl > %t/rename.jsonrpc
+#
+# RUN: clangd -experimental-modules-support -lit-test < %t/rename.jsonrpc \
+# RUN:      | FileCheck -strict-whitespace %t/rename.jsonrpc
+
+#--- Foo.cppm
+export module Foo;
+export import :Part;
+import Foo.Meta;
+
+#--- Part.cppm
+export module Foo:Part;
+
+#--- Second.cppm
+export module Foo:Second;
+
+#--- Meta.cppm
+export module Foo.Meta;
+
+#--- Other.cppm
+export module Other;
+
+#--- sub/Unlisted.cxx
+import Foo;
+
+#--- inc/Common.hpp
+import Foo;
+import Foo.Meta;
+
+#--- Use.cpp
+import Foo;
+import Foo.Meta;
+int x;
+
+#--- compile_commands.json.tmpl
+[
+    { "directory": "DIR", "command": "CLANG_CC -std=c++20 -c DIR/Use.cpp", "file": "DIR/Use.cpp" },
+    { "directory": "DIR", "command": "CLANG_CC -std=c++20 DIR/Foo.cppm --precompile -o DIR/Foo.pcm", "file": "DIR/Foo.cppm" },
+    { "directory": "DIR", "command": "CLANG_CC -std=c++20 DIR/Part.cppm --precompile -o DIR/Part.pcm", "file": "DIR/Part.cppm" },
+    { "directory": "DIR", "command": "CLANG_CC -std=c++20 DIR/Second.cppm --precompile -o DIR/Second.pcm", "file": "DIR/Second.cppm" },
+    { "directory": "DIR", "command": "CLANG_CC -std=c++20 DIR/Meta.cppm --precompile -o DIR/Meta.pcm", "file": "DIR/Meta.cppm" },
+    { "directory": "DIR", "command": "CLANG_CC -std=c++20 DIR/Other.cppm --precompile -o DIR/Other.pcm", "file": "DIR/Other.cppm" }
+]
+
+#--- rename.jsonrpc.tmpl
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"processId":123,"rootPath":"DIR","capabilities":{},"trace":"off"}}
+---
+{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://DIR/Use.cpp","languageId":"cpp","version":1,"text":"import Foo;\nimport Foo.Meta;\nint x;\n"}}}
+---
+# On the dotted part of Foo.Meta the whole name is the target.
+{"jsonrpc":"2.0","id":1,"method":"textDocument/prepareRename","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"position":{"line":1,"character":13}}}
+#      CHECK:  "id": 1,
+# CHECK-NEXT:  "jsonrpc": "2.0",
+# CHECK-NEXT:  "result": {
+# CHECK-NEXT:    "placeholder": "Foo.Meta",
+# CHECK-NEXT:    "range": {
+# CHECK-NEXT:      "end": {
+# CHECK-NEXT:        "character": 15,
+# CHECK-NEXT:        "line": 1
+# CHECK-NEXT:      },
+# CHECK-NEXT:      "start": {
+# CHECK-NEXT:        "character": 7,
+# CHECK-NEXT:        "line": 1
+# CHECK-NEXT:      }
+# CHECK-NEXT:    }
+# CHECK-NEXT:  }
+---
+# Foo is renamed: Foo.Meta is another module and stays.
+{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"position":{"line":0,"character":8},"newName":"Hello"}}
+#      CHECK:  "id": 2,
+#      CHECK:  "changes": {
+#  CHECK-DAG:    "file://{{.*}}/Foo.cppm": [
+#  CHECK-DAG:    "file://{{.*}}/Part.cppm": [
+#  CHECK-DAG:    "file://{{.*}}/Use.cpp": [
+# The files that the database does not list: a unit and a header.
+#  CHECK-DAG:    "file://{{.*}}/sub/Unlisted.cxx": [
+#  CHECK-DAG:    "file://{{.*}}/inc/Common.hpp": [
+# CHECK-NOT:     Meta.cppm
+# CHECK-NOT:     Other.cppm
+---
+# A name that already is a module, a reserved name.
+{"jsonrpc":"2.0","id":3,"method":"textDocument/rename","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"position":{"line":0,"character":8},"newName":"Other"}}
+#      CHECK:  "message": "'Other' already names a module
+---
+{"jsonrpc":"2.0","id":4,"method":"textDocument/rename","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"position":{"line":0,"character":8},"newName":"std.x"}}
+#      CHECK:  "message": "'std.x' is reserved
+---
+{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://DIR/Part.cppm","languageId":"cpp","version":1,"text":"export module Foo:Part;\n"}}}
+---
+# The name of a partition (after the colon) is a target of its own: the
+# partition, not the module.
+{"jsonrpc":"2.0","id":5,"method":"textDocument/prepareRename","params":{"textDocument":{"uri":"file://DIR/Part.cppm"},"position":{"line":0,"character":20}}}
+#      CHECK:  "id": 5,
+# CHECK-NEXT:  "jsonrpc": "2.0",
+# CHECK-NEXT:  "result": {
+# CHECK-NEXT:    "placeholder": "Part",
+# CHECK-NEXT:    "range": {
+# CHECK-NEXT:      "end": {
+# CHECK-NEXT:        "character": 22,
+# CHECK-NEXT:        "line": 0
+# CHECK-NEXT:      },
+# CHECK-NEXT:      "start": {
+# CHECK-NEXT:        "character": 18,
+# CHECK-NEXT:        "line": 0
+# CHECK-NEXT:      }
+# CHECK-NEXT:    }
+# CHECK-NEXT:  }
+---
+# The partition is renamed in its declaration and in the import of the unit of
+# Foo that imports it; the other modules are not touched.
+{"jsonrpc":"2.0","id":6,"method":"textDocument/rename","params":{"textDocument":{"uri":"file://DIR/Part.cppm"},"position":{"line":0,"character":20},"newName":"Piece"}}
+#      CHECK:  "id": 6,
+#      CHECK:  "changes": {
+#  CHECK-DAG:    "file://{{.*}}/Foo.cppm": [
+#  CHECK-DAG:    "file://{{.*}}/Part.cppm": [
+# CHECK-NOT:     Use.cpp
+# CHECK-NOT:     Meta.cppm
+# CHECK-NOT:     Other.cppm
+---
+# A partition that the module has already; a partition of a module that is not
+# renamed by the name of a module.
+{"jsonrpc":"2.0","id":7,"method":"textDocument/rename","params":{"textDocument":{"uri":"file://DIR/Part.cppm"},"position":{"line":0,"character":20},"newName":"Second"}}
+#      CHECK:  "message": "the module 'Foo' already has a partition 'Second'
+---
+{"jsonrpc":"2.0","id":8,"method":"shutdown"}
+---
+{"jsonrpc":"2.0","method":"exit"}

@@ -1,0 +1,109 @@
+//===- ContractsOptions.h - C++ Contract Options ----------------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+/// \file
+/// Defines common enums and types used by contracts and contract attributes.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_CLANG_BASIC_CONTRACT_OPTIONS_H
+#define LLVM_CLANG_BASIC_CONTRACT_OPTIONS_H
+
+#include "clang/Basic/LLVM.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringRef.h"
+#include <cassert>
+#include <cstdint>
+#include <functional>
+
+namespace clang {
+using llvm::StringRef;
+class ASTContext;
+
+enum class ContractTag { No = 0, Yes = 1 };
+
+constexpr ContractTag NotAContract = ContractTag::No;
+constexpr ContractTag IsAContract = ContractTag::Yes;
+constexpr ContractTag InContract = ContractTag::Yes;
+constexpr ContractTag NotInContract = ContractTag::No;
+
+/// The kind of contract.
+///
+/// NOTE: These enumerations _do not_ match the values in
+/// std::contracts::assertion_kind because they start at 1.
+enum class ContractKind {
+  /// A function precondition
+  Pre,
+
+  /// A function post condition
+  Post,
+
+  /// contract_assert
+  Assert
+};
+
+// std::contracts::assertion_kind
+enum class ContractAssertionKind {
+  Pre = 1,
+
+  Post = 2,
+
+  Assert = 3
+};
+
+/// Contract evaluation mode. Determines whether to check contracts, and
+// whether contract failures cause compile errors.
+//
+// These values match up with std::contracts::evaluation_semantic
+// ([contracts.syn]): ignore = 1, observe = 2, enforce = 3, quick_enforce = 4.
+enum class ContractEvaluationSemantic {
+  // Contracts are parsed, syntax checked and type checked, but never evaluated.
+  Ignore = 1,
+
+  // Contracts are run, failures are reported, and when a contract fails the
+  // program is terminated. The compiler can assume after contracts statements
+  // that the contracts hold.
+  Enforce = 3,
+
+  // Contracts are run, and failures are reported, but contract failures do not
+  // logically stop execution of the program, nor can the compiler assume
+  // contracts are true for optimizing.
+  Observe = 2,
+
+  // Contracts are run, failures cause an immediate trap
+  QuickEnforce = 4,
+};
+
+/// The result of checking a contract. The second two values match
+/// std::contracts::detection_mode.
+enum class ContractDetectionMode {
+  PredicateFailed = 1,
+  ExceptionRaised = 2
+};
+
+
+// Indicates whether the contract scope information was pushed prior to the function declaration context being
+// available (and therefore will need special consideration when adjusting the context).
+enum ContractScopeOffset {
+  CSO_ParentContext,
+  CSO_FunctionContext
+};
+
+class ContractOptions {
+public:
+  ContractOptions() = default;
+
+public:
+  /// The default semantics for contracts.
+  ContractEvaluationSemantic DefaultSemantic =
+      ContractEvaluationSemantic::Enforce;
+};
+
+} // namespace clang
+
+#endif // LLVM_CLANG_BASIC_CONTRACT_OPTIONS_H

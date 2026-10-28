@@ -1,0 +1,430 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _LIBCPP___NUMERIC_PSTL_H
+#define _LIBCPP___NUMERIC_PSTL_H
+
+#include <__config>
+
+#if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
+#  pragma GCC system_header
+#endif
+
+_LIBCPP_PUSH_MACROS
+#include <__undef_macros>
+
+#if _LIBCPP_STD_VER >= 17 && !defined(_LIBCPP_FREESTANDING)
+
+#  include <__functional/identity.h>
+#  include <__functional/operations.h>
+#  include <__iterator/cpp17_iterator_concepts.h>
+#  include <__iterator/iterator_traits.h>
+#  include <__pstl/backend.h>
+#  include <__pstl/dispatch.h>
+#  include <__pstl/handle_exception.h>
+#  include <__type_traits/enable_if.h>
+#  include <__type_traits/invoke.h>
+#  include <__type_traits/is_execution_policy.h>
+#  include <__type_traits/remove_cvref.h>
+#  include <__utility/forward.h>
+#  include <__utility/move.h>
+
+_LIBCPP_BEGIN_NAMESPACE_STD
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _Tp,
+          class _BinaryOperation,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _Tp reduce(
+    _ExecutionPolicy&& __policy, _ForwardIterator __first, _ForwardIterator __last, _Tp __init, _BinaryOperation __op) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "reduce requires ForwardIterators");
+#  if _LIBCPP_STD_VER >= 20
+  using _InputReference = decltype(*__first);
+  static_assert(is_invocable_r_v<_Tp, _BinaryOperation&, _Tp&, _InputReference> &&
+                    is_invocable_r_v<_Tp, _BinaryOperation&, _InputReference, _Tp&> &&
+                    is_invocable_r_v<_Tp, _BinaryOperation&, _Tp&, _Tp&> &&
+                    is_invocable_r_v<_Tp, _BinaryOperation&, _InputReference, _InputReference>,
+                "reduce requires all four binary_op argument combinations to produce T");
+#  endif
+  using _Implementation = __pstl::__dispatch<__pstl::__reduce, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first),
+      std::move(__last),
+      std::move(__init),
+      std::move(__op));
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _Tp,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _Tp
+reduce(_ExecutionPolicy&& __policy, _ForwardIterator __first, _ForwardIterator __last, _Tp __init) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "reduce requires ForwardIterators");
+  using _Implementation = __pstl::__dispatch<__pstl::__reduce, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy), std::move(__first), std::move(__last), std::move(__init), plus{});
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI __iterator_value_type<_ForwardIterator>
+reduce(_ExecutionPolicy&& __policy, _ForwardIterator __first, _ForwardIterator __last) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "reduce requires ForwardIterators");
+  using _Implementation = __pstl::__dispatch<__pstl::__reduce, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first),
+      std::move(__last),
+      __iterator_value_type<_ForwardIterator>(),
+      plus{});
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator1,
+          class _ForwardIterator2,
+          class _Tp,
+          class _BinaryOperation1,
+          class _BinaryOperation2,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _Tp transform_reduce(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator1 __first1,
+    _ForwardIterator1 __last1,
+    _ForwardIterator2 __first2,
+    _Tp __init,
+    _BinaryOperation1 __reduce,
+    _BinaryOperation2 __transform) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator1, "transform_reduce requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator2, "transform_reduce requires ForwardIterators");
+#  if _LIBCPP_STD_VER >= 20
+  using _TransformResult = __invoke_result_t<_BinaryOperation2&, decltype(*__first1), decltype(*__first2)>;
+  static_assert(is_invocable_r_v<_Tp, _BinaryOperation1&, _Tp&, _Tp&> &&
+                    is_invocable_r_v<_Tp, _BinaryOperation1&, _Tp&, _TransformResult> &&
+                    is_invocable_r_v<_Tp, _BinaryOperation1&, _TransformResult, _Tp&> &&
+                    is_invocable_r_v<_Tp, _BinaryOperation1&, _TransformResult, _TransformResult>,
+                "transform_reduce requires all four binary_op1 argument combinations to produce T");
+#  endif
+  using _Implementation =
+      __pstl::__dispatch<__pstl::__transform_reduce_binary, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first1),
+      std::move(__last1),
+      std::move(__first2),
+      std::move(__init),
+      std::move(__reduce),
+      std::move(__transform));
+}
+
+// This overload doesn't get a customization point because it's trivial to detect (through e.g.
+// __desugars_to_v) when specializing the more general variant, which should always be preferred
+template <class _ExecutionPolicy,
+          class _ForwardIterator1,
+          class _ForwardIterator2,
+          class _Tp,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _Tp transform_reduce(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator1 __first1,
+    _ForwardIterator1 __last1,
+    _ForwardIterator2 __first2,
+    _Tp __init) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator1, "transform_reduce requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator2, "transform_reduce requires ForwardIterators");
+  using _Implementation =
+      __pstl::__dispatch<__pstl::__transform_reduce_binary, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first1),
+      std::move(__last1),
+      std::move(__first2),
+      std::move(__init),
+      plus{},
+      multiplies{});
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _Tp,
+          class _BinaryOperation,
+          class _UnaryOperation,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _Tp transform_reduce(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator __first,
+    _ForwardIterator __last,
+    _Tp __init,
+    _BinaryOperation __reduce,
+    _UnaryOperation __transform) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "transform_reduce requires ForwardIterators");
+#  if _LIBCPP_STD_VER >= 20
+  using _TransformResult = __invoke_result_t<_UnaryOperation&, decltype(*__first)>;
+  static_assert(is_invocable_r_v<_Tp, _BinaryOperation&, _Tp&, _Tp&> &&
+                    is_invocable_r_v<_Tp, _BinaryOperation&, _Tp&, _TransformResult> &&
+                    is_invocable_r_v<_Tp, _BinaryOperation&, _TransformResult, _Tp&> &&
+                    is_invocable_r_v<_Tp, _BinaryOperation&, _TransformResult, _TransformResult>,
+                "transform_reduce requires all four binary_op argument combinations to produce T");
+#  endif
+  using _Implementation = __pstl::__dispatch<__pstl::__transform_reduce, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first),
+      std::move(__last),
+      std::move(__init),
+      std::move(__reduce),
+      std::move(__transform));
+}
+
+// [numeric.ops] parallel overloads of the scan family and adjacent_difference (P0452R1)
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _ForwardOutIterator,
+          class _BinaryOperation,
+          class _Tp,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _ForwardOutIterator inclusive_scan(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator __first,
+    _ForwardIterator __last,
+    _ForwardOutIterator __result,
+    _BinaryOperation __op,
+    _Tp __init) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "inclusive_scan requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardOutIterator, "inclusive_scan requires ForwardIterators");
+  using _Implementation = __pstl::__dispatch<__pstl::__inclusive_scan_op_init, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first),
+      std::move(__last),
+      std::move(__result),
+      std::move(__op),
+      std::move(__init));
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _ForwardOutIterator,
+          class _BinaryOperation,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _ForwardOutIterator inclusive_scan(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator __first,
+    _ForwardIterator __last,
+    _ForwardOutIterator __result,
+    _BinaryOperation __op) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "inclusive_scan requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardOutIterator, "inclusive_scan requires ForwardIterators");
+  using _Implementation = __pstl::__dispatch<__pstl::__inclusive_scan_op, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy), std::move(__first), std::move(__last), std::move(__result), std::move(__op));
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _ForwardOutIterator,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _ForwardOutIterator inclusive_scan(
+    _ExecutionPolicy&& __policy, _ForwardIterator __first, _ForwardIterator __last, _ForwardOutIterator __result) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "inclusive_scan requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardOutIterator, "inclusive_scan requires ForwardIterators");
+  using _Implementation = __pstl::__dispatch<__pstl::__inclusive_scan_op, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy), std::move(__first), std::move(__last), std::move(__result), plus{});
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _ForwardOutIterator,
+          class _Tp,
+          class _BinaryOperation,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _ForwardOutIterator exclusive_scan(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator __first,
+    _ForwardIterator __last,
+    _ForwardOutIterator __result,
+    _Tp __init,
+    _BinaryOperation __op) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "exclusive_scan requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardOutIterator, "exclusive_scan requires ForwardIterators");
+  using _Implementation = __pstl::__dispatch<__pstl::__exclusive_scan, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first),
+      std::move(__last),
+      std::move(__result),
+      std::move(__init),
+      std::move(__op));
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _ForwardOutIterator,
+          class _Tp,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _ForwardOutIterator exclusive_scan(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator __first,
+    _ForwardIterator __last,
+    _ForwardOutIterator __result,
+    _Tp __init) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "exclusive_scan requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardOutIterator, "exclusive_scan requires ForwardIterators");
+  using _Implementation = __pstl::__dispatch<__pstl::__exclusive_scan, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first),
+      std::move(__last),
+      std::move(__result),
+      std::move(__init),
+      plus{});
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _ForwardOutIterator,
+          class _BinaryOperation,
+          class _UnaryOperation,
+          class _Tp,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _ForwardOutIterator transform_inclusive_scan(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator __first,
+    _ForwardIterator __last,
+    _ForwardOutIterator __result,
+    _BinaryOperation __bop,
+    _UnaryOperation __uop,
+    _Tp __init) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "transform_inclusive_scan requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardOutIterator, "transform_inclusive_scan requires ForwardIterators");
+  using _Implementation =
+      __pstl::__dispatch<__pstl::__transform_inclusive_scan_init, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first),
+      std::move(__last),
+      std::move(__result),
+      std::move(__bop),
+      std::move(__uop),
+      std::move(__init));
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _ForwardOutIterator,
+          class _BinaryOperation,
+          class _UnaryOperation,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _ForwardOutIterator transform_inclusive_scan(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator __first,
+    _ForwardIterator __last,
+    _ForwardOutIterator __result,
+    _BinaryOperation __bop,
+    _UnaryOperation __uop) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "transform_inclusive_scan requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardOutIterator, "transform_inclusive_scan requires ForwardIterators");
+  using _Implementation =
+      __pstl::__dispatch<__pstl::__transform_inclusive_scan, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first),
+      std::move(__last),
+      std::move(__result),
+      std::move(__bop),
+      std::move(__uop));
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _ForwardOutIterator,
+          class _Tp,
+          class _BinaryOperation,
+          class _UnaryOperation,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _ForwardOutIterator transform_exclusive_scan(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator __first,
+    _ForwardIterator __last,
+    _ForwardOutIterator __result,
+    _Tp __init,
+    _BinaryOperation __bop,
+    _UnaryOperation __uop) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "transform_exclusive_scan requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardOutIterator, "transform_exclusive_scan requires ForwardIterators");
+  using _Implementation =
+      __pstl::__dispatch<__pstl::__transform_exclusive_scan, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy),
+      std::move(__first),
+      std::move(__last),
+      std::move(__result),
+      std::move(__init),
+      std::move(__bop),
+      std::move(__uop));
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _ForwardOutIterator,
+          class _BinaryOperation,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _ForwardOutIterator adjacent_difference(
+    _ExecutionPolicy&& __policy,
+    _ForwardIterator __first,
+    _ForwardIterator __last,
+    _ForwardOutIterator __result,
+    _BinaryOperation __op) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "adjacent_difference requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardOutIterator, "adjacent_difference requires ForwardIterators");
+  using _Implementation = __pstl::__dispatch<__pstl::__adjacent_difference, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy), std::move(__first), std::move(__last), std::move(__result), std::move(__op));
+}
+
+template <class _ExecutionPolicy,
+          class _ForwardIterator,
+          class _ForwardOutIterator,
+          class _RawPolicy                                    = __remove_cvref_t<_ExecutionPolicy>,
+          enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+_LIBCPP_HIDE_FROM_ABI _ForwardOutIterator adjacent_difference(
+    _ExecutionPolicy&& __policy, _ForwardIterator __first, _ForwardIterator __last, _ForwardOutIterator __result) {
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardIterator, "adjacent_difference requires ForwardIterators");
+  _LIBCPP_REQUIRE_CPP17_FORWARD_ITERATOR(_ForwardOutIterator, "adjacent_difference requires ForwardIterators");
+  using _Implementation = __pstl::__dispatch<__pstl::__adjacent_difference, __pstl::__current_configuration, _RawPolicy>;
+  return __pstl::__handle_exception<_Implementation>(
+      std::forward<_ExecutionPolicy>(__policy), std::move(__first), std::move(__last), std::move(__result), minus{});
+}
+
+_LIBCPP_END_NAMESPACE_STD
+
+#endif // _LIBCPP_STD_VER >= 17 && !defined(_LIBCPP_FREESTANDING)
+
+_LIBCPP_POP_MACROS
+
+#endif // _LIBCPP___NUMERIC_PSTL_H

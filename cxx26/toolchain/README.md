@@ -1,0 +1,317 @@
+# clang-cxx26 reference toolchain
+
+This directory defines the reproducible snapshot format used by Miracle, Switch, and Nyx.
+
+It is intentionally separate from LLVM's upstream release machinery.
+
+## Snapshot identities
+
+Published reference snapshots use annotated Git tags:
+
+```text
+cxx26-YYYY.MM.DD
+cxx26-YYYY.MM.DD.N
+```
+
+Examples:
+
+```text
+cxx26-2026.08.22
+cxx26-2026.08.22.2
+```
+
+A published identifier is immutable. Never move an existing snapshot tag or replace its release assets. If the bytes or source revision change, publish a new identifier.
+
+Non-publishing preflight artifacts use:
+
+```text
+cxx26-dev-<commit>
+```
+
+They are triggered by disposable tags named:
+
+```text
+cxx26-preflight-<name>
+```
+
+The trigger tag name is not the artifact identity. A preflight always packages the tagged commit as `cxx26-dev-<commit>`.
+
+## Initial platform
+
+T3 validates and packages:
+
+```text
+Linux x86_64
+```
+
+This is the initial validated snapshot platform, not a statement that the fork is inherently Linux- or x86-only.
+
+## Contents
+
+A snapshot is one coherent compiler/runtime unit:
+
+```text
+clang / clang++
+clangd
+clang-tidy
+clang-scan-deps
+lld
+llvm-ar
+libc++
+libc++abi
+libunwind
+libc++ standard-module sources and libc++.modules.json
+```
+
+The compiler and runtimes are built from the same source revision. libc++, libc++abi, and libunwind are configured through `LLVM_ENABLE_RUNTIMES`, so they are built by the just-built compiler rather than by an unrelated host compiler.
+
+The installed Clang defaults to libc++ and lld on Linux. The packaged CMake toolchain file also makes those choices explicit and sets `-std=c++26` (which includes reflection, expansion statements, annotations and contracts, P2900R14), with a per-config evaluation semantic: `enforce` in Debug and RelWithDebInfo (violations abort, matching `assert()`/NDEBUG's usual posture), `ignore` in Release and MinSizeRel (zero contract-checking cost in an optimized build unless a consumer opts back in). A consumer project can override the semantic by setting `-fcontract-evaluation-semantic=` itself before this toolchain file runs.
+
+## Build locally
+
+Prerequisites:
+
+```text
+CMake
+Ninja
+Python 3
+GNU tar
+zstd
+curl, xz, m4 and a C compiler (to build the pinned GMP/MPFR)
+```
+
+Clang's constexpr `<cmath>` evaluator (the P1383R2 transcendental functions)
+uses MPFR and GMP. `build-linux-x86_64.sh` builds the pinned GMP 6.3.0 and
+MPFR 4.2.1 releases (checksum-verified, `build-mpfr-gmp.sh`) as static
+position-independent libraries and links them into the compiler, so the
+snapshot has no MPFR/GMP runtime dependency and the build fails if clang was
+configured without them. Set `CXX26_MPFR_PREFIX` to reuse a prebuilt prefix.
+GMP and MPFR are LGPL-licensed (GMP: LGPLv3 or GPLv2+; MPFR: LGPLv3+); the
+sources are the unmodified upstream tarballs named in `build-mpfr-gmp.sh`.
+
+From the repository root:
+
+```bash
+cxx26/toolchain/build-linux-x86_64.sh \
+  /tmp/cxx26-stage \
+  /tmp/cxx26-build
+```
+
+Then package a development snapshot:
+
+```bash
+python3 cxx26/toolchain/package.py \
+  --stage /tmp/cxx26-stage \
+  --output /tmp/cxx26-dist \
+  --snapshot cxx26-dev-$(git rev-parse --short=12 HEAD) \
+  --revision $(git rev-parse HEAD) \
+  --source-date-epoch $(git show -s --format=%ct HEAD)
+```
+
+## Use an extracted snapshot
+
+After extracting the archive:
+
+```bash
+source clang-<snapshot>/share/clang-cxx26/activate.sh
+```
+
+This defines:
+
+```text
+CXX26_TOOLCHAIN_ROOT
+CXX26_CMAKE_TOOLCHAIN_FILE
+CC
+CXX
+PATH
+LD_LIBRARY_PATH
+```
+
+For CMake:
+
+```bash
+cmake \
+  -S . \
+  -B build \
+  -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE="$CXX26_CMAKE_TOOLCHAIN_FILE"
+```
+
+The toolchain file is relocatable and derives all paths from its own installed location.
+
+Consumer CMake projects should target standardized C++26 source semantics (`-std=c++26`); there are no separate reflection or contracts flags.
+
+## Using the bundled `clangd` with modules
+
+`clangd` only sees the flags in your compilation database (or a `.clangd` file). Two things go wrong with C++20/26 modules, both configuration rather than toolchain bugs:
+
+1. **No language-standard flag for a file.** If the compile command for a module unit has no `-std=c++20` or later (or the file is not in `compile_commands.json` at all, so `clangd` falls back to default flags), the file is parsed as C++17 and `clangd` reports, on perfectly valid code, `unknown type name 'import'`, `unknown type name 'module'` and `expected template` for `export module X:Y;`. Give every module file the toolchain's flags. In a project-level `.clangd`:
+
+   ```yaml
+   CompileFlags:
+     Add: [-std=c++26, -stdlib=libc++, -Wno-reserved-module-identifier]
+   ```
+
+   (CMake with the toolchain file above already passes these for compiled targets; the problem shows up for files the database does not contain, such as module partitions that are not listed.)
+
+2. **`import std;` needs a `std` binary module interface (BMI).** Without one, `clangd` reports `module 'std' not found`. Build one with the same compiler and point `clangd` at it:
+
+   ```bash
+   "$CXX" -std=c++26 -stdlib=libc++ -Wno-reserved-module-identifier \
+     --precompile -o std.pcm "$CXX26_TOOLCHAIN_ROOT/share/libc++/v1/std.cppm"
+   ```
+
+   ```yaml
+   CompileFlags:
+     Add: [-fmodule-file=std=/absolute/path/to/std.pcm]
+   ```
+
+   Rebuild `std.pcm` whenever the toolchain changes: a BMI from a different compiler revision is rejected.
+
+With both in place, `clangd --check=<module interface unit>` is clean for a unit that does `import std;`.
+
+3. **Importing your own modules (`import Demo;`, `import :Types;`) needs `--experimental-modules-support`,
+   AND every module-providing file must have its own entry in `compile_commands.json`.** Pass
+   `--experimental-modules-support` (builds project BMIs on demand via `clang-scan-deps`, shipped in this
+   toolchain) — verified working, in both `--check` mode and a live LSP session, for plain named-module
+   imports and module-partition imports, as long as the compilation database has an entry for *every*
+   `.cppm`/partition file the import graph touches, not just the consumer `.cpp`. A compile database missing
+   the provider's own entry reproduces exactly the `module 'X' not found` failure — this is a project/build-
+   system configuration gap (many build systems don't emit compile-commands entries for module interface
+   units by default), not a clangd or toolchain bug. If a module import fails to resolve, check
+   `compile_commands.json` for the missing provider file first.
+
+## Package metadata
+
+Each release contains:
+
+```text
+clang-<snapshot>-linux-x86_64.tar.zst
+clang-<snapshot>-linux-x86_64.manifest.json
+clang-<snapshot>-linux-x86_64.SHA256SUMS
+clang-<snapshot>-linux-x86_64.SHA512SUMS
+```
+
+The same manifest is also stored inside the archive at:
+
+```text
+share/clang-cxx26/manifest.json
+```
+
+The manifest records the exact source commit, platform, compiler identity, libc++ module manifest, included components, and CMake integration entrypoint.
+
+Miracle and Switch CI will later pin both the snapshot identifier and the expected archive digest. They must never follow the moving `cxx26` branch.
+
+## Validation boundary
+
+T3 performs a packaging smoke test after extracting the archive into a new location. The smoke test verifies that:
+
+- the artifact is relocatable;
+- the packaged Clang can be selected through the generated CMake toolchain file;
+- CMake sees C++26 `import std`;
+- the installed libc++ module sources are usable;
+- a small C++26 program can build and execute.
+
+Fine-grained language/library feature probing belongs to T4.
+
+The T3 relocation smoke test nevertheless exercises a minimal reflection path
+through `import std`, including libc++'s reflected type-trait wrappers. This is
+intentional: the reference snapshot is not considered usable if its packaged
+standard module cannot consume the reflection-enabled `<meta>` implementation.
+
+## CI persistence and caching
+
+The snapshot workflow separates expensive production from validation:
+
+```text
+exact staged-toolchain artifact?
+      |
+      +-- yes --> restore installed compiler/runtime stage
+      |
+      `-- no --> restore latest rolling ccache artifact
+                    |
+                    v
+               build + install
+                    |
+                    +--> persist exact staged-toolchain artifact
+                    |
+                    `--> persist updated rolling ccache artifact
+                              |
+                              v
+                           package
+                              |
+                              +--> candidate artifact
+                              |
+                              v
+                  separate relocation/smoke verification
+                              |
+                              v
+                  publish dated snapshots only
+```
+
+The packaged candidate is uploaded before verification begins. A failed smoke
+test therefore does not discard the already-built snapshot.
+
+GitHub Actions dependency caches are deliberately not used for the reusable
+toolchain state. Cache visibility is scoped by branch/tag ref, so a cache
+created by `cxx26-preflight-a` cannot be restored by
+`cxx26-preflight-b`. Disposable preflight tags therefore make the ordinary
+Actions cache service unsuitable for this workflow.
+
+Instead, the workflow uses repository-level Actions artifacts as a
+content-addressed build store:
+
+```text
+cxx26-stage-linux-x86_64-v2-<source-fingerprint>-<recipe-fingerprint>
+cxx26-ccache-linux-x86_64-v2
+```
+
+The staged-toolchain artifact is exact. Its fingerprint is derived from the
+compiler/runtime source trees plus the toolchain build recipe. Changes only to
+packaging, activation, verification, documentation, or the generated CMake
+toolchain integration reuse the installed stage without rebuilding LLVM.
+
+The ccache artifact is intentionally *not* keyed by the source revision. ccache
+performs its own content/dependency validation, so a source edit can reuse all
+unaffected object compilations. This is what makes a change to one libc++ header
+different from a cold compiler rebuild: the exact installed stage is rebuilt,
+but unrelated compiler objects are served from the rolling compiler cache.
+
+Artifacts are repository-level and can be located and downloaded across
+different preflight/release tag runs, avoiding the tag-scope restriction of the
+Actions cache service.
+
+During migration from the original cache implementation, the workflow retains
+a restore-only legacy `actions/cache` bridge. Reusing the same disposable
+preflight tag name once lets an existing tag-scoped stage/ccache entry be
+imported and republished as repository-level artifacts. New reusable state is
+not written back to the tag-scoped cache service.
+
+Exact staged-toolchain artifacts are retained for 30 days, rolling compiler
+cache artifacts and candidate snapshots for 14 days. Published dated snapshots
+remain the immutable long-term distribution mechanism.
+
+## Publishing
+
+The GitHub workflow `.github/workflows/reference-toolchain-snapshot.yml` has two modes.
+
+A `cxx26-preflight-*` tag builds and validates a temporary preflight artifact only.
+It does not create a GitHub release. Preflight tags may be deleted after the run.
+
+For example:
+
+```bash
+git tag cxx26-preflight-t3
+git push origin cxx26-preflight-t3
+```
+
+After the workflow has completed, the disposable trigger tag can be removed:
+
+```bash
+git push origin :refs/tags/cxx26-preflight-t3
+git tag -d cxx26-preflight-t3
+```
+
+Pushing an annotated `cxx26-YYYY.MM.DD[.N]` tag builds the same artifact and creates a GitHub prerelease after validation. The workflow refuses lightweight tags, tags whose commit is not in `cxx26` history, and release identifiers that already have a GitHub release.
+
+The workflow never creates or moves the source tag itself.

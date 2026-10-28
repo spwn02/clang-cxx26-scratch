@@ -1,0 +1,109 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _LIBCPP___ALGORITHM_RANGES_SWAP_RANGES_H
+#define _LIBCPP___ALGORITHM_RANGES_SWAP_RANGES_H
+
+#include <__algorithm/in_in_result.h>
+#include <__algorithm/iterator_operations.h>
+#include <__algorithm/pstl.h>
+#include <__algorithm/swap_ranges.h>
+#include <__config>
+#include <__iterator/concepts.h>
+#include <__iterator/iter_swap.h>
+#include <__ranges/access.h>
+#include <__ranges/concepts.h>
+#include <__ranges/dangling.h>
+#include <__type_traits/is_execution_policy.h>
+#include <__type_traits/remove_cvref.h>
+#include <__utility/forward.h>
+#include <__utility/move.h>
+
+#if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
+#  pragma GCC system_header
+#endif
+
+_LIBCPP_PUSH_MACROS
+#include <__undef_macros>
+
+#if _LIBCPP_STD_VER >= 20
+
+_LIBCPP_BEGIN_NAMESPACE_STD
+
+namespace ranges {
+
+template <class _I1, class _I2>
+using swap_ranges_result = in_in_result<_I1, _I2>;
+
+struct __swap_ranges {
+  template <input_iterator _I1, sentinel_for<_I1> _S1, input_iterator _I2, sentinel_for<_I2> _S2>
+    requires indirectly_swappable<_I1, _I2>
+  _LIBCPP_HIDE_FROM_ABI constexpr swap_ranges_result<_I1, _I2>
+  operator()(_I1 __first1, _S1 __last1, _I2 __first2, _S2 __last2) const {
+    auto __ret = std::__swap_ranges<_RangeAlgPolicy>(
+        std::move(__first1), std::move(__last1), std::move(__first2), std::move(__last2));
+    return {std::move(__ret.first), std::move(__ret.second)};
+  }
+
+  template <input_range _R1, input_range _R2>
+    requires indirectly_swappable<iterator_t<_R1>, iterator_t<_R2>>
+  _LIBCPP_HIDE_FROM_ABI constexpr swap_ranges_result<borrowed_iterator_t<_R1>, borrowed_iterator_t<_R2>>
+  operator()(_R1&& __r1, _R2&& __r2) const {
+    return operator()(ranges::begin(__r1), ranges::end(__r1), ranges::begin(__r2), ranges::end(__r2));
+  }
+#  if _LIBCPP_STD_VER >= 26 && !defined(_LIBCPP_FREESTANDING)
+  template <class _Ep, random_access_iterator _I1, sized_sentinel_for<_I1> _S1,
+            random_access_iterator _I2,
+            class _RawPolicy = __remove_cvref_t<_Ep>, enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+    requires indirectly_swappable<_I1, _I2>
+  _LIBCPP_HIDE_FROM_ABI swap_ranges_result<_I1, _I2> operator()(_Ep&& __exec, _I1 __first1, _S1 __last1,
+                                                                 _I2 __first2) const {
+    _I1 __end1 = __first1 + (__last1 - __first1);
+    _I2 __end2 = __first2 + (__last1 - __first1);
+    std::swap_ranges(std::forward<_Ep>(__exec), __first1, __end1, __first2);
+    return {std::move(__end1), std::move(__end2)};
+  }
+  template <class _Ep, random_access_iterator _I1, sized_sentinel_for<_I1> _S1,
+            random_access_iterator _I2, sized_sentinel_for<_I2> _S2,
+            class _RawPolicy = __remove_cvref_t<_Ep>, enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+    requires indirectly_swappable<_I1, _I2>
+  _LIBCPP_HIDE_FROM_ABI swap_ranges_result<_I1, _I2>
+  operator()(_Ep&& __exec, _I1 __first1, _S1 __last1, _I2 __first2, _S2 __last2) const {
+    auto __count1 = __last1 - __first1;
+    auto __count2 = __last2 - __first2;
+    auto __count = __count1 < __count2 ? __count1 : __count2;
+    _I1 __end1 = __first1 + __count;
+    _I2 __end2 = __first2 + __count;
+    std::swap_ranges(std::forward<_Ep>(__exec), __first1, __end1, __first2);
+    return {std::move(__end1), std::move(__end2)};
+  }
+  template <class _Ep, random_access_range _R1, random_access_range _R2,
+            class _RawPolicy = __remove_cvref_t<_Ep>, enable_if_t<is_execution_policy_v<_RawPolicy>, int> = 0>
+    requires sized_range<_R1> && sized_range<_R2> && indirectly_swappable<iterator_t<_R1>, iterator_t<_R2>>
+  _LIBCPP_HIDE_FROM_ABI swap_ranges_result<borrowed_iterator_t<_R1>, borrowed_iterator_t<_R2>>
+  operator()(_Ep&& __exec, _R1&& __r1, _R2&& __r2) const {
+    auto __first1 = ranges::begin(__r1);
+    auto __first2 = ranges::begin(__r2);
+    return (*this)(std::forward<_Ep>(__exec), __first1, __first1 + ranges::size(__r1),
+                   __first2, __first2 + ranges::size(__r2));
+  }
+#  endif
+};
+
+inline namespace __cpo {
+inline constexpr auto swap_ranges = __swap_ranges{};
+} // namespace __cpo
+} // namespace ranges
+
+_LIBCPP_END_NAMESPACE_STD
+
+#endif // _LIBCPP_STD_VER >= 20
+
+_LIBCPP_POP_MACROS
+
+#endif // _LIBCPP___ALGORITHM_RANGES_SWAP_RANGES_H

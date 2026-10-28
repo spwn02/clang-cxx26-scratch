@@ -1,0 +1,757 @@
+// RUN: %clang_cc1 -std=c++98 %s -verify=expected,cxx98 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++11 %s -verify=expected,cxx11-14,since-cxx11 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++14 %s -verify=expected,cxx11-14,since-cxx11,since-cxx14 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++17 %s -verify=expected,since-cxx11,since-cxx14,since-cxx17 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++20 %s -verify=expected,since-cxx11,since-cxx14,since-cxx17,since-cxx20 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++23 %s -verify=expected,since-cxx11,since-cxx14,since-cxx17,since-cxx20 -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++2c %s -verify=expected,since-cxx11,since-cxx14,since-cxx17,since-cxx20 -fexceptions -fcxx-exceptions -pedantic-errors
+
+namespace std {
+  __extension__ typedef __SIZE_TYPE__ size_t;
+
+  template<typename E> struct initializer_list {
+    const E *p; size_t n;
+    initializer_list(const E *p, size_t n);
+    initializer_list();
+  };
+}
+
+namespace cwg2303 { // cwg2303: 12
+#if __cplusplus >= 201103L
+template <typename... T>
+struct A;
+template <>
+struct A<> {};
+template <typename T, typename... Ts>
+struct A<T, Ts...> : A<Ts...> {};
+struct B : A<int, int> {};
+struct C : A<int, int>, A<int> {};
+/* since-cxx11-warning@-1 {{direct base 'A<int>' is inaccessible due to ambiguity:
+    struct cwg2303::C -> A<int, int> -> A<int>
+    struct cwg2303::C -> A<int>}} */
+struct D : A<int>, A<int, int> {};
+/* since-cxx11-warning@-1 {{direct base 'A<int>' is inaccessible due to ambiguity:
+    struct cwg2303::D -> A<int>
+    struct cwg2303::D -> A<int, int> -> A<int>}} */
+struct E : A<int, int> {};
+struct F : B, E {};
+
+template <typename... T>
+void f(const A<T...> &) {
+  static_assert(sizeof...(T) == 2, "Should only match A<int,int>");
+}
+template <typename... T>
+void f2(const A<T...> *);
+
+void g() {
+  f(B{}); // This is no longer ambiguous.
+  B b;
+  f2(&b);
+  f(C{});
+  f(D{});
+  f(F{});
+  /* since-cxx11-error@-1 {{ambiguous conversion from derived class 'const F' to base class 'const A<int, int>':
+    struct cwg2303::F -> B -> A<int, int>
+    struct cwg2303::F -> E -> A<int, int>}} */
+}
+#endif
+} // namespace cwg2303
+
+namespace cwg2304 { // cwg2304: 2.8
+template<typename T> void foo(T, int);
+template<typename T> void foo(T&, ...);
+struct Q; // #cwg2304-Q
+void fn1(Q &data_vectors) {
+  foo(data_vectors, 0);
+  // expected-error@-1 {{argument type 'cwg2304::Q' is incomplete}}
+  //   expected-note@#cwg2304-Q {{forward declaration of 'cwg2304::Q'}}
+}
+} // namespace cwg2304
+
+namespace cwg2310 { // cwg2310: 22
+#if __cplusplus >= 201103L
+template<typename A, typename B>
+struct check_derived_from {
+  static A a;
+  static constexpr B *p = &a;
+  typedef char force[p ? 1 : 1];
+  // since-cxx17-note@-1 {{in instantiation of static data member 'cwg2310::check_derived_from<cwg2310::Z, cwg2310::X>::p' requested here}}
+  // since-cxx17-note@-2 {{in instantiation of static data member 'cwg2310::check_derived_from<cwg2310::Z, cwg2310::Y>::p' requested here}}
+  // since-cxx17-note@-3 {{in instantiation of static data member 'cwg2310::check_derived_from<cwg2310::Z, cwg2310::W>::p' requested here}}
+  // expected-error@-5 {{cannot initialize a variable of type 'cwg2310::X *const' with an rvalue of type 'cwg2310::Z *'}}
+  // expected-error@-6 {{cannot initialize a variable of type 'cwg2310::Y *const' with an rvalue of type 'cwg2310::Z *'}}
+  // expected-error@-7 {{incomplete type 'cwg2310::Z' where a complete type is required}}
+};
+
+struct W {};
+struct X {};
+struct Y {};
+struct Z : W,
+  X, check_derived_from<Z, X>, // #cwg2310-X
+  check_derived_from<Z, Y>, Y  // #cwg2310-Y
+  // expected-note@#cwg2310-X {{in instantiation of template class 'cwg2310::check_derived_from<cwg2310::Z, cwg2310::X>' requested here}}
+  // expected-note@#cwg2310-Y {{in instantiation of template class 'cwg2310::check_derived_from<cwg2310::Z, cwg2310::Y>' requested here}}
+{
+  check_derived_from<Z, W> cdf;
+  // expected-note@-1 {{in instantiation of template class 'cwg2310::check_derived_from<cwg2310::Z, cwg2310::W>' requested here}}
+};
+#endif
+} // namespace cwg2310
+
+namespace cwg2310_incomplete_pointer_conversion { // cwg2310: 22
+#if __cplusplus < 201103L
+struct Base98 {};
+void convert(Base98 *);
+struct Derived98 : Base98 {
+  typedef char implicit[sizeof(convert(static_cast<Derived98 *>(0)))];
+  // expected-error@-1 {{incomplete type 'Derived98' where a complete type is required}}
+  typedef char explicit_cast[
+      sizeof(static_cast<Base98 *>(static_cast<Derived98 *>(0)))];
+  // expected-error@-1 {{incomplete type 'Derived98' where a complete type is required}}
+};
+#else
+struct Base {};
+struct Derived : Base {
+  static constexpr Base *implicit = static_cast<Derived *>(nullptr);
+  // expected-error@-1 {{incomplete type 'Derived' where a complete type is required}}
+  static constexpr Base *explicit_cast = static_cast<Base *>(static_cast<Derived *>(nullptr));
+  // expected-error@-1 {{incomplete type 'Derived' where a complete type is required}}
+  // cxx11-14-error@-2 {{declaration of constexpr static data member 'explicit_cast' requires an initializer}}
+  // since-cxx17-error@-3 {{constexpr variable 'explicit_cast' must be initialized by a constant expression}}
+};
+#endif
+} // namespace cwg2310_incomplete_pointer_conversion
+
+// cwg2331: na
+// cwg2335 is in cwg2335.cxx
+
+namespace cwg2311 {  // cwg2311 is open with no proposed resolution
+#if __cplusplus >= 201707L
+template<typename T>
+void test() {
+  // Ensure none of these try to call a move constructor.
+  T a = T{T(0)};
+  T b{T(0)};
+  auto c{T(0)};
+  T d = {T(0)};
+  auto e = {T(0)};
+#if __cplusplus >= 202302L
+  auto f = auto{T(0)};
+#endif
+  void(*fn)(T);
+  fn({T(0)});
+}
+
+struct NonMovable {
+  NonMovable(int);
+  NonMovable(NonMovable&&) = delete;
+};
+struct NonMovableNonApplicableIList {
+  NonMovableNonApplicableIList(int);
+  NonMovableNonApplicableIList(NonMovableNonApplicableIList&&) = delete;
+  NonMovableNonApplicableIList(std::initializer_list<int>);
+};
+struct ExplicitMovable {
+  ExplicitMovable(int);
+  explicit ExplicitMovable(ExplicitMovable&&);
+};
+struct ExplicitNonMovable {
+  ExplicitNonMovable(int);
+  explicit ExplicitNonMovable(ExplicitNonMovable&&) = delete;
+};
+struct ExplicitNonMovableNonApplicableIList {
+  ExplicitNonMovableNonApplicableIList(int);
+  explicit ExplicitNonMovableNonApplicableIList(ExplicitNonMovableNonApplicableIList&&) = delete;
+  ExplicitNonMovableNonApplicableIList(std::initializer_list<int>);
+};
+struct CopyOnly {
+  CopyOnly(int);
+  CopyOnly(const CopyOnly&);
+  CopyOnly(CopyOnly&&) = delete;
+};
+struct ExplicitCopyOnly {
+  ExplicitCopyOnly(int);
+  explicit ExplicitCopyOnly(const ExplicitCopyOnly&);
+  explicit ExplicitCopyOnly(ExplicitCopyOnly&&) = delete;
+};
+
+template void test<NonMovable>();
+template void test<NonMovableNonApplicableIList>();
+template void test<ExplicitMovable>();
+template void test<ExplicitNonMovable>();
+template void test<ExplicitNonMovableNonApplicableIList>();
+template void test<CopyOnly>();
+template void test<ExplicitCopyOnly>();
+
+struct any {
+    template<typename T>
+    any(T&&);
+};
+
+template<typename T>
+struct X {
+    X();
+    X(T) = delete; // #cwg2311-X
+};
+
+X<std::initializer_list<any>> x{ X<std::initializer_list<any>>() };
+// since-cxx17-error@-1 {{call to deleted constructor of 'X<std::initializer_list<any>>'}}
+//   since-cxx17-note@#cwg2311-X {{'X' has been explicitly marked deleted here}}
+
+// Per the currently implemented resolution, this does not apply to std::initializer_list.
+// An initializer list initialized from `{ e }` always has exactly one element constructed
+// from `e`, where previously that could have been a copy of an init list or `e.operator std::initializer_list()`
+struct InitListCtor {
+  InitListCtor(int);
+  InitListCtor(InitListCtor&&) = delete;
+  InitListCtor(std::initializer_list<InitListCtor>) = delete; // #cwg2311-InitListCtor
+};
+
+std::initializer_list<InitListCtor> i;
+auto j = std::initializer_list<InitListCtor>{ i };
+// since-cxx17-error@-1 {{conversion function from 'std::initializer_list<InitListCtor>' to 'const InitListCtor' invokes a deleted function}}
+//   since-cxx17-note@#cwg2311-InitListCtor {{'InitListCtor' has been explicitly marked deleted here}}
+#endif
+} // namespace cwg2311
+
+namespace cwg2338 { // cwg2338: 12
+#if __cplusplus >= 201103L
+namespace B {
+enum E : bool { Zero, One };
+static_assert((int)(E)2 == 1, "");
+} // namespace B
+namespace D {
+enum class E : bool { Zero, One };
+static_assert((int)(E)2 == 1, "");
+} // namespace D
+#endif
+} // namespace cwg2338
+
+namespace cwg2346 { // cwg2346: 11
+  void test() {
+    const int i2 = 0;
+    extern void h2b(int x = i2 + 0); // ok, not odr-use
+  }
+} // namespace cwg2346
+
+namespace cwg2351 { // cwg2351: 20
+#if __cplusplus >= 201103L
+  static_assert((void{}, true), "");
+
+  void f() {
+    return void{};
+  }
+
+  template<typename T>
+  void g() {
+    return T{};
+  }
+  template void g<void>();
+  template void g<const void>();
+
+  void h() {
+    return {};
+    // since-cxx11-error@-1 {{void function 'h' must not return a value}}
+  }
+
+  template<typename T, int... I>
+  T i() {
+    return T{I...};
+  }
+  template void i<void>();
+  template const void i<const void>();
+
+  static_assert((void({}), true), "");
+  // since-cxx11-error@-1 {{cannot initialize non-class type 'void' with a parenthesized initializer list}}
+#else
+  int I = (void{}, 0);
+  // cxx98-error@-1 {{expected ')'}}
+  //   cxx98-note@-2 {{to match this '('}}
+  // cxx98-error@-3 {{expected expression}}
+#endif
+} // namespace cwg2351
+
+namespace cwg2352 { // cwg2352: 10
+  int **p;
+  const int *const *const &f1() { return p; }
+  int *const *const &f2() { return p; }
+  int **const &f3() { return p; }
+
+  const int **const &f4() { return p; }
+  // expected-error@-1 {{reference to type 'const int **const' could not bind to an lvalue of type 'int **'}}
+  const int *const *&f5() { return p; }
+  // expected-error@-1 {{binding reference of type 'const int *const *' to value of type 'int **' not permitted due to incompatible qualifiers}}
+
+  // A glvalue conditional expression: the reference binds directly after a
+  // qualification conversion ([expr.cond], [dcl.init.ref]).
+  const int * const * const q = 0;
+  __typeof(&(true ? p : q)) x = &(true ? p : q);
+
+  // No conversion binds directly, so the result is a prvalue of the composite
+  // pointer type ([expr.cond]).
+  const int * const * r;
+  void *y = &(true ? p : r);
+  // expected-error@-1 {{rvalue of type 'const int *const *'}}
+
+  // The binding with the smaller qualification conversion is better
+  // ([over.ics.rank]).
+  void f(const int * const * const &r);
+#if __cplusplus >= 201103L
+  constexpr
+#endif
+  int *const *const &f(int * const * const &r) { return r; }
+
+  // No temporary is created here.
+  int *const *const &check_f = f(p);
+#if __cplusplus >= 201103L
+  static_assert(&p == &check_f, "");
+#endif
+} // namespace cwg2352
+
+namespace cwg2354 { // cwg2354: 15
+#if __cplusplus >= 201103L
+enum alignas(64) A {};
+// since-cxx11-error@-1 {{'alignas' attribute cannot be applied to an enumeration}}
+enum struct alignas(64) B {};
+// since-cxx11-error@-1 {{'alignas' attribute cannot be applied to an enumeration}}
+#endif
+} // namespace cwg2354
+
+namespace cwg2356 { // cwg2356: 4
+#if __cplusplus >= 201103L
+struct A {
+  A();
+  A(A &&);                        // #1
+  template<typename T> A(T &&);   // #2
+};
+struct B : A {
+  using A::A;
+  B(const B &);                   // #3
+  B(B &&) = default;              // #4, implicitly deleted
+  // since-cxx11-warning@-1 {{explicitly defaulted move constructor is implicitly deleted}}
+  //   since-cxx11-note@#cwg2356-X {{move constructor of 'B' is implicitly deleted because field 'x' has a deleted move constructor}}
+  //   since-cxx11-note@#cwg2356-X {{'X' has been explicitly marked deleted here}}
+  //   since-cxx11-note@-4 {{replace 'default' with 'delete'}}
+
+  struct X { X(X &&) = delete; } x; // #cwg2356-X
+};
+extern B b1;
+B b2 = static_cast<B&&>(b1);      // calls #3: #1, #2, and #4 are not viable
+struct C { operator B&&(); };
+B b3 = C();                       // calls #3
+#endif
+} // namespace cwg2356
+
+namespace cwg2358 { // cwg2358: 16
+#if __cplusplus >= 201402L
+  void f2() {
+    int i = 1;
+    void g1(int = [xxx=1] { return xxx; }());  // OK
+    void g2(int = [xxx=i] { return xxx; }());
+    // since-cxx14-error@-1 {{default argument references local variable 'i' of enclosing function}}
+  }
+#endif
+} // namespace cwg2358
+
+// CWG2363 was closed as NAD, but its resolution does affirm that
+// a friend declaration cannot have an opaque-enumm-specifier.
+namespace cwg2363 { // cwg2363: 19
+#if __cplusplus >= 201103L
+enum class E0;
+enum E1 : int;
+
+struct A {
+  friend enum class E0;
+  // since-cxx11-error@-1 {{reference to enumeration must use 'enum' not 'enum class'}}
+  // since-cxx11-error@-2 {{elaborated enum specifier cannot be declared as a friend}}
+  //   since-cxx11-note@-3 {{remove 'enum class' to befriend an enum}}
+
+  friend enum E0;
+  // since-cxx11-error@-1 {{elaborated enum specifier cannot be declared as a friend}}
+  //   since-cxx11-note@-2 {{remove 'enum' to befriend an enum}}
+
+  friend enum class E1;
+  // since-cxx11-error@-1 {{reference to enumeration must use 'enum' not 'enum class'}}
+  // since-cxx11-error@-2 {{elaborated enum specifier cannot be declared as a friend}}
+  //   since-cxx11-note@-3 {{remove 'enum class' to befriend an enum}}
+
+  friend enum E1;
+  // since-cxx11-error@-1 {{elaborated enum specifier cannot be declared as a friend}}
+  //   since-cxx11-note@-2 {{remove 'enum' to befriend an enum}}
+
+  friend enum class E2;
+  // since-cxx11-error@-1 {{reference to enumeration must use 'enum' not 'enum class'}}
+  // since-cxx11-error@-2 {{elaborated enum specifier cannot be declared as a friend}}
+  //   since-cxx11-note@-3 {{remove 'enum class' to befriend an enum}}
+};
+#endif
+} // namespace cwg2363
+
+namespace cwg2369 { // cwg2369: yes
+#if __cplusplus >= 202002L
+template <class T> struct Z {
+  typedef typename T::x xx;
+};
+
+template <class T>
+concept C = requires { typename T::A; };
+template <C T> typename Z<T>::xx f(void *, T); // #1
+template <class T> void f(int, T);             // #2
+
+struct A {
+} a;
+
+struct ZZ {
+  template <class T, class = typename Z<T>::xx> operator T *();
+  operator int();
+};
+
+void foo() {
+  ZZ zz;
+  f(1, a); // OK, deduction fails for #1 because there is no conversion from int
+           // to void*
+  f(zz, 42); // OK, deduction fails for #1 because C<int> is not satisfied
+}
+
+#endif
+} // namespace cwg2369
+
+namespace cwg2370 { // cwg2370: yes
+namespace N {
+typedef int type; // #cwg2370-type
+void g(type);
+void h(type);
+} // namespace N
+class C {
+  typedef N::type N_type;
+  // The part of a friend declaration after the declarator-id is not in the
+  // scope of N, so 'type' is not found.
+  friend void N::g(type);
+  // expected-error@-1 {{unknown type name 'type'; did you mean 'N::type'?}}
+  //   expected-note@#cwg2370-type {{'N::type' declared here}}
+  friend void N::h(N_type);
+};
+} // namespace cwg2370
+
+namespace cwg2376 { // cwg2376: 21
+#if __cplusplus >= 201703L
+template<int = 0> class C {};
+
+C a;
+const volatile C b = C<2>();
+C (c) = {};
+C* d;
+// expected-error@-1 {{cannot form pointer to deduced class template specialization type}}
+C e[1];
+// expected-error@-1 {{cannot form array of deduced class template specialization type}}
+#endif
+}
+
+namespace cwg2386 { // cwg2386: 9
+// Otherwise, if the qualified-id std::tuple_size<E> names a complete class
+// type **with a member value**, the expression std::tuple_size<E>::value shall
+// be a well-formed integral constant expression
+#if __cplusplus >= 201702L
+struct Bad1 { int a, b; };
+struct Bad2 { int a, b; };
+} // namespace cwg2386
+namespace std {
+template <typename T> struct tuple_size;
+template <> struct tuple_size<cwg2386::Bad1> {};
+template <> struct tuple_size<cwg2386::Bad2> {
+  static const int value = 42;
+};
+} // namespace std
+namespace cwg2386 {
+void no_value() { auto [x, y] = Bad1(); }
+void wrong_value() { auto [x, y] = Bad2(); }
+// since-cxx17-error@-1 {{type 'Bad2' binds to 42 elements, but only 2 names were provided}}
+#endif
+} // namespace cwg2386
+
+// cwg2385: na
+
+namespace cwg2387 { // cwg2387: 9
+#if __cplusplus >= 201402L
+  template<int> int a = 0;
+  extern template int a<0>; // ok
+
+  template<int> static int b = 0;
+  extern template int b<0>;
+  // since-cxx14-error@-1 {{explicit instantiation declaration of 'b<0>' with internal linkage}}
+
+  template<int> const int c = 0;
+  extern template const int c<0>; // ok, has external linkage despite 'const'
+
+  template<typename T> T d = 0;
+  extern template int d<int>;
+  extern template const int d<const int>;
+#endif
+} // namespace cwg2387
+
+namespace cwg2390 { // cwg2390: 14
+// Test that macro expansion of the builtin argument works.
+#define C clang
+#define F fallthrough
+#define CF clang::fallthrough
+
+#if !__has_cpp_attribute(F)
+#error "doesn't have fallthrough"
+#endif
+
+#if !__has_cpp_attribute(C::F)
+#error "doesn't have clang::fallthrough 1"
+#endif
+
+#if !__has_cpp_attribute(clang::F)
+#error "doesn't have clang::fallthrough 2"
+#endif
+
+#if !__has_cpp_attribute(C::fallthrough)
+#error "doesn't have clang::fallthrough 3"
+#endif
+
+#if !__has_cpp_attribute(CF)
+#error "doesn't have clang::fallthrough 4"
+#endif
+
+#define FUNCLIKE1(x) clang::x
+#if !__has_cpp_attribute(FUNCLIKE1(fallthrough))
+#error "doesn't have clang::fallthrough through func-like macro 1"
+#endif
+
+#define FUNCLIKE2(x) _Clang::x
+#if !__has_cpp_attribute(FUNCLIKE2(fallthrough))
+#error "doesn't have clang::fallthrough through func-like macro 2"
+#endif
+} // namespace cwg2390
+
+namespace cwg2394 { // cwg2394: 15
+
+struct A {};
+const A a;
+
+// Now allowed to default-init B.
+struct B { const A a; };
+B b;
+
+} // namespace cwg2394
+
+namespace cwg2396 { // cwg2396: yes c++11
+  struct A {
+    struct B;
+    operator B B::*();
+  };
+  struct B;
+
+  // The component names of a conversion-type-id are looked up in the class of
+  // the object expression first, then in the enclosing scopes
+  // ([basic.lookup.unqual], P1787R6), also when the object expression is
+  // dependent. C++98 keeps the ambiguity of 'B' (CWG1111).
+#if __cplusplus >= 201103L
+  void f(A a) { a.operator B B::*(); }
+  template <class Y> void f2(Y a) { a.operator B B::*(); }
+  template void f2<A>(A);
+#endif
+
+  struct T1 { struct U { int i; }; };
+  struct T2 {};
+  struct U1 {};
+  struct U2 {};
+#if __cplusplus >= 201103L
+  struct X {
+    using T = T1;
+    using U = U1;
+    operator U1 T1::*();
+    operator U1 T2::*();
+    operator U2 T1::*();
+    operator U2 T2::*();
+  };
+  template <class Obj, class T>
+  void g() {
+    using U = U2;
+    // #1 searches for U and T in the class of the object first
+    static_assert(__is_same(decltype(Obj().operator U T::*()), U1 T1::*), "");
+    // #2: the operand of decltype is an expression
+    static_assert(__is_same(decltype(Obj().operator U decltype(T())::*()), U1 T2::*), "");
+  }
+  template void g<X, T2>();
+#endif
+} // namespace cwg2396
+
+namespace cwg2397 { // cwg2397: 17
+#if __cplusplus >= 201103L
+  void foo() {
+    int a[5];
+
+    auto (&b)[5] = a;
+    auto (*c)[5] = &a;
+  }
+#endif
+} // namespace cwg2397
+// cwg2302: na
+// cwg2306: na
+// cwg2308: na
+// cwg2314: na
+// cwg2326: na
+// cwg2344: na
+// cwg2348: na
+// cwg2349: na
+// cwg2350: na
+// cwg2357: na
+// cwg2364: na
+// cwg2367: na
+// cwg2375: na
+// cwg2377: na
+// cwg2383: na
+// cwg2388: na
+// cwg2391: na
+// cwg2393: na
+// cwg2371: na
+// cwg2300: na
+// cwg2380: na
+// cwg2323: na
+// cwg2307: na
+// cwg2330: na
+// cwg2332: na
+
+namespace cwg2379 { // cwg2379: 22
+template <class T> void f(T);
+struct S {
+#if __cplusplus >= 201103L
+  friend constexpr void f<>(int);
+  // since-cxx11-error@-1 {{friend declaration of a function template specialization cannot be declared constexpr}}
+#endif
+  friend inline void f<>(long);
+  // expected-error@-1 {{friend declaration of a function template specialization cannot be declared inline}}
+};
+
+#if __cplusplus >= 201103L
+template <class T> constexpr int g(T) { return 1; }
+template <class A> struct S2 { friend int g<>(A); };
+S2<int> s2;
+static_assert(g(1) == 1, "friend specialization keeps constexpr");
+#endif
+} // namespace cwg2379
+// cwg2365: na
+// cwg2382: na
+// cwg2322: na
+// cwg2399: na
+
+#if __cplusplus >= 201703L
+namespace std {
+template<class> struct tuple_size;
+template<unsigned long, class> struct tuple_element;
+}
+namespace cwg2313 { struct Tup {}; }
+namespace std {
+template<> struct tuple_size<cwg2313::Tup> { static const unsigned long value = 1; };
+template<> struct tuple_element<0, cwg2313::Tup> { using type = int; };
+}
+namespace cwg2313 { // cwg2313: yes
+// Structured bindings are not variables that can be redeclared.
+template<unsigned long I> int &&get(Tup &&);
+Tup mk();
+auto [a] = mk();
+extern int &&a;
+// since-cxx17-error@-1 {{redefinition of 'a' as different kind of symbol}}
+//   since-cxx17-note@-3 {{previous definition is here}}
+} // namespace cwg2313
+#endif
+
+#if __cplusplus >= 201103L
+namespace cwg2315 { // cwg2315: yes
+// A union with a variant member that has a non-trivial copy constructor has a
+// deleted defaulted copy constructor.
+struct A { A(); A(const A &); };
+union B { A a; }; // #cwg2315-B
+B &mk();
+B c = mk();
+// since-cxx11-error@-1 {{call to implicitly-deleted copy constructor of 'B'}}
+//   since-cxx11-note@#cwg2315-B {{copy constructor of 'B' is implicitly deleted because variant field 'a' has a non-trivial copy constructor}}
+} // namespace cwg2315
+#endif
+
+#if __cplusplus >= 201703L
+namespace cwg2339 { struct Pair { int a, b; }; }
+namespace std {
+template<> struct tuple_size<cwg2339::Pair> { static const unsigned long value = 2; };
+template<unsigned long I> struct tuple_element<I, cwg2339::Pair> { using type = int; };
+}
+namespace cwg2339 { // cwg2339: yes
+// The index passed to get<i> is a prvalue of type std::size_t.
+template<unsigned long I> int get(const Pair &p) { return I ? p.b : p.a; }
+void f() { auto [x, y] = Pair{1, 2}; (void)x; (void)y; }
+} // namespace cwg2339
+#endif
+
+namespace cwg2342 { // cwg2342: yes
+// reinterpret_cast to a reference type refers to the pointer-interconvertible
+// object and creates no temporary.
+struct A { int n; } a;
+int *p = reinterpret_cast<int*>(&a);
+int &r = reinterpret_cast<int&>(a);
+} // namespace cwg2342
+
+#if __cplusplus >= 202002L
+namespace cwg2359 { // cwg2359: yes
+// A designated initializer with a braced initializer direct-initializes.
+struct X { explicit X(int); }; // #cwg2359-X
+struct A { X x; };
+A a{.x{3}};
+A b{.x = 3};
+// since-cxx20-error@-1 {{no viable conversion from 'int' to 'X'}}
+//   since-cxx20-note@#cwg2359-X {{explicit constructor is not a candidate}}
+//   since-cxx20-note@#cwg2359-X {{candidate constructor (the implicit copy constructor) not viable: no known conversion from 'int' to 'const X &' for 1st argument}}
+//   since-cxx20-note@#cwg2359-X {{candidate constructor (the implicit move constructor) not viable: no known conversion from 'int' to 'X &&' for 1st argument}}
+} // namespace cwg2359
+#endif
+
+#if __cplusplus >= 201103L
+namespace cwg2336 { // cwg2336: yes
+template<class T> T &declval() noexcept;
+// The virtual bases of an abstract class are not potentially constructed.
+struct V2 { ~V2() noexcept(false); };
+struct B2 : virtual V2 { virtual void f() = 0; };
+struct D2 : B2 { void f(); };
+static_assert(noexcept(declval<B2>().~B2()), "");
+static_assert(!noexcept(declval<D2>().~D2()), "");
+// A virtual destructor also considers the destructors of its virtual bases.
+class V { public: virtual ~V() noexcept(false); };
+class B : virtual V { virtual void foo() = 0; };
+class D : B { virtual void foo(); };
+static_assert(!noexcept(declval<B>().~B()), "");
+static_assert(!noexcept(declval<D>().~D()), "");
+} // namespace cwg2336
+#endif
+
+#if __cplusplus >= 201103L
+namespace cwg2373 { // cwg2373: yes
+// A static member function template is not given an implicit object
+// parameter during partial ordering.
+struct Foo {
+  template <typename T> static T *f(Foo *) { return nullptr; }
+  template <typename T, typename A1> T *f(const A1 &) { return nullptr; }
+};
+void g() { Foo x; x.f<int>(&x); }
+} // namespace cwg2373
+#endif
+
+#if __cplusplus >= 201103L
+namespace cwg2389 { // cwg2389: yes
+struct S { static int i; };
+auto S::i = 23;
+} // namespace cwg2389
+#endif
+
+#if __cplusplus >= 201402L
+namespace cwg2392 { // cwg2392: yes
+// The size of a new-expression array is only checked in potentially evaluated
+// expressions.
+template<class T = void> constexpr int f() { T t; return 1; }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunevaluated-expression"
+using _ = decltype(new int[f()]);
+#pragma clang diagnostic pop
+} // namespace cwg2392
+#endif

@@ -1,0 +1,311 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// UNSUPPORTED: c++03, c++11, c++14, c++17, c++20, c++23
+
+// <hive>
+
+// insert overloads, emplace, assign, from_range_t / deduction guides,
+// erase/erase_if, splice failure modes, allocator-extended construction.
+
+#include <hive>
+#include <cassert>
+#include <vector>
+#include <array>
+#include <algorithm>
+#include <iterator>
+#include <stdexcept>
+#include <string>
+
+#include "test_macros.h"
+
+template <class T, class Alloc>
+std::vector<T> sorted_contents(const std::hive<T, Alloc>& h) {
+  std::vector<T> v(h.begin(), h.end());
+  std::sort(v.begin(), v.end());
+  return v;
+}
+
+struct Point {
+  int x, y;
+  bool operator==(const Point&) const = default;
+};
+
+int main(int, char**) {
+  // emplace
+  {
+    std::hive<Point> h;
+    h.emplace(1, 2);
+    h.emplace(3, 4);
+    assert(h.size() == 2);
+    bool found12 = false, found34 = false;
+    for (auto& p : h) {
+      if (p == Point{1, 2}) found12 = true;
+      if (p == Point{3, 4}) found34 = true;
+    }
+    assert(found12 && found34);
+  }
+
+  // insert(n, value), insert(initializer_list), insert(first,last), insert_range
+  {
+    std::hive<int> h;
+    h.insert(5, 9);
+    assert(h.size() == 5);
+    for (int v : h)
+      assert(v == 9);
+
+    h.insert({1, 2, 3});
+    assert(h.size() == 8);
+
+    std::vector<int> more{10, 11};
+    h.insert(more.begin(), more.end());
+    assert(h.size() == 10);
+
+    h.insert_range(std::array<int, 2>{20, 21});
+    assert(h.size() == 12);
+  }
+
+  // assign
+  {
+    std::hive<int> h;
+    for (int i = 0; i < 5; ++i)
+      h.insert(i);
+    h.assign(3, 7);
+    assert(h.size() == 3);
+    for (int v : h)
+      assert(v == 7);
+
+    std::vector<int> src{1, 2, 3, 4};
+    h.assign(src.begin(), src.end());
+    assert(h.size() == 4);
+
+    h.assign_range(std::array<int, 2>{100, 200});
+    assert(h.size() == 2);
+  }
+
+  // from_range_t + CTAD deduction guides
+  {
+    std::array<int, 3> arr{1, 2, 3};
+    std::hive h(arr.begin(), arr.end());
+    static_assert(std::is_same_v<decltype(h), std::hive<int>>);
+    assert(h.size() == 3);
+
+    std::hive h2(std::from_range, std::array<int, 3>{4, 5, 6});
+    static_assert(std::is_same_v<decltype(h2), std::hive<int>>);
+    assert(h2.size() == 3);
+  }
+
+  // erase / erase_if free functions
+  {
+    std::hive<int> h;
+    for (int i = 0; i < 10; ++i)
+      h.insert(i);
+    auto n = std::erase_if(h, [](int v) { return v % 2 == 0; });
+    assert(n == 5 && h.size() == 5);
+
+    std::hive<int> h2{1, 2, 3, 2, 1};
+    auto n2 = std::erase(h2, 2);
+    assert(n2 == 2 && h2.size() == 3);
+  }
+
+  // splice: self-splice is erroneous-but-harmless (no effects); incompatible
+  // block_capacity_limits throws length_error.
+  {
+    std::hive<int> h;
+    h.insert(1);
+    h.splice(h);
+    assert(h.size() == 1);
+  }
+  {
+    std::hive<int> a(std::hive_limits(4, 4));
+    std::hive<int> b(std::hive_limits(64, 64));
+    b.insert(1);
+#ifndef TEST_HAS_NO_EXCEPTIONS
+    bool threw = false;
+    try {
+      a.splice(b);
+    } catch (const std::length_error&) {
+      threw = true;
+    }
+    assert(threw);
+#endif // TEST_HAS_NO_EXCEPTIONS
+  }
+
+  // splice: success path -- elements actually move, capacity accounting on
+  // both sides stays consistent (regression test for __moved_capacity,
+  // which must exclude __x's reserved-but-inactive groups), and existing
+  // pointers into the spliced-from hive stay valid (no relocation).
+  {
+    std::hive<int> a(std::hive_limits(4, 8));
+    std::hive<int> b(std::hive_limits(4, 8));
+    for (int i = 0; i < 10; ++i)
+      a.insert(i);
+    for (int i = 100; i < 115; ++i)
+      b.insert(i);
+    b.erase(b.begin()); // fragment the source group being spliced
+    auto mid_it = std::next(b.begin(), 3);
+    int* p       = std::addressof(*mid_it);
+    int p_value  = *mid_it;
+
+    a.splice(b);
+    assert(a.size() == 24);
+    assert(a.capacity() >= a.size());
+    assert(b.empty() && b.begin() == b.end());
+    assert(b.size() == 0);
+    assert(b.capacity() >= b.size());
+    assert(*p == p_value); // no relocation across the splice
+
+    std::vector<int> contents = sorted_contents(a);
+    assert(contents.size() == 24);
+    for (int i = 0; i < 10; ++i)
+      assert(std::binary_search(contents.begin(), contents.end(), i));
+    for (int i = 101; i < 115; ++i) // 100 was erased before splicing
+      assert(std::binary_search(contents.begin(), contents.end(), i));
+  }
+
+  // unique(): the erase(pos)-return-value chaining pattern (`__it =
+  // erase(__it)` against a re-evaluated end()) must hold up on a hive with
+  // pre-existing erasures -- a dense, never-erased hive won't exercise the
+  // skipfield merge case at all. All elements share one group here so the
+  // erased sentinel and the first unique()-driven erasure land adjacent in
+  // the same skipfield, reproducing the merge case the fix addressed.
+  {
+    // Layout: [1,1,9,2,2,2,3,1,1], all in one group. Erasing the sentinel
+    // (value 9, index 2) frees index 2, so unique()'s first removal (the
+    // duplicate 1 at index 1) merges with that already-free run -- the
+    // exact adjacency the erase(pos) fix addressed.
+    std::hive<int> h2(std::hive_limits(16, 16));
+    for (int v : {1, 1, 9, 2, 2, 2, 3, 1, 1})
+      h2.insert(v);
+    auto sentinel_it = std::next(h2.begin(), 2);
+    assert(*sentinel_it == 9);
+    h2.erase(sentinel_it);
+
+    auto removed = h2.unique();
+    assert(removed == 4); // 1,1 -> keep1 rm1 ; 2,2,2 -> keep1 rm2 ; 1,1 -> keep1 rm1
+    assert(h2.size() == 4);
+    std::vector<int> contents = sorted_contents(h2);
+    std::vector<int> expected{1, 1, 2, 3};
+    assert(contents == expected);
+  }
+
+  // allocator-extended copy/move constructors
+  {
+    std::hive<int> h;
+    h.insert(1);
+    h.insert(2);
+    std::allocator<int> a;
+    std::hive<int> h2(h, a);
+    assert(h2.size() == 2);
+    std::hive<int> h3(std::move(h2), a);
+    assert(h3.size() == 2);
+  }
+
+  // copy/move assignment
+  {
+    std::hive<std::string> a;
+    a.insert("x");
+    a.insert("y");
+    std::hive<std::string> b;
+    b = a;
+    assert(b.size() == 2);
+    std::hive<std::string> c;
+    c = std::move(b);
+    assert(c.size() == 2);
+  }
+
+  // clear
+  {
+    std::hive<int> h{1, 2, 3};
+    h.clear();
+    assert(h.empty() && h.size() == 0 && h.begin() == h.end());
+    h.insert(42);
+    assert(h.size() == 1 && *h.begin() == 42);
+  }
+
+  // clear() on a sparsely-filled, large-capacity group with a non-trivial
+  // element type: regression test for a bug where clear() raw-scanned
+  // skipfield_[i]==0 across the whole capacity, which misreads the
+  // untouched interior of a long never-used free run as "live" (skipfield
+  // only guarantees accuracy at a run's front/back) and destroys
+  // never-constructed objects. Only visible with a non-trivial destructor;
+  // for int the same bug is silent.
+  {
+    std::hive<std::string> h(std::hive_limits(64, 64));
+    for (int i = 0; i < 20; ++i)
+      h.insert(std::to_string(i));
+    assert(h.size() == 20);
+    h.clear();
+    assert(h.empty() && h.size() == 0 && h.begin() == h.end());
+    h.insert("hello");
+    assert(h.size() == 1 && *h.begin() == "hello");
+  }
+
+  // erase(first, last): partial range, and the full-container range
+  // (regression test -- erasing through the tail group used to crash
+  // because the loop compared against a stale `end()`).
+  {
+    std::hive<int> h(std::hive_limits(4, 4));
+    for (int i = 0; i < 12; ++i)
+      h.insert(i);
+    auto first = h.begin();
+    std::advance(first, 3);
+    auto last = first;
+    std::advance(last, 4);
+    auto result = h.erase(first, last);
+    assert(h.size() == 8);
+    assert(result == last);
+  }
+  {
+    std::hive<int> h(std::hive_limits(4, 4));
+    for (int i = 0; i < 20; ++i)
+      h.insert(i);
+    auto result = h.erase(h.begin(), h.end());
+    assert(h.empty() && h.size() == 0);
+    assert(result == h.end());
+  }
+  {
+    // Erase-to-end starting partway through, spanning multiple groups.
+    std::hive<int> h(std::hive_limits(4, 4));
+    for (int i = 0; i < 20; ++i)
+      h.insert(i);
+    auto mid = h.begin();
+    std::advance(mid, 6);
+    auto result = h.erase(mid, h.end());
+    assert(h.size() == 6);
+    assert(result == h.end());
+  }
+
+#ifndef TEST_HAS_NO_EXCEPTIONS
+  {
+    // [hive.operations]: if splice throws (the block capacity limits are incompatible), there are no effects.
+    std::hive<int> a(std::hive_limits(2, 4));
+    std::hive<int> b(std::hive_limits(10, 20));
+    for (int i = 0; i < 3; ++i)
+      a.insert(i);
+    for (int i = 0; i < 12; ++i)
+      b.insert(100 + i);
+    bool threw = false;
+    try {
+      a.splice(b);
+    } catch (const std::length_error&) {
+      threw = true;
+    }
+    assert(threw);
+    assert(a.size() == 3 && b.size() == 12);
+    int sum_a = 0, sum_b = 0;
+    for (int x : a)
+      sum_a += x;
+    for (int x : b)
+      sum_b += x;
+    assert(sum_a == 3 && sum_b == 12 * 100 + 66);
+  }
+#endif
+
+  return 0;
+}

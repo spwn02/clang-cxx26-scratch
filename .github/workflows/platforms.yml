@@ -1,0 +1,139 @@
+name: Platform availability (scratch)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS arm64 (build + examples)
+    runs-on: macos-14
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 1 }
+      - name: Tools
+        run: |
+          brew install ninja ccache || true
+          cmake --version; ninja --version; clang --version | head -1; sysctl -n hw.ncpu; df -h / | tail -1
+      - name: Configure
+        id: configure
+        continue-on-error: true
+        run: |
+          cmake -S llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/install" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_BENCHMARKS=OFF -DLIBCXX_INSTALL_MODULES=ON \
+            -DLIBCXXABI_INCLUDE_TESTS=OFF
+      - name: Build clang and lld
+        id: clang
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        run: ninja -C build clang lld 2>&1 | tail -200
+      - name: Build and install libc++
+        id: runtimes
+        if: steps.clang.outcome == 'success'
+        continue-on-error: true
+        run: ninja -C build install-clang install-clang-resource-headers install-lld install-cxx install-cxxabi install-cxx-modules 2>&1 | tail -100
+      - name: Examples
+        id: examples
+        if: steps.runtimes.outcome == 'success'
+        continue-on-error: true
+        run: |
+          P="$PWD/install"; cd scratch-examples
+          for f in hello reflect expansion contracts execution simd; do
+            echo "== $f"
+            "$P/bin/clang++" -std=c++26 -Wall -Wextra -Wpedantic -Werror -nostdlib++ -isystem "$P/include/c++/v1" \
+              -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" $f.cpp -o $f && ./$f
+          done
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### macOS arm64"
+            echo "- configure: ${{ steps.configure.outcome }}"
+            echo "- build clang+lld: ${{ steps.clang.outcome }}"
+            echo "- libc++ install: ${{ steps.runtimes.outcome }}"
+            echo "- examples: ${{ steps.examples.outcome }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: Windows x64 (build + examples)
+    runs-on: windows-2022
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 1 }
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Tools
+        run: |
+          cmake --version; ninja --version || choco install ninja -y; cl 2>&1 | head -1; nproc; df -h / | tail -1
+      - name: Configure
+        id: configure
+        continue-on-error: true
+        run: |
+          cmake -S llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/install" \
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=2
+      - name: Build clang and lld
+        id: clang
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        run: cmake --build build --target clang lld 2>&1 | tail -200
+      - name: Install compiler
+        id: install
+        if: steps.clang.outcome == 'success'
+        continue-on-error: true
+        run: cmake --build build --target install-clang install-clang-resource-headers install-lld 2>&1 | tail -50
+      - name: Build libc++ with the new compiler
+        id: runtimes
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          P="$PWD/install"
+          cmake -S runtimes -B build-rt -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$P" \
+            -DCMAKE_C_COMPILER="$P/bin/clang-cl.exe" -DCMAKE_CXX_COMPILER="$P/bin/clang-cl.exe" \
+            -DCMAKE_LINKER="$P/bin/lld-link.exe" \
+            -DLLVM_ENABLE_RUNTIMES="libcxx" -DLIBCXX_ENABLE_SHARED=OFF \
+            -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_BENCHMARKS=OFF -DLIBCXX_INSTALL_MODULES=ON \
+          && cmake --build build-rt --target install-cxx install-cxx-modules 2>&1 | tail -80
+      - name: Examples
+        id: examples
+        if: steps.runtimes.outcome == 'success'
+        continue-on-error: true
+        run: |
+          P="$PWD/install"; cd scratch-examples
+          for f in hello reflect expansion contracts execution simd; do
+            echo "== $f"
+            "$P/bin/clang-cl.exe" /std:c++latest /EHsc -fuse-ld=lld -Xclang -nostdinc++ -imsvc "$P/include/c++/v1" \
+              $f.cpp /Fe:$f.exe -link "$P/lib/c++.lib" && ./$f.exe
+          done
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Windows x64"
+            echo "- configure: ${{ steps.configure.outcome }}"
+            echo "- build clang+lld: ${{ steps.clang.outcome }}"
+            echo "- compiler install: ${{ steps.install.outcome }}"
+            echo "- libc++ build: ${{ steps.runtimes.outcome }}"
+            echo "- examples: ${{ steps.examples.outcome }}"
+          } >> "$GITHUB_STEP_SUMMARY"

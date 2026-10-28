@@ -1,0 +1,4919 @@
+// This module contains headers related to the configuration of the library. These headers
+// are free of any dependency on the rest of libc++.
+module std_config [system] {
+  @LIBCXX_CONFIG_SITE_MODULE_ENTRY@ // generated via CMake
+  textual header "__config"
+  textual header "__configuration/abi.h"
+  textual header "__configuration/availability.h"
+  textual header "__configuration/compiler.h"
+  textual header "__configuration/hardening.h"
+  textual header "__configuration/language.h"
+  textual header "__algorithm/pstl_freestanding.h"
+  textual header "__memory/pstl_freestanding.h"
+  textual header "__numeric/pstl_freestanding.h"
+  textual header "__configuration/platform.h"
+  textual header "version"
+  export *
+}
+
+module std_core [system] {
+  module cstddef {
+    module byte {
+      header "__cstddef/byte.h"
+      export *
+    }
+    module max_align_t  {
+      header "__cstddef/max_align_t.h"
+      export *
+    }
+    module nullptr_t {
+      header "__cstddef/nullptr_t.h"
+      export *
+    }
+    module ptrdiff_t {
+      header "__cstddef/ptrdiff_t.h"
+      export *
+    }
+    module size_t {
+      header "__cstddef/size_t.h"
+      export *
+    }
+  }
+
+  module cstdlib {
+    module callbacks {
+      header "__cstdlib/callbacks.h"
+      export *
+    }
+  }
+
+  module cstdint {
+    header "cstdint"
+    export *
+  }
+
+  module fwd {
+    module byte {
+      header "__fwd/byte.h"
+      export *
+    }
+    module functional {
+      header "__fwd/functional.h"
+      export *
+    }
+    module pair {
+      header "__fwd/pair.h"
+      export *
+    }
+    module tuple {
+      header "__fwd/tuple.h"
+      export *
+    }
+  }
+
+  module limits {
+    header "limits"
+    export *
+  }
+
+  module math {
+    module abs {
+      header "__math/abs.h"
+      export *
+    }
+    module div {
+      header "__math/div.h"
+      export *
+    }
+    module copysign {
+      header "__math/copysign.h"
+      export *
+    }
+    module error_functions {
+      header "__math/error_functions.h"
+      export *
+    }
+    module exponential_functions {
+      header "__math/exponential_functions.h"
+      export *
+    }
+    module fdim {
+      header "__math/fdim.h"
+      export *
+    }
+    module fma {
+      header "__math/fma.h"
+      export *
+    }
+    module gamma {
+      header "__math/gamma.h"
+      export *
+    }
+    module hyperbolic_functions {
+      header "__math/hyperbolic_functions.h"
+      export *
+    }
+    module hypot {
+      header "__math/hypot.h"
+      export *
+    }
+    module inverse_hyperbolic_functions {
+      header "__math/inverse_hyperbolic_functions.h"
+      export *
+    }
+    module inverse_trigonometric_functions {
+      header "__math/inverse_trigonometric_functions.h"
+      export *
+    }
+    module logarithms {
+      header "__math/logarithms.h"
+      export *
+    }
+    module min_max {
+      header "__math/min_max.h"
+      export *
+    }
+    module modulo {
+      header "__math/modulo.h"
+      export *
+    }
+    module remainder {
+      header "__math/remainder.h"
+      export *
+    }
+    module roots {
+      header "__math/roots.h"
+      export *
+    }
+    module rounding_functions {
+      header "__math/rounding_functions.h"
+      export *
+    }
+    module special_functions {
+      header "__math/special_functions.h"
+      export *
+    }
+    module stdfloat {
+      header "__math/stdfloat.h"
+      export *
+    }
+    module traits {
+      header "__math/traits.h"
+      export *
+    }
+    module trigonometric_functions {
+      header "__math/trigonometric_functions.h"
+      export *
+    }
+  }
+
+  module type_traits {
+    module add_cv_quals {
+      header "__type_traits/add_cv_quals.h"
+      export *
+    }
+    module add_pointer {
+      header "__type_traits/add_pointer.h"
+      export *
+    }
+    module add_reference {
+      header "__type_traits/add_reference.h"
+      export *
+    }
+    module aligned_storage {
+      header "__type_traits/aligned_storage.h"
+      export *
+    }
+    module aligned_union {
+      header "__type_traits/aligned_union.h"
+      export *
+    }
+    module alignment_of {
+      header "__type_traits/alignment_of.h"
+      export *
+    }
+    module common_reference {
+      header "__type_traits/common_reference.h"
+      export *
+    }
+    module common_type {
+      header "__type_traits/common_type.h"
+      // We need to export those because common_type inherits from either of those based on __builtin_common_type.
+      export *
+    }
+    module conditional {
+      header "__type_traits/conditional.h"
+      export *
+    }
+    module conjunction {
+      header "__type_traits/conjunction.h"
+      export *
+    }
+    module container_traits {
+      header "__type_traits/container_traits.h"
+      export *
+    }
+    module copy_cv {
+      header "__type_traits/copy_cv.h"
+      export *
+    }
+    module copy_cvref {
+      header "__type_traits/copy_cvref.h"
+      export *
+    }
+    module datasizeof {
+      header "__type_traits/datasizeof.h"
+      export *
+    }
+    module decay {
+      header "__type_traits/decay.h"
+      export *
+    }
+    module dependent_type {
+      header "__type_traits/dependent_type.h"
+      export *
+    }
+    module desugars_to {
+      header "__type_traits/desugars_to.h"
+      export *
+    }
+    module detected_or {
+      header "__type_traits/detected_or.h"
+      export *
+    }
+    module disjunction {
+      header "__type_traits/disjunction.h"
+      export *
+    }
+    module enable_if {
+      header "__type_traits/enable_if.h"
+      export *
+    }
+    module extent {
+      header "__type_traits/extent.h"
+      export *
+    }
+    module has_unique_object_representation {
+      header "__type_traits/has_unique_object_representation.h"
+      export *
+    }
+    module has_virtual_destructor {
+      header "__type_traits/has_virtual_destructor.h"
+      export *
+    }
+    module integer_traits {
+      header "__type_traits/integer_traits.h"
+      export *
+    }
+    module integral_constant {
+      header "__type_traits/integral_constant.h"
+      export *
+    }
+    module invoke {
+      header "__type_traits/invoke.h"
+      export *
+    }
+    module is_abstract {
+      header "__type_traits/is_abstract.h"
+      export *
+    }
+    module is_aggregate {
+      header "__type_traits/is_aggregate.h"
+      export *
+    }
+    module is_allocator {
+      header "__type_traits/is_allocator.h"
+      export *
+    }
+    module is_always_bitcastable {
+      header "__type_traits/is_always_bitcastable.h"
+      export *
+    }
+    module is_arithmetic {
+      header "__type_traits/is_arithmetic.h"
+      export *
+    }
+    module is_array {
+      header "__type_traits/is_array.h"
+      export *
+    }
+    module is_assignable {
+      header "__type_traits/is_assignable.h"
+      export *
+    }
+    module is_base_of {
+      header "__type_traits/is_base_of.h"
+      export *
+    }
+    module is_callable {
+      header "__type_traits/is_callable.h"
+      export *
+    }
+    module is_char_like_type {
+      header "__type_traits/is_char_like_type.h"
+      export *
+    }
+    module is_class {
+      header "__type_traits/is_class.h"
+      export *
+    }
+    module is_compound {
+      header "__type_traits/is_compound.h"
+      export *
+    }
+    module is_const {
+      header "__type_traits/is_const.h"
+      export *
+    }
+    module is_constant_evaluated {
+      header "__type_traits/is_constant_evaluated.h"
+      export *
+    }
+    module is_constructible {
+      header "__type_traits/is_constructible.h"
+      export *
+    }
+    module is_convertible {
+      header "__type_traits/is_convertible.h"
+      export *
+    }
+    module is_core_convertible {
+      header "__type_traits/is_core_convertible.h"
+      export *
+    }
+    module is_destructible {
+      header "__type_traits/is_destructible.h"
+      export *
+    }
+    module is_empty {
+      header "__type_traits/is_empty.h"
+      export *
+    }
+    module is_enum {
+      header "__type_traits/is_enum.h"
+      export *
+    }
+    module is_equality_comparable {
+      header "__type_traits/is_equality_comparable.h"
+      export *
+    }
+    module is_execution_policy {
+      header "__type_traits/is_execution_policy.h"
+      export *
+    }
+    module is_final {
+      header "__type_traits/is_final.h"
+      export *
+    }
+    module is_floating_point {
+      header "__type_traits/is_floating_point.h"
+      export *
+    }
+    module is_function {
+      header "__type_traits/is_function.h"
+      export *
+    }
+    module is_fundamental {
+      header "__type_traits/is_fundamental.h"
+      export *
+    }
+    module is_generic_transparent_comparator {
+      header "__type_traits/is_generic_transparent_comparator.h"
+      export *
+    }
+    module is_implicit_lifetime {
+      header "__type_traits/is_implicit_lifetime.h"
+      export *
+    }
+    module is_implicitly_default_constructible {
+      header "__type_traits/is_implicitly_default_constructible.h"
+      export *
+    }
+    module is_integral {
+      header "__type_traits/is_integral.h"
+      export *
+    }
+    module is_layout_compatible {
+      header "__type_traits/is_layout_compatible.h"
+      export *
+    }
+    module is_corresponding_member {
+      header "__type_traits/is_corresponding_member.h"
+      export *
+    }
+    module is_literal_type {
+      header "__type_traits/is_literal_type.h"
+      export *
+    }
+    module is_member_pointer {
+      header "__type_traits/is_member_pointer.h"
+      export *
+    }
+    module is_nothrow_assignable {
+      header "__type_traits/is_nothrow_assignable.h"
+      export *
+    }
+    module is_nothrow_constructible {
+      header "__type_traits/is_nothrow_constructible.h"
+      export *
+    }
+    module is_nothrow_destructible {
+      header "__type_traits/is_nothrow_destructible.h"
+      export *
+    }
+    module is_null_pointer {
+      header "__type_traits/is_null_pointer.h"
+      export *
+    }
+    module is_object {
+      header "__type_traits/is_object.h"
+      export *
+    }
+    module is_pod {
+      header "__type_traits/is_pod.h"
+      export *
+    }
+    module is_pointer {
+      header "__type_traits/is_pointer.h"
+      export *
+    }
+    module is_pointer_interconvertible_base_of {
+      header "__type_traits/is_pointer_interconvertible_base_of.h"
+      export *
+    }
+    module is_pointer_interconvertible_with_class {
+      header "__type_traits/is_pointer_interconvertible_with_class.h"
+      export *
+    }
+    module is_polymorphic {
+      header "__type_traits/is_polymorphic.h"
+      export *
+    }
+    module is_primary_template {
+      header "__type_traits/is_primary_template.h"
+      export *
+    }
+    module is_reference_wrapper {
+      header "__type_traits/is_reference_wrapper.h"
+      export *
+    }
+    module is_reflection {
+      header "__type_traits/is_reflection.h"
+      export *
+    }
+    module is_reference {
+      header "__type_traits/is_reference.h"
+      export *
+    }
+    module is_referenceable {
+      header "__type_traits/is_referenceable.h"
+      export *
+    }
+    module is_replaceable {
+      header "__type_traits/is_replaceable.h"
+      export *
+    }
+    module is_same {
+      header "__type_traits/is_same.h"
+      export *
+    }
+    module is_scalar {
+      header "__type_traits/is_scalar.h"
+      export *
+    }
+    module is_signed {
+      header "__type_traits/is_signed.h"
+      export *
+    }
+    module is_similar {
+      header "__type_traits/is_similar.h"
+      export *
+    }
+    module is_specialization {
+      header "__type_traits/is_specialization.h"
+      export *
+    }
+    module is_standard_layout {
+      header "__type_traits/is_standard_layout.h"
+      export *
+    }
+    module is_structural {
+      header "__type_traits/is_structural.h"
+      export *
+    }
+    module is_swappable {
+      header "__type_traits/is_swappable.h"
+      export *
+    }
+    module is_trivial {
+      header "__type_traits/is_trivial.h"
+      export *
+    }
+    module is_trivially_assignable {
+      header "__type_traits/is_trivially_assignable.h"
+      export *
+    }
+    module is_trivially_constructible {
+      header "__type_traits/is_trivially_constructible.h"
+      export *
+    }
+    module is_trivially_copyable {
+      header "__type_traits/is_trivially_copyable.h"
+      export *
+    }
+    module is_trivially_destructible {
+      header "__type_traits/is_trivially_destructible.h"
+      export *
+    }
+    module is_trivially_lexicographically_comparable {
+      header "__type_traits/is_trivially_lexicographically_comparable.h"
+      export *
+    }
+    module is_trivially_relocatable {
+      header "__type_traits/is_trivially_relocatable.h"
+      export *
+    }
+    module is_union {
+      header "__type_traits/is_union.h"
+      export *
+    }
+    module is_unqualified {
+      header "__type_traits/is_unqualified.h"
+      export *
+    }
+    module is_unsigned {
+      header "__type_traits/is_unsigned.h"
+      export *
+    }
+    module is_valid_expansion {
+      header "__type_traits/is_valid_expansion.h"
+      export *
+    }
+    module is_void {
+      header "__type_traits/is_void.h"
+      export *
+    }
+    module is_volatile {
+      header "__type_traits/is_volatile.h"
+      export *
+    }
+    module is_within_lifetime {
+      header "__type_traits/is_within_lifetime.h"
+      export *
+    }
+    module lazy {
+      header "__type_traits/lazy.h"
+      export *
+    }
+    module make_32_64_or_128_bit {
+      header "__type_traits/make_32_64_or_128_bit.h"
+      export *
+    }
+    module make_const_lvalue_ref {
+      header "__type_traits/make_const_lvalue_ref.h"
+      export *
+    }
+    module make_signed {
+      header "__type_traits/make_signed.h"
+      export *
+    }
+    module make_transparent {
+      header "__type_traits/make_transparent.h"
+      export *
+    }
+    module make_unsigned {
+      header "__type_traits/make_unsigned.h"
+      export *
+    }
+    module maybe_const {
+      header "__type_traits/maybe_const.h"
+      export *
+    }
+    module nat {
+      header "__type_traits/nat.h"
+      export *
+    }
+    module negation {
+      header "__type_traits/negation.h"
+      export *
+    }
+    module promote {
+      header "__type_traits/promote.h"
+      export *
+    }
+    module rank {
+      header "__type_traits/rank.h"
+      export *
+    }
+    module reference_constructs_from_temporary {
+      header "__type_traits/reference_constructs_from_temporary.h"
+      export *
+    }
+    module reference_converts_from_temporary {
+      header "__type_traits/reference_converts_from_temporary.h"
+      export *
+    }
+    module remove_all_extents {
+      header "__type_traits/remove_all_extents.h"
+      export *
+    }
+    module remove_const_ref {
+      header "__type_traits/remove_const_ref.h"
+      export *
+    }
+    module remove_const {
+      header "__type_traits/remove_const.h"
+      export *
+    }
+    module remove_cv {
+      header "__type_traits/remove_cv.h"
+      export *
+    }
+    module remove_cvref {
+      header "__type_traits/remove_cvref.h"
+      export *
+    }
+    module remove_extent {
+      header "__type_traits/remove_extent.h"
+      export *
+    }
+    module remove_pointer {
+      header "__type_traits/remove_pointer.h"
+      export *
+    }
+    module remove_reference {
+      header "__type_traits/remove_reference.h"
+      export *
+    }
+    module remove_volatile {
+      header "__type_traits/remove_volatile.h"
+      export *
+    }
+    module result_of {
+      header "__type_traits/result_of.h"
+      export *
+    }
+    module strip_signature {
+      header "__type_traits/strip_signature.h"
+      export *
+    }
+    module type_identity {
+      header "__type_traits/type_identity.h"
+      export *
+    }
+    module type_list {
+      header "__type_traits/type_list.h"
+      export *
+    }
+    module underlying_type {
+      header "__type_traits/underlying_type.h"
+      export *
+    }
+    module unwrap_ref {
+      header "__type_traits/unwrap_ref.h"
+      export *
+    }
+    module void_t {
+      header "__type_traits/void_t.h"
+      export *
+    }
+
+    header "type_traits"
+    export *
+  } // module type_traits
+
+  // Only the truly dependency-free parts of __utility are here
+  module utility_core {
+    module declval {
+      header "__utility/declval.h"
+      export *
+    }
+    module empty {
+      header "__utility/empty.h"
+      export *
+    }
+    module forward {
+      header "__utility/forward.h"
+      export *
+    }
+  }
+} // module std_core
+
+module std [system] {
+  module algorithm {
+    module adjacent_find {
+      header "__algorithm/adjacent_find.h"
+      export *
+    }
+    module all_of {
+      header "__algorithm/all_of.h"
+      export *
+    }
+    module any_of {
+      header "__algorithm/any_of.h"
+      export *
+    }
+    module binary_search {
+      header "__algorithm/binary_search.h"
+      export *
+    }
+    module clamp {
+      header "__algorithm/clamp.h"
+      export *
+    }
+    module comp_ref_type {
+      header "__algorithm/comp_ref_type.h"
+      export *
+    }
+    module comp {
+      header "__algorithm/comp.h"
+      export *
+    }
+    module copy_backward {
+      header "__algorithm/copy_backward.h"
+      export *
+    }
+    module copy_if {
+      header "__algorithm/copy_if.h"
+      export *
+    }
+    module copy_move_common {
+      header "__algorithm/copy_move_common.h"
+      export *
+    }
+    module copy_n                                 {
+      header "__algorithm/copy_n.h"
+      export *
+    }
+    module copy {
+      header "__algorithm/copy.h"
+      export *
+    }
+    module count_if {
+      header "__algorithm/count_if.h"
+      export *
+    }
+    module count {
+      header "__algorithm/count.h"
+      export *
+    }
+    module equal_range {
+      header "__algorithm/equal_range.h"
+      export *
+    }
+    module equal {
+      header "__algorithm/equal.h"
+      export *
+    }
+    module fill_n {
+      header "__algorithm/fill_n.h"
+      export *
+    }
+    module fill {
+      header "__algorithm/fill.h"
+      export *
+    }
+    module find_end {
+      header "__algorithm/find_end.h"
+      export *
+    }
+    module find_first_of {
+      header "__algorithm/find_first_of.h"
+      export *
+    }
+    module find_if_not {
+      header "__algorithm/find_if_not.h"
+      export *
+    }
+    module find_if {
+      header "__algorithm/find_if.h"
+      export *
+    }
+    module find_segment_if {
+      header "__algorithm/find_segment_if.h"
+      export *
+    }
+    module find {
+      header "__algorithm/find.h"
+      export *
+    }
+    module for_each_n {
+      header "__algorithm/for_each_n.h"
+      export *
+    }
+    module for_each_n_segment {
+      header "__algorithm/for_each_n_segment.h"
+      export *
+    }
+    module for_each_segment {
+      header "__algorithm/for_each_segment.h"
+      export *
+    }
+    module for_each {
+      header "__algorithm/for_each.h"
+      export *
+    }
+    module generate_n {
+      header "__algorithm/generate_n.h"
+      export *
+    }
+    module generate {
+      header "__algorithm/generate.h"
+      export *
+    }
+    module half_positive {
+      header "__algorithm/half_positive.h"
+      export *
+    }
+    module in_found_result {
+      header "__algorithm/in_found_result.h"
+      export *
+    }
+    module in_fun_result {
+      header "__algorithm/in_fun_result.h"
+      export *
+    }
+    module in_in_out_result {
+      header "__algorithm/in_in_out_result.h"
+      export *
+    }
+    module in_in_result {
+      header "__algorithm/in_in_result.h"
+      export *
+    }
+    module in_out_out_result {
+      header "__algorithm/in_out_out_result.h"
+      export *
+    }
+    module in_out_result {
+      header "__algorithm/in_out_result.h"
+      export *
+    }
+    module includes {
+      header "__algorithm/includes.h"
+      export *
+    }
+    module inplace_merge {
+      header "__algorithm/inplace_merge.h"
+      export *
+    }
+    module is_heap_until {
+      header "__algorithm/is_heap_until.h"
+      export *
+    }
+    module is_heap {
+      header "__algorithm/is_heap.h"
+      export *
+    }
+    module is_partitioned {
+      header "__algorithm/is_partitioned.h"
+      export *
+    }
+    module is_permutation {
+      header "__algorithm/is_permutation.h"
+      export *
+    }
+    module is_sorted_until {
+      header "__algorithm/is_sorted_until.h"
+      export *
+    }
+    module is_sorted {
+      header "__algorithm/is_sorted.h"
+      export *
+    }
+    module iter_swap {
+      header "__algorithm/iter_swap.h"
+      export *
+    }
+    module iterator_operations {
+      header "__algorithm/iterator_operations.h"
+      export *
+    }
+    module lexicographical_compare_three_way {
+      header "__algorithm/lexicographical_compare_three_way.h"
+      export *
+    }
+    module lexicographical_compare {
+      header "__algorithm/lexicographical_compare.h"
+      export *
+    }
+    module lower_bound {
+      header "__algorithm/lower_bound.h"
+      export *
+    }
+    module make_heap {
+      header "__algorithm/make_heap.h"
+      export *
+    }
+    module make_projected {
+      header "__algorithm/make_projected.h"
+      export *
+    }
+    module max_element {
+      header "__algorithm/max_element.h"
+      export *
+    }
+    module max {
+      header "__algorithm/max.h"
+      export *
+    }
+    module merge {
+      header "__algorithm/merge.h"
+      export *
+    }
+    module min_element {
+      header "__algorithm/min_element.h"
+      export *
+    }
+    module min_max_result {
+      header "__algorithm/min_max_result.h"
+      export *
+    }
+    module min {
+      header "__algorithm/min.h"
+      export *
+    }
+    module minmax_element {
+      header "__algorithm/minmax_element.h"
+      export *
+    }
+    module minmax {
+      header "__algorithm/minmax.h"
+      export *
+    }
+    module mismatch {
+      header "__algorithm/mismatch.h"
+      export *
+    }
+    module move_backward {
+      header "__algorithm/move_backward.h"
+      export *
+    }
+    module move {
+      header "__algorithm/move.h"
+      export *
+    }
+    module next_permutation {
+      header "__algorithm/next_permutation.h"
+      export *
+    }
+    module none_of {
+      header "__algorithm/none_of.h"
+      export *
+    }
+    module nth_element {
+      header "__algorithm/nth_element.h"
+      export *
+    }
+    module out_value_result {
+      header "__algorithm/out_value_result.h"
+      export *
+    }
+    module partial_sort_copy {
+      header "__algorithm/partial_sort_copy.h"
+      export *
+    }
+    module partial_sort {
+      header "__algorithm/partial_sort.h"
+      export *
+    }
+    module partition_copy {
+      header "__algorithm/partition_copy.h"
+      export *
+    }
+    module partition_point {
+      header "__algorithm/partition_point.h"
+      export *
+    }
+    module partition {
+      header "__algorithm/partition.h"
+      export *
+    }
+    module pop_heap {
+      header "__algorithm/pop_heap.h"
+      export *
+    }
+    module prev_permutation {
+      header "__algorithm/prev_permutation.h"
+      export *
+    }
+    module pstl {
+      header "__algorithm/pstl.h"
+      export *
+    }
+    module push_heap {
+      header "__algorithm/push_heap.h"
+      export *
+    }
+    module radix_sort {
+      header "__algorithm/radix_sort.h"
+      export *
+    }
+    module ranges_adjacent_find {
+      header "__algorithm/ranges_adjacent_find.h"
+      export *
+    }
+    module ranges_all_of {
+      header "__algorithm/ranges_all_of.h"
+      export *
+    }
+    module ranges_any_of {
+      header "__algorithm/ranges_any_of.h"
+      export *
+    }
+    module ranges_binary_search {
+      header "__algorithm/ranges_binary_search.h"
+      export *
+    }
+    module ranges_clamp {
+      header "__algorithm/ranges_clamp.h"
+      export *
+    }
+    module ranges_contains_subrange {
+      header "__algorithm/ranges_contains_subrange.h"
+      export *
+    }
+    module ranges_contains {
+      header "__algorithm/ranges_contains.h"
+      export *
+    }
+    module ranges_copy_backward {
+      header "__algorithm/ranges_copy_backward.h"
+      export *
+    }
+    module ranges_copy_if {
+      header "__algorithm/ranges_copy_if.h"
+      export *
+    }
+    module ranges_copy_n {
+      header "__algorithm/ranges_copy_n.h"
+      export *
+    }
+    module ranges_copy {
+      header "__algorithm/ranges_copy.h"
+      export *
+    }
+    module ranges_count_if {
+      header "__algorithm/ranges_count_if.h"
+      export *
+    }
+    module ranges_count {
+      header "__algorithm/ranges_count.h"
+      export *
+    }
+    module ranges_ends_with {
+      header "__algorithm/ranges_ends_with.h"
+      export *
+    }
+    module ranges_equal_range {
+      header "__algorithm/ranges_equal_range.h"
+      export *
+    }
+    module ranges_equal {
+      header "__algorithm/ranges_equal.h"
+      export *
+    }
+    module ranges_fill_n {
+      header "__algorithm/ranges_fill_n.h"
+      export *
+    }
+    module ranges_fill {
+      header "__algorithm/ranges_fill.h"
+      export *
+    }
+    module ranges_find_end {
+      header "__algorithm/ranges_find_end.h"
+      export *
+    }
+    module ranges_find_first_of {
+      header "__algorithm/ranges_find_first_of.h"
+      export *
+    }
+    module ranges_find_if_not {
+      header "__algorithm/ranges_find_if_not.h"
+      export *
+    }
+    module ranges_find_if {
+      header "__algorithm/ranges_find_if.h"
+      export *
+    }
+    module ranges_find_last {
+      header "__algorithm/ranges_find_last.h"
+      export *
+    }
+    module ranges_find {
+      header "__algorithm/ranges_find.h"
+      export *
+    }
+    module ranges_fold {
+      header "__algorithm/ranges_fold.h"
+      export *
+    }
+    module ranges_for_each_n {
+      header "__algorithm/ranges_for_each_n.h"
+      export *
+    }
+    module ranges_for_each {
+      header "__algorithm/ranges_for_each.h"
+      export *
+    }
+    module ranges_generate_n {
+      header "__algorithm/ranges_generate_n.h"
+      export *
+    }
+    module ranges_generate {
+      header "__algorithm/ranges_generate.h"
+      export *
+    }
+    module ranges_includes {
+      header "__algorithm/ranges_includes.h"
+      export *
+    }
+    module ranges_inplace_merge {
+      header "__algorithm/ranges_inplace_merge.h"
+      export *
+    }
+    module ranges_is_heap_until {
+      header "__algorithm/ranges_is_heap_until.h"
+      export *
+    }
+    module ranges_is_heap {
+      header "__algorithm/ranges_is_heap.h"
+      export *
+    }
+    module ranges_is_partitioned {
+      header "__algorithm/ranges_is_partitioned.h"
+      export *
+    }
+    module ranges_is_permutation {
+      header "__algorithm/ranges_is_permutation.h"
+      export *
+    }
+    module ranges_is_sorted_until {
+      header "__algorithm/ranges_is_sorted_until.h"
+      export *
+    }
+    module ranges_is_sorted {
+      header "__algorithm/ranges_is_sorted.h"
+      export *
+    }
+    module ranges_iterator_concept {
+      header "__algorithm/ranges_iterator_concept.h"
+      export *
+    }
+    module ranges_lexicographical_compare {
+      header "__algorithm/ranges_lexicographical_compare.h"
+      export *
+    }
+    module ranges_lower_bound {
+      header "__algorithm/ranges_lower_bound.h"
+      export *
+    }
+    module ranges_make_heap {
+      header "__algorithm/ranges_make_heap.h"
+      export *
+    }
+    module ranges_max_element {
+      header "__algorithm/ranges_max_element.h"
+      export *
+    }
+    module ranges_max {
+      header "__algorithm/ranges_max.h"
+      export *
+    }
+    module ranges_merge {
+      header "__algorithm/ranges_merge.h"
+      export *
+    }
+    module ranges_min_element {
+      header "__algorithm/ranges_min_element.h"
+      export *
+    }
+    module ranges_min {
+      header "__algorithm/ranges_min.h"
+      export *
+    }
+    module ranges_minmax_element {
+      header "__algorithm/ranges_minmax_element.h"
+      export *
+    }
+    module ranges_minmax {
+      header "__algorithm/ranges_minmax.h"
+      export *
+    }
+    module ranges_mismatch {
+      header "__algorithm/ranges_mismatch.h"
+      export *
+    }
+    module ranges_move_backward {
+      header "__algorithm/ranges_move_backward.h"
+      export *
+    }
+    module ranges_move {
+      header "__algorithm/ranges_move.h"
+      export *
+    }
+    module ranges_next_permutation {
+      header "__algorithm/ranges_next_permutation.h"
+      export *
+    }
+    module ranges_none_of {
+      header "__algorithm/ranges_none_of.h"
+      export *
+    }
+    module ranges_nth_element {
+      header "__algorithm/ranges_nth_element.h"
+      export *
+    }
+    module ranges_partial_sort_copy {
+      header "__algorithm/ranges_partial_sort_copy.h"
+      export *
+    }
+    module ranges_partial_sort {
+      header "__algorithm/ranges_partial_sort.h"
+      export *
+    }
+    module ranges_partition_copy {
+      header "__algorithm/ranges_partition_copy.h"
+      export *
+    }
+    module ranges_partition_point {
+      header "__algorithm/ranges_partition_point.h"
+      export *
+    }
+    module ranges_partition {
+      header "__algorithm/ranges_partition.h"
+      export *
+    }
+    module ranges_pop_heap {
+      header "__algorithm/ranges_pop_heap.h"
+      export *
+    }
+    module ranges_prev_permutation {
+      header "__algorithm/ranges_prev_permutation.h"
+      export *
+    }
+    module ranges_push_heap {
+      header "__algorithm/ranges_push_heap.h"
+      export *
+    }
+    module ranges_remove_copy_if {
+      header "__algorithm/ranges_remove_copy_if.h"
+      export *
+    }
+    module ranges_remove_copy {
+      header "__algorithm/ranges_remove_copy.h"
+      export *
+    }
+    module ranges_remove_if {
+      header "__algorithm/ranges_remove_if.h"
+      export *
+    }
+    module ranges_remove {
+      header "__algorithm/ranges_remove.h"
+      export *
+    }
+    module ranges_replace_copy_if {
+      header "__algorithm/ranges_replace_copy_if.h"
+      export *
+    }
+    module ranges_replace_copy {
+      header "__algorithm/ranges_replace_copy.h"
+      export *
+    }
+    module ranges_replace_if {
+      header "__algorithm/ranges_replace_if.h"
+      export *
+    }
+    module ranges_replace {
+      header "__algorithm/ranges_replace.h"
+      export *
+    }
+    module ranges_reverse_copy {
+      header "__algorithm/ranges_reverse_copy.h"
+      export *
+    }
+    module ranges_reverse {
+      header "__algorithm/ranges_reverse.h"
+      export *
+    }
+    module ranges_rotate_copy {
+      header "__algorithm/ranges_rotate_copy.h"
+      export *
+    }
+    module ranges_rotate {
+      header "__algorithm/ranges_rotate.h"
+      export *
+    }
+    module ranges_sample {
+      header "__algorithm/ranges_sample.h"
+      export *
+    }
+    module ranges_search_n {
+      header "__algorithm/ranges_search_n.h"
+      export *
+    }
+    module ranges_search {
+      header "__algorithm/ranges_search.h"
+      export *
+    }
+    module ranges_set_difference {
+      header "__algorithm/ranges_set_difference.h"
+      export *
+    }
+    module ranges_set_intersection {
+      header "__algorithm/ranges_set_intersection.h"
+      export *
+    }
+    module ranges_set_symmetric_difference {
+      header "__algorithm/ranges_set_symmetric_difference.h"
+      export *
+    }
+    module ranges_set_union {
+      header "__algorithm/ranges_set_union.h"
+      export *
+    }
+    module ranges_shift_left {
+      header "__algorithm/ranges_shift_left.h"
+      export *
+    }
+    module ranges_shift_right {
+      header "__algorithm/ranges_shift_right.h"
+      export *
+    }
+    module ranges_shuffle {
+      header "__algorithm/ranges_shuffle.h"
+      export *
+    }
+    module ranges_sort_heap {
+      header "__algorithm/ranges_sort_heap.h"
+      export *
+    }
+    module ranges_sort {
+      header "__algorithm/ranges_sort.h"
+      export *
+    }
+    module ranges_stable_partition {
+      header "__algorithm/ranges_stable_partition.h"
+      export *
+    }
+    module ranges_stable_sort {
+      header "__algorithm/ranges_stable_sort.h"
+      export *
+    }
+    module ranges_starts_with {
+      header "__algorithm/ranges_starts_with.h"
+      export *
+    }
+    module ranges_swap_ranges {
+      header "__algorithm/ranges_swap_ranges.h"
+      export *
+    }
+    module ranges_transform {
+      header "__algorithm/ranges_transform.h"
+      export *
+    }
+    module ranges_unique_copy {
+      header "__algorithm/ranges_unique_copy.h"
+      export *
+    }
+    module ranges_unique {
+      header "__algorithm/ranges_unique.h"
+      export *
+    }
+    module ranges_upper_bound {
+      header "__algorithm/ranges_upper_bound.h"
+      export *
+    }
+    module remove_copy_if {
+      header "__algorithm/remove_copy_if.h"
+      export *
+    }
+    module remove_copy {
+      header "__algorithm/remove_copy.h"
+      export *
+    }
+    module remove_if {
+      header "__algorithm/remove_if.h"
+      export *
+    }
+    module remove {
+      header "__algorithm/remove.h"
+      export *
+    }
+    module replace_copy_if {
+      header "__algorithm/replace_copy_if.h"
+      export *
+    }
+    module replace_copy {
+      header "__algorithm/replace_copy.h"
+      export *
+    }
+    module replace_if {
+      header "__algorithm/replace_if.h"
+      export *
+    }
+    module replace {
+      header "__algorithm/replace.h"
+      export *
+    }
+    module reverse_copy {
+      header "__algorithm/reverse_copy.h"
+      export *
+    }
+    module reverse {
+      header "__algorithm/reverse.h"
+      export *
+    }
+    module rotate_copy {
+      header "__algorithm/rotate_copy.h"
+      export *
+    }
+    module rotate {
+      header "__algorithm/rotate.h"
+      export *
+    }
+    module sample {
+      header "__algorithm/sample.h"
+      export *
+    }
+    module search_n {
+      header "__algorithm/search_n.h"
+      export *
+    }
+    module search {
+      header "__algorithm/search.h"
+      export *
+    }
+    module set_difference {
+      header "__algorithm/set_difference.h"
+      export *
+    }
+    module set_intersection {
+      header "__algorithm/set_intersection.h"
+      export *
+    }
+    module set_symmetric_difference {
+      header "__algorithm/set_symmetric_difference.h"
+      export *
+    }
+    module set_union {
+      header "__algorithm/set_union.h"
+      export *
+    }
+    module shift_left {
+      header "__algorithm/shift_left.h"
+      export *
+    }
+    module shift_right {
+      header "__algorithm/shift_right.h"
+      export *
+    }
+    module shuffle {
+      header "__algorithm/shuffle.h"
+      export *
+    }
+    module sift_down {
+      header "__algorithm/sift_down.h"
+      export *
+    }
+    module simd_utils {
+      header "__algorithm/simd_utils.h"
+      export *
+    }
+    module sort_heap {
+      header "__algorithm/sort_heap.h"
+      export *
+    }
+    module sort {
+      header "__algorithm/sort.h"
+      export *
+    }
+    module specialized_algorithms {
+      header "__algorithm/specialized_algorithms.h"
+      export *
+    }
+    module stable_partition {
+      header "__algorithm/stable_partition.h"
+      export *
+    }
+    module stable_sort {
+      header "__algorithm/stable_sort.h"
+      export *
+    }
+    module swap_ranges {
+      header "__algorithm/swap_ranges.h"
+      export *
+    }
+    module three_way_comp_ref_type {
+      header "__algorithm/three_way_comp_ref_type.h"
+      export *
+    }
+    module transform {
+      header "__algorithm/transform.h"
+      export *
+    }
+    module uniform_random_bit_generator_adaptor {
+      header "__algorithm/uniform_random_bit_generator_adaptor.h"
+      export *
+    }
+    module unique_copy {
+      header "__algorithm/unique_copy.h"
+      export *
+    }
+    module unique {
+      header "__algorithm/unique.h"
+      export *
+    }
+    module unwrap_iter {
+      header "__algorithm/unwrap_iter.h"
+      export *
+    }
+    module unwrap_range {
+      header "__algorithm/unwrap_range.h"
+      export *
+    }
+    module upper_bound {
+      header "__algorithm/upper_bound.h"
+      export *
+    }
+
+    header "algorithm"
+    export *
+  } // module algorithm
+
+  module any {
+    header "any"
+    export *
+  }
+
+  module array {
+    module fwd {
+      header "__fwd/array.h"
+      export *
+    }
+
+    header "array"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module atomic {
+    module aliases {
+      header "__atomic/aliases.h"
+      export *
+    }
+    module atomic_flag {
+      header "__atomic/atomic_flag.h"
+      export *
+    }
+    module atomic_init {
+      header "__atomic/atomic_init.h"
+      export *
+    }
+    module atomic_lock_free {
+      header "__atomic/atomic_lock_free.h"
+      export *
+    }
+    module atomic_ref {
+      header "__atomic/atomic_ref.h"
+      export *
+    }
+    module atomic_sync {
+      header "__atomic/atomic_sync.h"
+      export *
+    }
+    module atomic_sync_timed {
+      header "__atomic/atomic_sync_timed.h"
+      export *
+    }
+    module atomic_waitable_traits {
+      header "__atomic/atomic_waitable_traits.h"
+      export *
+    }
+    module atomic {
+      header "__atomic/atomic.h"
+      export *
+    }
+    module check_memory_order {
+      header "__atomic/check_memory_order.h"
+      export *
+    }
+    module contention_t {
+      header "__atomic/contention_t.h"
+      export *
+    }
+    module fence {
+      header "__atomic/fence.h"
+      export *
+    }
+    module floating_point_helper {
+      header "__atomic/floating_point_helper.h"
+      export *
+    }
+    module is_always_lock_free {
+      header "__atomic/is_always_lock_free.h"
+      export *
+    }
+    module kill_dependency {
+      header "__atomic/kill_dependency.h"
+      export *
+    }
+    module memory_order {
+      header "__atomic/memory_order.h"
+      export *
+    }
+    module to_gcc_order {
+      header "__atomic/to_gcc_order.h"
+      export *
+    }
+
+    module support {
+      header "__atomic/support.h"
+      textual header "__atomic/support/c11.h"
+      textual header "__atomic/support/gcc.h"
+      export *
+    }
+
+    header "atomic"
+    export *
+  }
+
+  module barrier {
+    header "barrier"
+    export *
+  }
+
+  module bit {
+    module bit_cast {
+      header "__bit/bit_cast.h"
+      export *
+    }
+    module bit_ceil {
+      header "__bit/bit_ceil.h"
+      export *
+    }
+    module bit_floor {
+      header "__bit/bit_floor.h"
+      export *
+    }
+    module bit_log2 {
+      header "__bit/bit_log2.h"
+      export *
+    }
+    module bit_width {
+      header "__bit/bit_width.h"
+      export *
+    }
+    module blsr {
+      header "__bit/blsr.h"
+      export *
+    }
+    module byteswap {
+      header "__bit/byteswap.h"
+      export *
+    }
+    module countl {
+      header "__bit/countl.h"
+      export *
+    }
+    module countr {
+      header "__bit/countr.h"
+      export *
+    }
+    module endian {
+      header "__bit/endian.h"
+      export *
+    }
+    module has_single_bit {
+      header "__bit/has_single_bit.h"
+      export *
+    }
+    module invert_if {
+      header "__bit/invert_if.h"
+      export *
+    }
+    module popcount {
+      header "__bit/popcount.h"
+      export *
+    }
+    module rotate {
+      header "__bit/rotate.h"
+      export *
+    }
+
+    header "bit"
+    export *
+  }
+
+  module bitset {
+    header "bitset"
+    export *
+  }
+
+  module charconv {
+    module chars_format {
+      header "__charconv/chars_format.h"
+      export *
+    }
+    module float128 {
+      header "__charconv/float128.h"
+      export *
+    }
+    module from_chars_floating_point {
+      header "__charconv/from_chars_floating_point.h"
+      export *
+    }
+    module from_chars_integral {
+      header "__charconv/from_chars_integral.h"
+      export *
+    }
+    module from_chars_result          {
+      header "__charconv/from_chars_result.h"
+      export *
+    }
+    module tables {
+      header "__charconv/tables.h"
+      export *
+    }
+    module to_chars {
+      header "__charconv/to_chars.h"
+      export *
+    }
+    module to_chars_base_10 {
+      header "__charconv/to_chars_base_10.h"
+      export *
+    }
+    module to_chars_floating_point {
+      header "__charconv/to_chars_floating_point.h"
+      export *
+    }
+    module to_chars_integral          {
+      header "__charconv/to_chars_integral.h"
+      export *
+    }
+    module to_chars_result {
+      header "__charconv/to_chars_result.h"
+      export *
+    }
+    module traits {
+      header "__charconv/traits.h"
+      export *
+    }
+
+    header "charconv"
+    export *
+  }
+
+  module chrono {
+    module calendar {
+      header "__chrono/calendar.h"
+      export *
+    }
+    module concepts {
+      header "__chrono/concepts.h"
+      export *
+    }
+    module convert_to_timespec {
+      header "__chrono/convert_to_timespec.h"
+      export *
+    }
+    module convert_to_tm {
+      header "__chrono/convert_to_tm.h"
+      export *
+    }
+    module day {
+      header "__chrono/day.h"
+      export *
+    }
+    module duration {
+      header "__chrono/duration.h"
+      export *
+    }
+    module exception {
+      header "__chrono/exception.h"
+      export *
+    }
+    module file_clock {
+      header "__chrono/file_clock.h"
+      export *
+    }
+    module formatter {
+      header "__chrono/formatter.h"
+      export *
+    }
+    module from_stream {
+      header "__chrono/from_stream.h"
+      export *
+    }
+    module gps_clock {
+      header "__chrono/gps_clock.h"
+      export *
+    }
+    module hh_mm_ss {
+      header "__chrono/hh_mm_ss.h"
+      export *
+    }
+    module high_resolution_clock {
+      header "__chrono/high_resolution_clock.h"
+      export *
+    }
+    module is_clock {
+      header "__chrono/is_clock.h"
+      export *
+    }
+    module leap_second {
+      header "__chrono/leap_second.h"
+      export *
+    }
+    module literals {
+      header "__chrono/literals.h"
+      export *
+    }
+    module local_info {
+      header "__chrono/local_info.h"
+      export *
+    }
+    module local_time_format {
+      header "__chrono/local_time_format.h"
+      export *
+    }
+    module month_weekday {
+      header "__chrono/month_weekday.h"
+      export *
+    }
+    module month {
+      header "__chrono/month.h"
+      export *
+    }
+    module monthday {
+      header "__chrono/monthday.h"
+      export *
+    }
+    module ostream {
+      header "__chrono/ostream.h"
+      export *
+    }
+    module parser_std_format_spec {
+      header "__chrono/parser_std_format_spec.h"
+      export *
+    }
+    module statically_widen {
+      header "__chrono/statically_widen.h"
+      export *
+    }
+    module steady_clock {
+      header "__chrono/steady_clock.h"
+      export *
+    }
+    module sys_info {
+      header "__chrono/sys_info.h"
+      export *
+    }
+    module system_clock {
+      header "__chrono/system_clock.h"
+      export *
+    }
+    module tai_clock {
+      header "__chrono/tai_clock.h"
+      export *
+    }
+    module time_point {
+      header "__chrono/time_point.h"
+      export *
+    }
+    module time_zone_link {
+      header "__chrono/time_zone_link.h"
+      export *
+    }
+    module time_zone {
+      header "__chrono/time_zone.h"
+      export *
+    }
+    module tzdb_list {
+      header "__chrono/tzdb_list.h"
+      export *
+    }
+    module tzdb {
+      header "__chrono/tzdb.h"
+      export *
+    }
+    module utc_clock {
+      header "__chrono/utc_clock.h"
+      export *
+    }
+    module weekday {
+      header "__chrono/weekday.h"
+      export *
+    }
+    module year_month_day {
+      header "__chrono/year_month_day.h"
+      export *
+    }
+    module year_month_weekday {
+      header "__chrono/year_month_weekday.h"
+      export *
+    }
+    module year_month {
+      header "__chrono/year_month.h"
+      export *
+    }
+    module year {
+      header "__chrono/year.h"
+      export *
+    }
+    module zoned_time {
+      header "__chrono/zoned_time.h"
+      export *
+    }
+
+    header "chrono"
+    export *
+  } // module chrono
+
+  module codecvt {
+    header "codecvt"
+    export *
+  }
+
+  module compare {
+    module common_comparison_category {
+      header "__compare/common_comparison_category.h"
+      export *
+    }
+    module compare_partial_order_fallback {
+      header "__compare/compare_partial_order_fallback.h"
+      export *
+    }
+    module compare_strong_order_fallback {
+      header "__compare/compare_strong_order_fallback.h"
+      export *
+    }
+    module compare_three_way {
+      header "__compare/compare_three_way.h"
+      export *
+    }
+    module compare_three_way_result {
+      header "__compare/compare_three_way_result.h"
+      export *
+    }
+    module compare_weak_order_fallback {
+      header "__compare/compare_weak_order_fallback.h"
+      export *
+    }
+    module is_eq {
+      header "__compare/is_eq.h"
+      export *
+    }
+    module ordering {
+      header "__compare/ordering.h"
+      export *
+    }
+    module partial_order {
+      header "__compare/partial_order.h"
+      export *
+    }
+    module strong_order {
+      header "__compare/strong_order.h"
+      export *
+    }
+    module synth_three_way {
+      header "__compare/synth_three_way.h"
+      export *
+    }
+    module three_way_comparable {
+      header "__compare/three_way_comparable.h"
+      export *
+    }
+    module type_order {
+      header "__compare/type_order.h"
+      export *
+    }
+    module weak_order {
+      header "__compare/weak_order.h"
+      export *
+    }
+
+    header "compare"
+    export *
+  }
+
+  module complex {
+    module fwd {
+      header "__fwd/complex.h"
+      export *
+    }
+
+    header "complex"
+    export *
+  }
+
+  module concepts {
+    module arithmetic {
+      header "__concepts/arithmetic.h"
+      export *
+    }
+    module assignable {
+      header "__concepts/assignable.h"
+      export *
+    }
+    module boolean_testable {
+      header "__concepts/boolean_testable.h"
+      export *
+    }
+    module class_or_enum {
+      header "__concepts/class_or_enum.h"
+      export *
+    }
+    module common_reference_with {
+      header "__concepts/common_reference_with.h"
+      export *
+    }
+    module common_with {
+      header "__concepts/common_with.h"
+      export *
+    }
+    module comparison_common_type {
+      header "__concepts/comparison_common_type.h"
+      export *
+    }
+    module constructible {
+      header "__concepts/constructible.h"
+      export *
+    }
+    module convertible_to {
+      header "__concepts/convertible_to.h"
+      export *
+    }
+    module copyable {
+      header "__concepts/copyable.h"
+      export *
+    }
+    module derived_from {
+      header "__concepts/derived_from.h"
+      export *
+    }
+    module destructible {
+      header "__concepts/destructible.h"
+      export *
+    }
+    module different_from {
+      header "__concepts/different_from.h"
+      export *
+    }
+    module equality_comparable {
+      header "__concepts/equality_comparable.h"
+      export *
+    }
+    module invocable {
+      header "__concepts/invocable.h"
+      export *
+    }
+    module movable {
+      header "__concepts/movable.h"
+      export *
+    }
+    module predicate {
+      header "__concepts/predicate.h"
+      export *
+    }
+    module regular {
+      header "__concepts/regular.h"
+      export *
+    }
+    module relation {
+      header "__concepts/relation.h"
+      export *
+    }
+    module same_as {
+      header "__concepts/same_as.h"
+      export *
+    }
+    module semiregular {
+      header "__concepts/semiregular.h"
+      export *
+    }
+    module swappable {
+      header "__concepts/swappable.h"
+      export *
+    }
+    module totally_ordered {
+      header "__concepts/totally_ordered.h"
+      export *
+    }
+
+    header "concepts"
+    export *
+  }
+
+  module condition_variable {
+    module condition_variable {
+      header "__condition_variable/condition_variable.h"
+      export *
+    }
+
+    header "condition_variable"
+    export *
+  }
+
+  module cassert {
+    textual header "cassert" // NDEBUG requires textual inclusion
+    export *
+  }
+
+  module ccomplex {
+    requires !cplusplus20
+    header "ccomplex"
+    export *
+  }
+
+  module cctype {
+    header "cctype"
+    export *
+  }
+
+  module cerrno {
+    header "cerrno"
+    export *
+  }
+
+  module cfenv {
+    header "cfenv"
+    export *
+  }
+
+  module cfloat {
+    header "cfloat"
+    export *
+  }
+
+  module cinttypes {
+    header "cinttypes"
+    export *
+  }
+
+  module ciso646 {
+    requires !cplusplus20
+    header "ciso646"
+    export *
+  }
+
+  module climits {
+    header "climits"
+    export *
+  }
+
+  module clocale {
+    header "clocale"
+    export *
+  }
+
+  module cmath {
+    header "cmath"
+    export *
+  }
+
+  // TODO: Make non-textual. This seems to cause problems when compiling against Glibc.
+  module csetjmp {
+    textual header "csetjmp"
+    export *
+  }
+
+  module csignal {
+    header "csignal"
+    export *
+  }
+
+  module cstdalign {
+    requires !cplusplus20
+    header "cstdalign"
+    export *
+  }
+
+  module cstdarg {
+    header "cstdarg"
+    export *
+  }
+
+  module cstdbool {
+    requires !cplusplus20
+    header "cstdbool"
+    export *
+  }
+
+  module cstddef {
+    header "cstddef"
+    export *
+  }
+
+  module cstdio {
+    header "cstdio"
+    export *
+  }
+
+  module cstdlib {
+    header "cstdlib"
+    export *
+  }
+
+  module cstring {
+    header "cstring"
+    export *
+  }
+
+  module ctgmath {
+    requires !cplusplus20
+    header "ctgmath"
+    export *
+  }
+
+  module ctime {
+    header "ctime"
+    export *
+  }
+
+  module cuchar {
+    header "cuchar"
+    export *
+  }
+
+  module cwchar {
+    header "cwchar"
+    export *
+  }
+
+  module cwctype {
+    header "cwctype"
+    export *
+  }
+
+  module contracts {
+    header "contracts"
+    export *
+  }
+
+  module deque {
+    module fwd {
+      header "__fwd/deque.h"
+      export *
+    }
+
+    header "deque"
+    export *
+    export std.iterator.reverse_iterator
+    export std.algorithm.simd_utils // This is a workaround for https://llvm.org/PR120108.
+  }
+
+  module debugging {
+    module is_debugger_present {
+      header "__debugging/is_debugger_present.h"
+      export *
+    }
+
+    header "debugging"
+    export *
+  }
+
+  module exception {
+    module exception {
+      header "__exception/exception.h"
+      export *
+    }
+    module exception_ptr {
+      header "__exception/exception_ptr.h"
+      export *
+    }
+    module nested_exception {
+      header "__exception/nested_exception.h"
+      export *
+    }
+    module operations {
+      header "__exception/operations.h"
+      export *
+    }
+    module terminate {
+      header "__exception/terminate.h"
+      export *
+    }
+
+    header "exception"
+    export *
+  }
+
+  module execution {
+    // [exec], std::execution (P2300R10) submodules. Each header pulls in
+    // symbols from several tightly-coupled siblings (e.g. completion_functions'
+    // set_value_t/set_error_t are used throughout), so — matching this file's
+    // existing `allocator`/`unique_temporary_buffer`/`high_resolution_clock`
+    // precedent for the same shape of problem — every submodule here
+    // re-exports everything it imports rather than hand-enumerating each
+    // cross-header symbol, since the latter was verified (see this file's own
+    // history) to under-export and produce "declaration must be imported"
+    // errors under a real `-fmodules` build.
+    module affine                         { header "__execution/affine.h" export * }
+    module as_awaitable                   { header "__execution/as_awaitable.h" export * }
+    module async_scope                    { header "__execution/async_scope.h" export * }
+    module awaitable                      { header "__execution/awaitable.h" export * }
+    module bulk                           { header "__execution/bulk.h" export * }
+    module completion_attrs               { header "__execution/completion_attrs.h" export * }
+    module completion_functions           { header "__execution/completion_functions.h" export * }
+    module completion_signatures          { header "__execution/completion_signatures.h" export * }
+    module connect                        { header "__execution/connect.h" export * }
+    module continues_on                   { header "__execution/continues_on.h" export * }
+    module domain                         { header "__execution/domain.h" export * }
+    module env                            { header "__execution/env.h" export * }
+    module forwarding_query               { header "__execution/forwarding_query.h" export * }
+    module fwd_env                        { header "__execution/fwd_env.h" export * }
+    module get_allocator                  { header "__execution/get_allocator.h" export * }
+    module get_await_completion_adaptor   { header "__execution/get_await_completion_adaptor.h" export * }
+    module get_completion_signatures      { header "__execution/get_completion_signatures.h" export * }
+    module get_env                        { header "__execution/get_env.h" export * }
+    module get_forward_progress_guarantee { header "__execution/get_forward_progress_guarantee.h" export * }
+    module get_scheduler                  { header "__execution/get_scheduler.h" export * }
+    module get_stop_token                 { header "__execution/get_stop_token.h" export * }
+    module infallible_scheduler           { header "__execution/infallible_scheduler.h" export * }
+    module inline_scheduler               { header "__execution/inline_scheduler.h" export * }
+    module into_variant                   { header "__execution/into_variant.h" export * }
+    module just                           { header "__execution/just.h" export * }
+    module let                            { header "__execution/let.h" export * }
+    module movable_value                  { header "__execution/movable_value.h" export * }
+    module on                             { header "__execution/on.h" export * }
+    module operation_state                { header "__execution/operation_state.h" export * }
+    module parallel_scheduler             { header "__execution/parallel_scheduler.h" export * }
+    module policies                       { header "__execution/policies.h" export * }
+    module queryable                      { header "__execution/queryable.h" export * }
+    module read_env                       { header "__execution/read_env.h" export * }
+    module receiver                       { header "__execution/receiver.h" export * }
+    module run_loop                       { header "__execution/run_loop.h" export * }
+    module schedule                       { header "__execution/schedule.h" export * }
+    module schedule_from                  { header "__execution/schedule_from.h" export * }
+    module scheduler                      { header "__execution/scheduler.h" export * }
+    module sender                         { header "__execution/sender.h" export * }
+    module sender_adaptor_closure         { header "__execution/sender_adaptor_closure.h" export * }
+    module starts_on                      { header "__execution/starts_on.h" export * }
+    module stop_when                      { header "__execution/stop_when.h" export * }
+    module stopped_as_error               { header "__execution/stopped_as_error.h" export * }
+    module stopped_as_optional            { header "__execution/stopped_as_optional.h" export * }
+    module sync_wait                      { header "__execution/sync_wait.h" export * }
+    module system_context_replaceability  { header "__execution/system_context_replaceability.h" export * }
+    module task                           { header "__execution/task.h" export * }
+    module task_scheduler                 { header "__execution/task_scheduler.h" export * }
+    module then                           { header "__execution/then.h" export * }
+    module unstoppable                    { header "__execution/unstoppable.h" export * }
+    module when_all                       { header "__execution/when_all.h" export * }
+    module with_awaitable_senders         { header "__execution/with_awaitable_senders.h" export * }
+    module write_env                      { header "__execution/write_env.h" export * }
+
+    header "execution"
+    export *
+  }
+
+  module expected {
+    module bad_expected_access {
+      header "__expected/bad_expected_access.h"
+      export *
+    }
+    module expected {
+      header "__expected/expected.h"
+      export *
+    }
+    module unexpect {
+      header "__expected/unexpect.h"
+      export *
+    }
+    module unexpected {
+      header "__expected/unexpected.h"
+      export *
+    }
+
+    header "expected"
+    export *
+  }
+
+  module filesystem {
+    module copy_options {
+      header "__filesystem/copy_options.h"
+      export *
+    }
+    module directory_entry {
+      header "__filesystem/directory_entry.h"
+      export *
+    }
+    module directory_iterator             {
+      header "__filesystem/directory_iterator.h"
+      // This is a workaround for https://llvm.org/PR120108.
+      export *
+    }
+    module directory_options {
+      header "__filesystem/directory_options.h"
+      export *
+    }
+    module file_status {
+      header "__filesystem/file_status.h"
+      export *
+    }
+    module file_time_type {
+      header "__filesystem/file_time_type.h"
+      export *
+    }
+    module file_type {
+      header "__filesystem/file_type.h"
+      export *
+    }
+    module filesystem_error {
+      header "__filesystem/filesystem_error.h"
+      export *
+    }
+    module operations {
+      header "__filesystem/operations.h"
+      export *
+    }
+    module path_iterator {
+      header "__filesystem/path_iterator.h"
+      export *
+    }
+    module path                           {
+      header "__filesystem/path.h"
+      export *
+    }
+    module path_format {
+      header "__filesystem/path_format.h"
+      export *
+    }
+    module perm_options {
+      header "__filesystem/perm_options.h"
+      export *
+    }
+    module perms {
+      header "__filesystem/perms.h"
+      export *
+    }
+    module recursive_directory_iterator {
+      header "__filesystem/recursive_directory_iterator.h"
+      export *
+    }
+    module space_info {
+      header "__filesystem/space_info.h"
+      export *
+    }
+    module u8path {
+      header "__filesystem/u8path.h"
+      export *
+    }
+
+    header "filesystem"
+    export *
+  }
+
+  module flat_map {
+    module flat_map                       {
+      header "__flat_map/flat_map.h"
+      export *
+    }
+    module flat_multimap                  {
+      header "__flat_map/flat_multimap.h"
+      export *
+    }
+    module key_value_iterator {
+      header "__flat_map/key_value_iterator.h"
+      export *
+    }
+    module sorted_equivalent {
+      header "__flat_map/sorted_equivalent.h"
+      export *
+    }
+    module sorted_unique {
+      header "__flat_map/sorted_unique.h"
+      export *
+    }
+    module utils {
+      header "__flat_map/utils.h"
+      export *
+    }
+
+    header "flat_map"
+    export *
+    export std.algorithm.ranges_sort
+    export std.iterator.reverse_iterator
+    export std.ranges.zip_view
+    export std.tuple
+  }
+
+  module flat_set {
+    module flat_set                       {
+      header "__flat_set/flat_set.h"
+      header "__flat_set/flat_multiset.h"
+      export *
+    }
+    module ra_iterator {
+      header "__flat_set/ra_iterator.h"
+      export *
+    }
+    module utils {
+      header "__flat_set/utils.h"
+      export *
+    }
+
+    header "flat_set"
+    export std.flat_map.sorted_unique
+    export std.flat_map.sorted_equivalent
+    export *
+    export std.algorithm.ranges_sort
+    export std.iterator.reverse_iterator
+    export std.ranges.zip_view
+    export std.tuple
+  }
+
+  module format {
+    module buffer                             {
+      header "__format/buffer.h"
+      export *
+    }
+    module concepts {
+      header "__format/concepts.h"
+      export *
+    }
+    module container_adaptor {
+      header "__format/container_adaptor.h"
+      export *
+    }
+    module enable_insertable {
+      header "__format/enable_insertable.h"
+      export *
+    }
+    module escaped_output_table {
+      header "__format/escaped_output_table.h"
+      export *
+    }
+    module extended_grapheme_cluster_table {
+      header "__format/extended_grapheme_cluster_table.h"
+      export *
+    }
+    module fmt_pair_like {
+      header "__format/fmt_pair_like.h"
+      export *
+    }
+    module format_arg {
+      header "__format/format_arg.h"
+      export *
+    }
+    module format_arg_store                   {
+      header "__format/format_arg_store.h"
+      export *
+    }
+    module format_args {
+      header "__format/format_args.h"
+      export *
+    }
+    module format_context {
+      header "__format/format_context.h"
+      export *
+    }
+    module format_error {
+      header "__format/format_error.h"
+      export *
+    }
+    module format_functions {
+      header "__format/format_functions.h"
+      export *
+    }
+    module format_parse_context {
+      header "__format/format_parse_context.h"
+      export *
+    }
+    module format_string {
+      header "__format/format_string.h"
+      export *
+    }
+    module format_to_n_result {
+      header "__format/format_to_n_result.h"
+      export *
+    }
+    module formatter {
+      header "__format/formatter.h"
+      export *
+    }
+    module formatter_bool {
+      header "__format/formatter_bool.h"
+      export *
+    }
+    module formatter_char {
+      header "__format/formatter_char.h"
+      export *
+    }
+    module formatter_floating_point {
+      header "__format/formatter_floating_point.h"
+      export *
+    }
+    module formatter_integer {
+      header "__format/formatter_integer.h"
+      export *
+    }
+    module formatter_integral {
+      header "__format/formatter_integral.h"
+      export *
+    }
+    module formatter_output {
+      header "__format/formatter_output.h"
+      export *
+    }
+    module formatter_pointer {
+      header "__format/formatter_pointer.h"
+      export *
+    }
+    module formatter_string {
+      header "__format/formatter_string.h"
+      export *
+    }
+    module formatter_tuple {
+      header "__format/formatter_tuple.h"
+      export *
+    }
+    module fwd {
+      header "__fwd/format.h"
+      export *
+    }
+    module indic_conjunct_break_table {
+      header "__format/indic_conjunct_break_table.h"
+      export *
+    }
+    module parser_std_format_spec {
+      header "__format/parser_std_format_spec.h"
+      export *
+    }
+    module print_buffer {
+      header "__format/print_buffer.h"
+      export *
+    }
+    module range_default_formatter {
+      header "__format/range_default_formatter.h"
+      export *
+    }
+    module range_format {
+      header "__format/range_format.h"
+      export *
+    }
+    module range_formatter {
+      header "__format/range_formatter.h"
+      export *
+    }
+    module unicode {
+      header "__format/unicode.h"
+      export *
+    }
+    module width_estimation_table {
+      header "__format/width_estimation_table.h"
+      export *
+    }
+    module write_escaped {
+      header "__format/write_escaped.h"
+      export *
+    }
+
+    header "format"
+    export *
+  } // module format
+
+  module forward_list {
+    header "forward_list"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module fstream {
+    module fwd {
+      header "__fwd/fstream.h"
+      export *
+    }
+
+    header "fstream"
+    export *
+  }
+
+  module functional {
+    module binary_function {
+      header "__functional/binary_function.h"
+      export *
+    }
+    module binary_negate {
+      header "__functional/binary_negate.h"
+      export *
+    }
+    module bind_back {
+      header "__functional/bind_back.h"
+      export *
+    }
+    module bind_front {
+      header "__functional/bind_front.h"
+      export *
+    }
+    module bind {
+      header "__functional/bind.h"
+      export *
+    }
+    module binder1st {
+      header "__functional/binder1st.h"
+      export *
+    }
+    module binder2nd {
+      header "__functional/binder2nd.h"
+      export *
+    }
+    module boyer_moore_searcher {
+      header "__functional/boyer_moore_searcher.h"
+      export *
+    }
+    module compose {
+      header "__functional/compose.h"
+      export *
+    }
+    module copyable_function {
+      header "__functional/copyable_function.h"
+      export *
+    }
+    module copyable_function_common {
+      header "__functional/copyable_function_common.h"
+      export *
+    }
+    module copyable_function_impl {
+      textual header "__functional/copyable_function_impl.h"
+      export *
+    }
+    module default_searcher {
+      header "__functional/default_searcher.h"
+      export *
+    }
+    module function {
+      header "__functional/function.h"
+      export *
+    }
+    module function_ref {
+      header "__functional/function_ref.h"
+      export *
+    }
+    module function_ref_common {
+      header "__functional/function_ref_common.h"
+      export *
+    }
+    module function_ref_impl {
+      textual header "__functional/function_ref_impl.h"
+      export *
+    }
+    module hash {
+      header "__functional/hash.h"
+      export *
+    }
+    module identity {
+      header "__functional/identity.h"
+      export *
+    }
+    module invoke {
+      header "__functional/invoke.h"
+      export *
+    }
+    module is_transparent {
+      header "__functional/is_transparent.h"
+      export *
+    }
+    module mem_fn {
+      header "__functional/mem_fn.h"
+      export *
+    }
+    module mem_fun_ref {
+      header "__functional/mem_fun_ref.h"
+      export *
+    }
+    module move_only_function {
+      header "__functional/move_only_function.h"
+      export *
+    }
+    module move_only_function_common {
+      header "__functional/move_only_function_common.h"
+      export *
+    }
+    module move_only_function_impl {
+      textual header "__functional/move_only_function_impl.h"
+      export *
+    }
+    module not_fn {
+      header "__functional/not_fn.h"
+      export *
+    }
+    module operations {
+      header "__functional/operations.h"
+      export *
+    }
+    module perfect_forward {
+      header "__functional/perfect_forward.h"
+      export *
+    }
+    module pointer_to_binary_function {
+      header "__functional/pointer_to_binary_function.h"
+      export *
+    }
+    module pointer_to_unary_function {
+      header "__functional/pointer_to_unary_function.h"
+      export *
+    }
+    module ranges_operations {
+      header "__functional/ranges_operations.h"
+      export *
+    }
+    module reference_wrapper {
+      header "__functional/reference_wrapper.h"
+      export *
+    }
+    module unary_function {
+      header "__functional/unary_function.h"
+      export *
+    }
+    module unary_negate {
+      header "__functional/unary_negate.h"
+      export *
+    }
+    module weak_result_type {
+      header "__functional/weak_result_type.h"
+      export *
+    }
+
+    header "functional"
+    export *
+  } // module functional
+
+  module future {
+    header "future"
+    export *
+  }
+
+  module hazard_pointer {
+    private header "__hazard_pointer/hazard_pointer.h"
+
+    header "hazard_pointer"
+    export *
+  }
+
+  module hive {
+    header "hive"
+    export *
+  }
+
+  module rcu {
+    private header "__rcu/rcu.h"
+
+    header "rcu"
+    export *
+  }
+
+  module simd {
+    private header "__simd/abi.h"
+    private header "__simd/algorithms.h"
+    private header "__simd/basic_mask.h"
+    private header "__simd/basic_vec.h"
+    private header "__simd/bit.h"
+    private header "__simd/complex.h"
+    private header "__simd/concepts.h"
+    private header "__simd/creation.h"
+    private header "__simd/flags.h"
+    private header "__simd/iterator.h"
+    private header "__simd/loadstore.h"
+    private header "__simd/math.h"
+    private header "__simd/permute.h"
+    private header "__simd/reductions.h"
+    private header "__simd/traits.h"
+    private header "__simd/vectorizable.h"
+
+    header "simd"
+    export *
+  }
+
+  module inplace_vector {
+    header "inplace_vector"
+    export *
+  }
+
+  module generator {
+    module generator {
+      header "__generator/generator.h"
+      export *
+    }
+
+    header "generator"
+    export *
+  }
+
+  module initializer_list {
+    header "initializer_list"
+    export *
+  }
+
+  module iomanip {
+    header "iomanip"
+    export *
+  }
+
+  module ios {
+    module fwd {
+      header "__fwd/ios.h"
+      export *
+    }
+    module fpos {
+      header "__ios/fpos.h"
+      export *
+    }
+
+    header "ios"
+    export *
+  }
+
+  module iosfwd {
+    header "iosfwd"
+    export *
+  }
+
+  module iostream {
+    header "iostream"
+    export *
+  }
+
+  module istream {
+    module fwd {
+      header "__fwd/istream.h"
+      export *
+    }
+
+    header "istream"
+    export std.ios // base class
+  }
+
+  module iterator {
+    module access {
+      header "__iterator/access.h"
+      export *
+    }
+    module advance {
+      header "__iterator/advance.h"
+      export *
+    }
+    module aliasing_iterator {
+      header "__iterator/aliasing_iterator.h"
+      export *
+    }
+    module back_insert_iterator {
+      header "__iterator/back_insert_iterator.h"
+      export *
+    }
+    module bounded_iter {
+      header "__iterator/bounded_iter.h"
+      export *
+    }
+    module common_iterator {
+      header "__iterator/common_iterator.h"
+      export *
+    }
+    module concepts {
+      header "__iterator/concepts.h"
+      export *
+    }
+    module const_iterator {
+      header "__iterator/const_iterator.h"
+      export *
+    }
+    module counted_iterator {
+      header "__iterator/counted_iterator.h"
+      export *
+    }
+    module cpp17_iterator_concepts {
+      header "__iterator/cpp17_iterator_concepts.h"
+      export *
+    }
+    module data {
+      header "__iterator/data.h"
+      export *
+    }
+    module default_sentinel {
+      header "__iterator/default_sentinel.h"
+      export *
+    }
+    module distance {
+      header "__iterator/distance.h"
+      export *
+    }
+    module empty {
+      header "__iterator/empty.h"
+      export *
+    }
+    module erase_if_container {
+      header "__iterator/erase_if_container.h"
+      export *
+    }
+    module front_insert_iterator {
+      header "__iterator/front_insert_iterator.h"
+      export *
+    }
+    module incrementable_traits {
+      header "__iterator/incrementable_traits.h"
+      export *
+    }
+    module indirectly_comparable {
+      header "__iterator/indirectly_comparable.h"
+      export *
+    }
+    module insert_iterator {
+      header "__iterator/insert_iterator.h"
+      export *
+    }
+    module integer_like {
+      header "__iterator/integer_like.h"
+      export *
+    }
+    module istream_iterator {
+      header "__iterator/istream_iterator.h"
+      export *
+    }
+    module istreambuf_iterator        {
+      header "__iterator/istreambuf_iterator.h"
+      export *
+    }
+    module iter_move {
+      header "__iterator/iter_move.h"
+      export *
+    }
+    module iter_swap {
+      header "__iterator/iter_swap.h"
+      export *
+    }
+    module iterator_traits {
+      header "__iterator/iterator_traits.h"
+      export *
+    }
+    module iterator_with_data {
+      header "__iterator/iterator_with_data.h"
+      export *
+    }
+    module iterator {
+      header "__iterator/iterator.h"
+      export *
+    }
+    module mergeable {
+      header "__iterator/mergeable.h"
+      export *
+    }
+    module move_iterator {
+      header "__iterator/move_iterator.h"
+      export *
+    }
+    module move_sentinel {
+      header "__iterator/move_sentinel.h"
+      export *
+    }
+    module next {
+      header "__iterator/next.h"
+      export *
+    }
+    module ostream_iterator {
+      header "__iterator/ostream_iterator.h"
+      export *
+    }
+    module ostreambuf_iterator {
+      header "__iterator/ostreambuf_iterator.h"
+      export *
+    }
+    module permutable {
+      header "__iterator/permutable.h"
+      export *
+    }
+    module prev {
+      header "__iterator/prev.h"
+      export *
+    }
+    module product_iterator {
+      header "__iterator/product_iterator.h"
+      export *
+    }
+    module projected {
+      header "__iterator/projected.h"
+      export *
+    }
+    module ranges_iterator_traits {
+      header "__iterator/ranges_iterator_traits.h"
+      export *
+    }
+    module readable_traits {
+      header "__iterator/readable_traits.h"
+      export *
+    }
+    module reverse_access {
+      header "__iterator/reverse_access.h"
+      export *
+    }
+    module reverse_iterator {
+      header "__iterator/reverse_iterator.h"
+      export *
+    }
+    module segmented_iterator {
+      header "__iterator/segmented_iterator.h"
+      export *
+    }
+    module size {
+      header "__iterator/size.h"
+      export *
+    }
+    module sortable {
+      header "__iterator/sortable.h"
+      export *
+    }
+    module static_bounded_iter {
+      header "__iterator/static_bounded_iter.h"
+      export *
+    }
+    module unreachable_sentinel {
+      header "__iterator/unreachable_sentinel.h"
+      export *
+    }
+    module wrap_iter {
+      header "__iterator/wrap_iter.h"
+      export *
+    }
+
+    header "iterator"
+    export *
+  }
+
+  module latch {
+    header "latch"
+    export *
+  }
+
+  module linalg {
+    header "linalg"
+    export *
+  }
+
+  module list {
+    header "list"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module locale {
+    header "locale"
+    module check_grouping {
+      header "__locale_dir/check_grouping.h"
+      export *
+    }
+    module get_c_locale {
+      header "__locale_dir/get_c_locale.h"
+      export *
+    }
+    module messages {
+      header "__locale_dir/messages.h"
+      export *
+    }
+    module money {
+      header "__locale_dir/money.h"
+      export *
+    }
+    module num {
+      header "__locale_dir/num.h"
+      export *
+    }
+    module pad_and_output {
+      header "__locale_dir/pad_and_output.h"
+      export *
+    }
+    module scan_keyword {
+      header "__locale_dir/scan_keyword.h"
+      export *
+    }
+    module time {
+      header "__locale_dir/time.h"
+      export *
+    }
+    module wbuffer_convert {
+      header "__locale_dir/wbuffer_convert.h"
+      export *
+    }
+    module wstring_convert {
+      header "__locale_dir/wstring_convert.h"
+      export *
+    }
+
+    module support {
+      header "__locale_dir/locale_base_api.h"
+      export *
+    }
+
+    module support_impl {
+      textual header "__locale_dir/support/aix.h"
+      textual header "__locale_dir/support/apple.h"
+      textual header "__locale_dir/support/bsd_like.h"
+      textual header "__locale_dir/support/freebsd.h"
+      textual header "__locale_dir/support/fuchsia.h"
+      textual header "__locale_dir/support/linux.h"
+      textual header "__locale_dir/support/netbsd.h"
+      textual header "__locale_dir/support/newlib.h"
+      textual header "__locale_dir/support/no_locale/characters.h"
+      textual header "__locale_dir/support/no_locale/strtonum.h"
+      textual header "__locale_dir/support/windows.h"
+      export *
+    }
+
+    module locale_base_api {
+      textual header "__locale_dir/locale_base_api/bsd_locale_fallbacks.h"
+      textual header "__locale_dir/locale_base_api/ibm.h"
+      textual header "__locale_dir/locale_base_api/openbsd.h"
+      export *
+    }
+    export *
+  }
+
+  // TODO: Understand why this needs to live in its own module
+  module locale_base [system] {
+    header "__locale"
+    export *
+  }
+
+  module map {
+    header "map"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module mdspan {
+    module aligned_accessor {
+      header "__mdspan/aligned_accessor.h"
+      export *
+    }
+    module default_accessor {
+      header "__mdspan/default_accessor.h"
+      export *
+    }
+    module extents {
+      header "__mdspan/extents.h"
+      export *
+    }
+    module fwd {
+      header "__fwd/mdspan.h"
+      export *
+    }
+    module layout_left {
+      header "__mdspan/layout_left.h"
+      export *
+    }
+    module layout_left_padded {
+      header "__mdspan/layout_left_padded.h"
+      export *
+    }
+    module layout_padded_helpers {
+      header "__mdspan/layout_padded_helpers.h"
+      export *
+    }
+    module layout_right {
+      header "__mdspan/layout_right.h"
+      export *
+    }
+    module layout_right_padded {
+      header "__mdspan/layout_right_padded.h"
+      export *
+    }
+    module layout_stride {
+      header "__mdspan/layout_stride.h"
+      export *
+    }
+    module mdspan {
+      header "__mdspan/mdspan.h"
+      export *
+    }
+    module submdspan {
+      header "__mdspan/submdspan.h"
+      export *
+    }
+    module submdspan_mapping {
+      header "__mdspan/submdspan_mapping.h"
+      export *
+    }
+
+    header "mdspan"
+    export *
+  }
+
+  module memory {
+    module addressof {
+      header "__memory/addressof.h"
+      export *
+    }
+    module align {
+      header "__memory/align.h"
+      export *
+    }
+    module allocate_at_least {
+      header "__memory/allocate_at_least.h"
+      export *
+    }
+    module allocation_guard {
+      header "__memory/allocation_guard.h"
+      export *
+    }
+    module allocator {
+      header "__memory/allocator.h"
+      export *
+    }
+    module allocator_arg_t {
+      header "__memory/allocator_arg_t.h"
+      export *
+    }
+    module allocator_destructor {
+      header "__memory/allocator_destructor.h"
+      export *
+    }
+    module allocator_traits {
+      header "__memory/allocator_traits.h"
+      export *
+    }
+    module array_cookie {
+      header "__memory/array_cookie.h"
+      export *
+    }
+    module assume_aligned {
+      header "__memory/assume_aligned.h"
+      export *
+    }
+    module auto_ptr {
+      header "__memory/auto_ptr.h"
+      export *
+    }
+    module compressed_pair {
+      header "__memory/compressed_pair.h"
+      export *
+    }
+    module concepts {
+      header "__memory/concepts.h"
+      export *
+    }
+    module construct_at {
+      header "__memory/construct_at.h"
+      export *
+    }
+    module destroy {
+      header "__memory/destroy.h"
+      export *
+    }
+    module destruct_n {
+      header "__memory/destruct_n.h"
+      export *
+    }
+    module fwd {
+      header "__fwd/memory.h"
+      export *
+    }
+    module indirect {
+      header "__memory/indirect.h"
+      export *
+    }
+    module inout_ptr {
+      header "__memory/inout_ptr.h"
+      export *
+    }
+    module is_sufficiently_aligned {
+      header "__memory/is_sufficiently_aligned.h"
+      export *
+    }
+    module noexcept_move_assign_container {
+      header "__memory/noexcept_move_assign_container.h"
+      export *
+    }
+    module out_ptr {
+      header "__memory/out_ptr.h"
+      export *
+    }
+    module pointer_traits {
+      header "__memory/pointer_traits.h"
+      export *
+    }
+    module polymorphic {
+      header "__memory/polymorphic.h"
+      export *
+    }
+    module pstl_uninitialized_algorithms {
+      header "__memory/pstl_uninitialized_algorithms.h"
+      export *
+    }
+    module ranges_construct_at {
+      header "__memory/ranges_construct_at.h"
+      export *
+    }
+    module ranges_destroy {
+      header "__memory/ranges_destroy.h"
+      export *
+    }
+    module ranges_uninitialized_algorithms {
+      header "__memory/ranges_uninitialized_algorithms.h"
+      export *
+    }
+    module raw_storage_iterator {
+      header "__memory/raw_storage_iterator.h"
+      export *
+    }
+    module shared_count {
+      header "__memory/shared_count.h"
+      export *
+    }
+    module atomic_shared_ptr {
+      header "__memory/atomic_shared_ptr.h"
+      export *
+    }
+    module shared_ptr                         {
+      header "__memory/shared_ptr.h"
+      export *
+    }
+    module start_lifetime {
+      header "__memory/start_lifetime.h"
+      export *
+    }
+    module start_lifetime_as {
+      header "__memory/start_lifetime_as.h"
+      export *
+    }
+    module swap_allocator {
+      header "__memory/swap_allocator.h"
+      export *
+    }
+    module temp_value {
+      header "__memory/temp_value.h"
+      export *
+    }
+    module temporary_buffer                   {
+      header "__memory/temporary_buffer.h"
+      export *
+    }
+    module uninitialized_algorithms {
+      header "__memory/uninitialized_algorithms.h"
+      export *
+    }
+    module unique_ptr {
+      header "__memory/unique_ptr.h"
+      export *
+    }
+    module unique_temporary_buffer {
+      header "__memory/unique_temporary_buffer.h"
+      export *
+    }
+    module uses_allocator {
+      header "__memory/uses_allocator.h"
+      export *
+    }
+    module uses_allocator_construction {
+      header "__memory/uses_allocator_construction.h"
+      export *
+    }
+
+    header "memory"
+    export *
+  }
+
+  module memory_resource {
+    module fwd {
+      header "__fwd/memory_resource.h"
+      export *
+    }
+    module memory_resource {
+      header "__memory_resource/memory_resource.h"
+      export *
+    }
+    module monotonic_buffer_resource {
+      header "__memory_resource/monotonic_buffer_resource.h"
+      export *
+    }
+    module polymorphic_allocator {
+      header "__memory_resource/polymorphic_allocator.h"
+      export *
+    }
+    module pool_options {
+      header "__memory_resource/pool_options.h"
+      export *
+    }
+    module synchronized_pool_resource {
+      header "__memory_resource/synchronized_pool_resource.h"
+      export *
+    }
+    module unsynchronized_pool_resource {
+      header "__memory_resource/unsynchronized_pool_resource.h"
+      export *
+    }
+
+    header "memory_resource"
+    export *
+  }
+
+  module meta {
+    header "meta"
+    export *
+    export std.concepts.constructible
+    export std.concepts.same_as
+    export std.exception
+    export std.tuple
+  }
+
+  module mutex {
+    module lock_guard {
+      header "__mutex/lock_guard.h"
+      export *
+    }
+    module mutex {
+      header "__mutex/mutex.h"
+      export *
+    }
+    module once_flag {
+      header "__mutex/once_flag.h"
+      export *
+    }
+    module tag_types {
+      header "__mutex/tag_types.h"
+      export *
+    }
+    module unique_lock {
+      header "__mutex/unique_lock.h"
+      export *
+    }
+
+    header "mutex"
+    export *
+  }
+
+  module new {
+    header "new"
+    module align_val_t {
+      header "__new/align_val_t.h"
+      export *
+    }
+    module allocate {
+      header "__new/allocate.h"
+      export *
+    }
+    module destroying_delete_t {
+      header "__new/destroying_delete_t.h"
+      export *
+    }
+    module exceptions {
+      header "__new/exceptions.h"
+      export *
+    }
+    module global_new_delete    {
+      header "__new/global_new_delete.h"
+
+      export *
+    }
+    module interference_size {
+      header "__new/interference_size.h"
+      export *
+    }
+    module launder {
+      header "__new/launder.h"
+      export *
+    }
+    module new_handler {
+      header "__new/new_handler.h"
+      export *
+    }
+    module nothrow_t {
+      header "__new/nothrow_t.h"
+      export *
+    }
+    module placement_new_delete {
+      header "__new/placement_new_delete.h"
+      export *
+    }
+
+    export *
+  }
+
+  module numbers {
+    header "numbers"
+    export *
+  }
+
+  module numeric {
+    module accumulate {
+      header "__numeric/accumulate.h"
+      export *
+    }
+    module adjacent_difference {
+      header "__numeric/adjacent_difference.h"
+      export *
+    }
+    module exclusive_scan {
+      header "__numeric/exclusive_scan.h"
+      export *
+    }
+    module gcd_lcm {
+      header "__numeric/gcd_lcm.h"
+      export *
+    }
+    module inclusive_scan {
+      header "__numeric/inclusive_scan.h"
+      export *
+    }
+    module inner_product {
+      header "__numeric/inner_product.h"
+      export *
+    }
+    module iota {
+      header "__numeric/iota.h"
+      export *
+    }
+    module midpoint {
+      header "__numeric/midpoint.h"
+      export *
+    }
+    module partial_sum {
+      header "__numeric/partial_sum.h"
+      export *
+    }
+    module pstl {
+      header "__numeric/pstl.h"
+      export *
+    }
+    module reduce {
+      header "__numeric/reduce.h"
+      export *
+    }
+    module ranges_iota {
+      header "__numeric/ranges_iota.h"
+      export *
+    }
+    module saturation_arithmetic {
+      header "__numeric/saturation_arithmetic.h"
+      export *
+    }
+    module transform_exclusive_scan {
+      header "__numeric/transform_exclusive_scan.h"
+      export *
+    }
+    module transform_inclusive_scan {
+      header "__numeric/transform_inclusive_scan.h"
+      export *
+    }
+    module transform_reduce {
+      header "__numeric/transform_reduce.h"
+      export *
+    }
+
+    header "numeric"
+    export *
+  }
+
+  module optional {
+    header "optional"
+    export *
+  }
+
+  module ostream {
+    module basic_ostream {
+      header "__ostream/basic_ostream.h"
+      export *
+    }
+    module fwd {
+      header "__fwd/ostream.h"
+      export *
+    }
+    module print {
+      header "__ostream/print.h"
+      export *
+    }
+    module put_character_sequence {
+      header "__ostream/put_character_sequence.h"
+      export *
+    }
+
+    header "ostream"
+    export *
+  }
+
+  module print {
+    header "print"
+    export *
+  }
+
+  module queue {
+    module fwd {
+      header "__fwd/queue.h"
+      export *
+    }
+
+    header "queue"
+    export *
+  }
+
+  module random {
+    module bernoulli_distribution {
+      header "__random/bernoulli_distribution.h"
+      export *
+    }
+    module binomial_distribution {
+      header "__random/binomial_distribution.h"
+      export *
+    }
+    module cauchy_distribution {
+      header "__random/cauchy_distribution.h"
+      export *
+    }
+    module chi_squared_distribution {
+      header "__random/chi_squared_distribution.h"
+      export *
+    }
+    module clamp_to_integral {
+      header "__random/clamp_to_integral.h"
+      export *
+    }
+    module default_random_engine {
+      header "__random/default_random_engine.h"
+      export *
+    }
+    module discard_block_engine {
+      header "__random/discard_block_engine.h"
+      export *
+    }
+    module discrete_distribution {
+      header "__random/discrete_distribution.h"
+      export *
+    }
+    module exponential_distribution {
+      header "__random/exponential_distribution.h"
+      export *
+    }
+    module extreme_value_distribution {
+      header "__random/extreme_value_distribution.h"
+      export *
+    }
+    module fisher_f_distribution {
+      header "__random/fisher_f_distribution.h"
+      export *
+    }
+    module gamma_distribution {
+      header "__random/gamma_distribution.h"
+      export *
+    }
+    module generate_canonical {
+      header "__random/generate_canonical.h"
+      export *
+    }
+    module generate_random {
+      header "__random/generate_random.h"
+      export *
+    }
+    module geometric_distribution {
+      header "__random/geometric_distribution.h"
+      export *
+    }
+    module independent_bits_engine {
+      header "__random/independent_bits_engine.h"
+      export *
+    }
+    module is_seed_sequence {
+      header "__random/is_seed_sequence.h"
+      export *
+    }
+    module is_valid {
+      header "__random/is_valid.h"
+      export *
+    }
+    module knuth_b {
+      header "__random/knuth_b.h"
+      export *
+    }
+    module linear_congruential_engine {
+      header "__random/linear_congruential_engine.h"
+      export *
+    }
+    module log2 {
+      header "__random/log2.h"
+      export *
+    }
+    module lognormal_distribution {
+      header "__random/lognormal_distribution.h"
+      export *
+    }
+    module mersenne_twister_engine {
+      header "__random/mersenne_twister_engine.h"
+      export *
+    }
+    module negative_binomial_distribution {
+      header "__random/negative_binomial_distribution.h"
+      export *
+    }
+    module normal_distribution {
+      header "__random/normal_distribution.h"
+      export *
+    }
+    module philox_engine {
+      header "__random/philox_engine.h"
+      export *
+    }
+    module piecewise_constant_distribution {
+      header "__random/piecewise_constant_distribution.h"
+      export *
+    }
+    module piecewise_linear_distribution {
+      header "__random/piecewise_linear_distribution.h"
+      export *
+    }
+    module poisson_distribution {
+      header "__random/poisson_distribution.h"
+      export *
+    }
+    module random_device {
+      header "__random/random_device.h"
+      export *
+    }
+    module ranlux {
+      header "__random/ranlux.h"
+      export *
+    }
+    module seed_seq {
+      header "__random/seed_seq.h"
+      export *
+    }
+    module shuffle_order_engine {
+      header "__random/shuffle_order_engine.h"
+      export *
+    }
+    module student_t_distribution {
+      header "__random/student_t_distribution.h"
+      export *
+    }
+    module subtract_with_carry_engine {
+      header "__random/subtract_with_carry_engine.h"
+      export *
+    }
+    module uniform_int_distribution {
+      header "__random/uniform_int_distribution.h"
+      export *
+    }
+    module uniform_random_bit_generator {
+      header "__random/uniform_random_bit_generator.h"
+      export *
+    }
+    module uniform_real_distribution {
+      header "__random/uniform_real_distribution.h"
+      export *
+    }
+    module weibull_distribution {
+      header "__random/weibull_distribution.h"
+      export *
+    }
+
+    header "random"
+    export *
+  }
+
+  module ranges {
+    private header "__ranges/as_input_view.h"
+    private header "__ranges/cache_latest_view.h"
+    private header "__ranges/cartesian_product_view.h"
+    private header "__ranges/concat_view.h"
+    private header "__ranges/enumerate_view.h"
+    module access {
+      header "__ranges/access.h"
+      export *
+    }
+    module adjacent_transform_view {
+      header "__ranges/adjacent_transform_view.h"
+      export *
+    }
+    module adjacent_view {
+      header "__ranges/adjacent_view.h"
+      export *
+    }
+    module all                            {
+      header "__ranges/all.h"
+      export *
+    }
+    module as_const_view {
+      header "__ranges/as_const_view.h"
+      export *
+    }
+    module as_rvalue_view {
+      header "__ranges/as_rvalue_view.h"
+      export *
+    }
+    module chunk_by_view {
+      header "__ranges/chunk_by_view.h"
+      export *
+    }
+    module chunk_view {
+      header "__ranges/chunk_view.h"
+      export *
+    }
+    module common_view {
+      header "__ranges/common_view.h"
+      export *
+    }
+    module concepts {
+      header "__ranges/concepts.h"
+      export *
+    }
+    module container_compatible_range {
+      header "__ranges/container_compatible_range.h"
+      export *
+    }
+    module counted {
+      header "__ranges/counted.h"
+      export *
+    }
+    module dangling {
+      header "__ranges/dangling.h"
+      export *
+    }
+    module data {
+      header "__ranges/data.h"
+      export *
+    }
+    module drop_view {
+      header "__ranges/drop_view.h"
+      export *
+    }
+    module drop_while_view {
+      header "__ranges/drop_while_view.h"
+      export *
+    }
+    module elements_of {
+      header "__ranges/elements_of.h"
+      export *
+    }
+    module elements_view {
+      header "__ranges/elements_view.h"
+      export *
+    }
+    module empty {
+      header "__ranges/empty.h"
+      export *
+    }
+    module empty_view {
+      header "__ranges/empty_view.h"
+      export *
+    }
+    module enable_borrowed_range {
+      header "__ranges/enable_borrowed_range.h"
+      export *
+    }
+    module enable_view {
+      header "__ranges/enable_view.h"
+      export *
+    }
+    module filter_view {
+      header "__ranges/filter_view.h"
+      export *
+    }
+    module from_range {
+      header "__ranges/from_range.h"
+      export *
+    }
+    module iota_view {
+      header "__ranges/iota_view.h"
+      export *
+    }
+    module istream_view {
+      header "__ranges/istream_view.h"
+      export *
+    }
+    module join_view {
+      header "__ranges/join_view.h"
+      export *
+    }
+    module join_with_view {
+      header "__ranges/join_with_view.h"
+      export *
+    }
+    module lazy_split_view {
+      header "__ranges/lazy_split_view.h"
+      export *
+    }
+    module movable_box {
+      header "__ranges/movable_box.h"
+      export *
+    }
+    module non_propagating_cache {
+      header "__ranges/non_propagating_cache.h"
+      export *
+    }
+    module owning_view {
+      header "__ranges/owning_view.h"
+      export *
+    }
+    module range_adaptor {
+      header "__ranges/range_adaptor.h"
+      export *
+    }
+    module rbegin {
+      header "__ranges/rbegin.h"
+      export *
+    }
+    module ref_view {
+      header "__ranges/ref_view.h"
+      export *
+    }
+    module rend {
+      header "__ranges/rend.h"
+      export *
+    }
+    module repeat_view {
+      header "__ranges/repeat_view.h"
+      export *
+    }
+    module reverse_view {
+      header "__ranges/reverse_view.h"
+      export *
+    }
+    module single_view {
+      header "__ranges/single_view.h"
+      export *
+    }
+    module size {
+      header "__ranges/size.h"
+      export *
+    }
+    module slide_view {
+      header "__ranges/slide_view.h"
+      export *
+    }
+    module split_view {
+      header "__ranges/split_view.h"
+      export *
+    }
+    module stride_view {
+      header "__ranges/stride_view.h"
+      export *
+    }
+    module subrange {
+      header "__ranges/subrange.h"
+      export *
+    }
+    module subrange_fwd {
+      header "__fwd/subrange.h"
+      export *
+    }
+    module take_view {
+      header "__ranges/take_view.h"
+      export *
+    }
+    module take_while_view {
+      header "__ranges/take_while_view.h"
+      export *
+    }
+    module to {
+      header "__ranges/to.h"
+      export *
+    }
+    module transform_view {
+      header "__ranges/transform_view.h"
+      export *
+    }
+    module view_interface {
+      header "__ranges/view_interface.h"
+      export *
+    }
+    module views {
+      header "__ranges/views.h"
+      export *
+    }
+    module zip_view {
+      header "__ranges/zip_view.h"
+      export *
+    }
+    module zip_transform_view {
+      header "__ranges/zip_transform_view.h"
+      export *
+    }
+
+    header "ranges"
+    export *
+  } // module ranges
+
+  module ratio {
+    header "ratio"
+    export *
+  }
+
+  module regex {
+    header "regex"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module scoped_allocator {
+    header "scoped_allocator"
+    export *
+  }
+
+  module semaphore {
+    header "semaphore"
+    export *
+  }
+
+  module set {
+    header "set"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module shared_mutex {
+    header "shared_mutex"
+    export *
+  }
+
+  module source_location {
+    header "source_location"
+    export *
+  }
+
+  module span {
+    module fwd {
+      header "__fwd/span.h"
+      export *
+    }
+
+    header "span"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module spanstream {
+    module fwd {
+      header "__fwd/spanstream.h"
+      export *
+    }
+
+    header "spanstream"
+    export *
+  }
+
+  module sstream {
+    module fwd {
+      header "__fwd/sstream.h"
+      export *
+    }
+
+    header "sstream"
+    export *
+  }
+
+  module stack {
+    module fwd {
+      header "__fwd/stack.h"
+      export *
+    }
+
+    header "stack"
+    export *
+  }
+
+  module stacktrace {
+    module basic_stacktrace {
+      header "__stacktrace/basic_stacktrace.h"
+      export *
+    }
+    module formatter {
+      header "__stacktrace/formatter.h"
+      export *
+    }
+    module stacktrace_decls {
+      header "__stacktrace/stacktrace_decls.h"
+      export *
+    }
+    module stacktrace_entry {
+      header "__stacktrace/stacktrace_entry.h"
+      export *
+    }
+
+    header "stacktrace"
+    export *
+  }
+
+  module stdexcept {
+    header "stdexcept"
+    export *
+  }
+
+  module stdfloat {
+    header "stdfloat"
+    export *
+  }
+
+  module stop_token {
+    module atomic_unique_lock {
+      header "__stop_token/atomic_unique_lock.h"
+      export *
+    }
+    module inplace_stop_callback {
+      header "__stop_token/inplace_stop_callback.h"
+      export *
+    }
+    module inplace_stop_source {
+      header "__stop_token/inplace_stop_source.h"
+      export *
+    }
+    module inplace_stop_token {
+      header "__stop_token/inplace_stop_token.h"
+      export *
+    }
+    module intrusive_list_view {
+      header "__stop_token/intrusive_list_view.h"
+      export *
+    }
+    module intrusive_shared_ptr {
+      header "__stop_token/intrusive_shared_ptr.h"
+      export *
+    }
+    module never_stop_token {
+      header "__stop_token/never_stop_token.h"
+      export *
+    }
+    module stop_callback {
+      header "__stop_token/stop_callback.h"
+      export *
+    }
+    module stop_source {
+      header "__stop_token/stop_source.h"
+      export *
+    }
+    module stop_state {
+      header "__stop_token/stop_state.h"
+      export *
+    }
+    module stop_token {
+      header "__stop_token/stop_token.h"
+      export *
+    }
+    module stoppable_token {
+      header "__stop_token/stoppable_token.h"
+      export *
+    }
+
+    header "stop_token"
+    export *
+  }
+
+  module streambuf {
+    module fwd {
+      header "__fwd/streambuf.h"
+      export *
+    }
+
+    header "streambuf"
+    export *
+  }
+
+  module string {
+    module char_traits {
+      header "__string/char_traits.h"
+      export *
+    }
+    module constexpr_c_functions    {
+      header "__string/constexpr_c_functions.h"
+      export *
+    }
+    module extern_template_lists {
+      header "__string/extern_template_lists.h"
+      export *
+    }
+    module fwd {
+      header "__fwd/string.h"
+      export *
+    }
+
+    header "string"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module string_view {
+    module fwd {
+      header "__fwd/string_view.h"
+      export *
+    }
+
+    header "string_view"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module strstream {
+    header "strstream"
+    export *
+  }
+
+  module syncstream {
+    header "syncstream"
+    export *
+  }
+
+  module system_error {
+    module errc {
+      header "__system_error/errc.h"
+      export *
+    }
+    module error_category {
+      header "__system_error/error_category.h"
+      export *
+    }
+    module error_code {
+      header "__system_error/error_code.h"
+      export *
+    }
+    module error_condition {
+      header "__system_error/error_condition.h"
+      export *
+    }
+    module system_error {
+      header "__system_error/system_error.h"
+      export *
+    }
+    module throw_system_error {
+      header "__system_error/throw_system_error.h"
+      export *
+    }
+
+    header "system_error"
+    export *
+  }
+
+  module text_encoding {
+    header "text_encoding"
+    export *
+  }
+
+  module thread {
+    module formatter {
+      header "__thread/formatter.h"
+      export *
+    }
+    module id {
+      header "__thread/id.h"
+      export *
+    }
+    module jthread {
+      header "__thread/jthread.h"
+      export *
+    }
+    module poll_with_backoff {
+      header "__thread/poll_with_backoff.h"
+      export *
+    }
+    module this_thread {
+      header "__thread/this_thread.h"
+      export *
+    }
+    module thread {
+      header "__thread/thread.h"
+      export *
+    }
+    module timed_backoff_policy {
+      header "__thread/timed_backoff_policy.h"
+      export *
+    }
+
+    module support {
+      header "__thread/support.h"
+      export *
+    }
+    module support_impl {
+      textual header "__thread/support/c11.h"
+      textual header "__thread/support/external.h"
+      textual header "__thread/support/pthread.h"
+      textual header "__thread/support/windows.h"
+      export *
+    }
+
+    header "thread"
+    export *
+  }
+
+  module tuple {
+    module find_index {
+      header "__tuple/find_index.h"
+      export *
+    }
+    module ignore {
+      header "__tuple/ignore.h"
+      export *
+    }
+    module sfinae_helpers {
+      header "__tuple/sfinae_helpers.h"
+      export *
+    }
+    module tuple_element {
+      header "__tuple/tuple_element.h"
+      export *
+    }
+    module tuple_like_no_subrange {
+      header "__tuple/tuple_like_no_subrange.h"
+      export *
+    }
+    module tuple_like {
+      header "__tuple/tuple_like.h"
+      export *
+    }
+    module tuple_size {
+      header "__tuple/tuple_size.h"
+      export *
+    }
+    module tuple_trasnform {
+      header "__tuple/tuple_transform.h"
+      export *
+    }
+
+    header "tuple"
+    export *
+  }
+
+  module typeindex {
+    header "typeindex"
+    export *
+  }
+
+  module typeinfo {
+    header "typeinfo"
+    export *
+  }
+
+  module unordered_map {
+    header "unordered_map"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module unordered_set {
+    header "unordered_set"
+    export *
+    export std.iterator.reverse_iterator
+  }
+
+  module utility {
+    module as_const {
+      header "__utility/as_const.h"
+      export *
+    }
+    module as_lvalue {
+      header "__utility/as_lvalue.h"
+      export *
+    }
+    module auto_cast                       {
+      header "__utility/auto_cast.h"
+      export *
+    }
+    module cmp {
+      header "__utility/cmp.h"
+      export *
+    }
+    module constant_wrapper {
+      header "__utility/constant_wrapper.h"
+      export *
+    }
+    module convert_to_integral {
+      header "__utility/convert_to_integral.h"
+      export *
+    }
+    module default_three_way_comparator {
+      header "__utility/default_three_way_comparator.h"
+      export *
+    }
+    module element_count {
+      header "__utility/element_count.h"
+      export *
+    }
+    module exception_guard {
+      header "__utility/exception_guard.h"
+      export *
+    }
+    module exchange {
+      header "__utility/exchange.h"
+      export *
+    }
+    module forward_like {
+      header "__utility/forward_like.h"
+      export *
+    }
+    module in_place                        {
+      header "__utility/in_place.h"
+      export *
+    }
+    module integer_sequence {
+      header "__utility/integer_sequence.h"
+      export *
+    }
+    module is_pointer_in_range {
+      header "__utility/is_pointer_in_range.h"
+      export *
+    }
+    module is_valid_range {
+      header "__utility/is_valid_range.h"
+      export *
+    }
+    module lazy_synth_three_way_comparator {
+      header "__utility/lazy_synth_three_way_comparator.h"
+      export *
+    }
+    module move {
+      header "__utility/move.h"
+      export *
+    }
+    module no_destroy {
+      header "__utility/no_destroy.h"
+      export *
+    }
+    module observable_checkpoint {
+      header "__utility/observable_checkpoint.h"
+      export *
+    }
+    module pair                            {
+      header "__utility/pair.h"
+      export *
+    }
+    module piecewise_construct {
+      header "__utility/piecewise_construct.h"
+      export *
+    }
+    module priority_tag {
+      header "__utility/priority_tag.h"
+      export *
+    }
+    module private_constructor_tag {
+      header "__utility/private_constructor_tag.h"
+      export *
+    }
+    module rel_ops {
+      header "__utility/rel_ops.h"
+      export *
+    }
+    module scope_guard {
+      header "__utility/scope_guard.h"
+      export *
+    }
+    module small_buffer {
+      header "__utility/small_buffer.h"
+      export *
+    }
+    module swap {
+      header "__utility/swap.h"
+      export *
+    }
+    module to_underlying {
+      header "__utility/to_underlying.h"
+      export *
+    }
+    module try_key_extraction {
+      header "__utility/try_key_extraction.h"
+      export *
+    }
+    module unreachable {
+      header "__utility/unreachable.h"
+      export *
+    }
+
+    header "utility"
+    export *
+  }
+
+  module valarray {
+    header "valarray"
+    export *
+  }
+
+  module variant {
+    module fwd {
+      header "__fwd/variant.h"
+      export *
+    }
+    module monostate {
+      header "__variant/monostate.h"
+      export *
+    }
+
+    header "variant"
+    export *
+  }
+
+  module vector {
+    module fwd {
+      header "__fwd/vector.h"
+      export *
+    }
+
+    module comparison {
+      header "__vector/comparison.h"
+      export *
+    }
+    module container_traits {
+      header "__vector/container_traits.h"
+      export *
+    }
+    module erase {
+      header "__vector/erase.h"
+      export *
+    }
+    module vector_bool_formatter {
+      header "__vector/vector_bool_formatter.h"
+
+      export *
+    }
+    module pmr                   {
+      header "__vector/pmr.h"
+
+      export *
+    }
+    module swap {
+      header "__vector/swap.h"
+      export *
+    }
+    module vector_bool           {
+      header "__vector/vector_bool.h"
+      export *
+    }
+    module vector                {
+      header "__vector/vector.h"
+      export *
+    }
+
+    header "vector"
+    export std.iterator.reverse_iterator
+    export *
+    export std.algorithm.simd_utils // This is a workaround for https://llvm.org/PR120108.
+  }
+
+  // Implementation detail headers that are private to libc++. These modules
+  // must not be directly imported.
+  module debug_utils {
+    module randomize_range {
+      header "__debug_utils/randomize_range.h"
+      export *
+    }
+    module sanitizers {
+      header "__debug_utils/sanitizers.h"
+      export *
+    }
+    module strict_weak_ordering_check {
+      header "__debug_utils/strict_weak_ordering_check.h"
+      export *
+    }
+  }
+
+  module get_fwd {
+    header "__fwd/get.h"
+    export *
+  }
+
+  module pstl {
+    module backend_fwd {
+      header "__pstl/backend_fwd.h"
+      export *
+    }
+    module backend {
+      header "__pstl/backend.h"
+      export *
+    }
+    module backends {
+      module default {
+        header "__pstl/backends/default.h"
+        export *
+      }
+      module libdispatch {
+        header "__pstl/backends/libdispatch.h"
+        export *
+      }
+      module serial {
+        header "__pstl/backends/serial.h"
+        export *
+      }
+      module std_thread {
+        header "__pstl/backends/std_thread.h"
+        export *
+      }
+    }
+    module cpu_algos {
+      module any_of {
+        header "__pstl/cpu_algos/any_of.h"
+        export *
+      }
+      module cpu_traits {
+        header "__pstl/cpu_algos/cpu_traits.h"
+        export *
+      }
+      module fill {
+        header "__pstl/cpu_algos/fill.h"
+        export *
+      }
+      module find_if {
+        header "__pstl/cpu_algos/find_if.h"
+        export *
+      }
+      module for_each {
+        header "__pstl/cpu_algos/for_each.h"
+        export *
+      }
+      module merge {
+        header "__pstl/cpu_algos/merge.h"
+        export *
+      }
+      module stable_sort {
+        header "__pstl/cpu_algos/stable_sort.h"
+        export *
+      }
+      module transform {
+        header "__pstl/cpu_algos/transform.h"
+        export *
+      }
+      module transform_reduce {
+        header "__pstl/cpu_algos/transform_reduce.h"
+        export *
+      }
+    }
+    module dispatch {
+      header "__pstl/dispatch.h"
+      export *
+    }
+    module handle_exception {
+      header "__pstl/handle_exception.h"
+      export *
+    }
+    module memory_algorithms {
+      header "__pstl/memory_algorithms.h"
+      export *
+    }
+    module ranges_bounded {
+      header "__pstl/ranges_bounded.h"
+      export *
+    }
+  }
+
+  // Miscellaneous modules for top-level headers
+  module bit_reference_fwd {
+    header "__fwd/bit_reference.h"
+    export *
+  }
+  module bit_reference {
+    header "__bit_reference"
+    export *
+  }
+  module hash_table {
+    header "__hash_table"
+    export *
+  }
+  module node_handle {
+    header "__node_handle"
+    export *
+  }
+  module split_buffer {
+    header "__split_buffer"
+    export *
+  }
+  module tree                 {
+    header "__tree"
+    export *
+  }
+  module std_mbstate_t {
+    header "__std_mbstate_t.h"
+    export *
+  }
+  module hardened_violation {
+    header "__hardened_violation"
+    export *
+  }
+  module verbose_abort {
+    header "__verbose_abort"
+    export *
+  }
+  module verbose_trap {
+    header "__verbose_trap"
+    export *
+  }
+  module internal_assert {
+    header "__assert"
+    export *
+  }
+  module assertion_handler {
+    header "__assertion_handler" // generated via CMake
+    export *
+  }
+
+  module undef_macros {
+    textual header "__undef_macros"
+    export *
+  }
+
+  // This module needs to appear after __tree to work around issues with modules in Objective-C++ mode.
+  module coroutine {
+    module coroutine_handle {
+      header "__coroutine/coroutine_handle.h"
+      export *
+    }
+    module coroutine_traits {
+      header "__coroutine/coroutine_traits.h"
+      export *
+    }
+    module noop_coroutine_handle {
+      header "__coroutine/noop_coroutine_handle.h"
+      export *
+    }
+    module trivial_awaitables {
+      header "__coroutine/trivial_awaitables.h"
+      export *
+    }
+
+    header "coroutine"
+    export *
+    export std.functional.hash
+  }
+} // module std
+
+// C compatibility headers
+//
+// These modules need to be their own top-level modules because they depend on the system-provided
+// headers (via include_next), which are then free to include other C headers provided by libc++.
+// If we group these headers in a single module, we would end up with circular dependencies.
+module std_complex_h [system] {
+  header "complex.h"
+  export *
+}
+module std_ctype_h [system] {
+  header "ctype.h"
+  export *
+}
+module std_errno_h [system] {
+  header "errno.h"
+  export *
+}
+module std_fenv_h [system] {
+  header "fenv.h"
+  export *
+}
+module std_float_h [system] {
+  header "float.h"
+  export *
+}
+module std_inttypes_h [system] {
+  header "inttypes.h"
+  export *
+}
+module std_math_h [system] {
+  header "math.h"
+  export *
+}
+module std_stdatomic_h [system] {
+  header "stdatomic.h"
+  export *
+}
+module std_stdbit_h [system] {
+  header "stdbit.h"
+  export *
+}
+module std_stdbool_h [system] {
+  // <stdbool.h>'s __bool_true_false_are_defined macro requires textual inclusion.
+  textual header "stdbool.h"
+  export *
+}
+module std_stdckdint_h [system] {
+  header "stdckdint.h"
+  export *
+}
+module std_stddef_h [system] {
+  // <stddef.h> supports being included multiple times with different pre-defined macros
+  textual header "stddef.h"
+  export *
+}
+module std_stdio_h [system] {
+  // <stdio.h> supports being included multiple times with different pre-defined macros
+  textual header "stdio.h"
+  export *
+}
+module std_stdlib_h [system] {
+  // <stdlib.h> supports being included multiple times with different pre-defined macros
+  textual header "stdlib.h"
+  export *
+}
+module std_string_h [system] {
+  header "string.h"
+  export *
+}
+module std_tgmath_h [system] {
+  header "tgmath.h"
+  export *
+}
+module std_uchar_h [system] {
+  header "uchar.h"
+  export *
+}
+module std_wchar_h [system] {
+  // <wchar.h> supports being included multiple times with different pre-defined macros
+  textual header "wchar.h"
+  export *
+}
+module std_wctype_h [system] {
+  header "wctype.h"
+  export *
+}
+
+// This header is used by other C compatibility headers so it needs to be in its own module.
+module std_private_mbstate_t [system] {
+  header "__mbstate_t.h"
+  export *
+}
