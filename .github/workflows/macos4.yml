@@ -75,6 +75,18 @@ jobs:
                  -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" $f.cpp -o $f && ./$f; then echo "PASS $f"; else echo "FAIL $f"; fail=1; fi
           done
           exit $fail
+      - name: Diagnose the linker crash
+        if: always()
+        run: |
+          P="$PWD/install"
+          env | grep -iE 'DYLD|LIBRARY_PATH|SDKROOT' || echo "no DYLD/LIBRARY_PATH/SDKROOT in env"
+          otool -D "$P/lib/libc++.1.dylib" || true
+          otool -L "$P/lib/libc++.1.dylib" || true
+          nm -gU "$P/lib/libc++.1.dylib" | grep -c . || true
+          nm -gU "$P/lib/libc++.1.dylib" | grep -E "shared_weak_count" | head -5 || echo "no shared_weak_count symbols exported"
+          nm -gU /usr/lib/libc++.1.dylib 2>/dev/null | grep -E "shared_weak_countD2" | head -3 || true
+          cd scratch-examples
+          "$P/bin/clang++" -v -std=c++26 -nostdlib++ -isysroot "$(xcrun --show-sdk-path)" -isystem "$P/include/c++/v1" -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" hello.cpp -o hello 2>&1 | tail -12 || true
       - name: libc++ tests of the fixes
         run: |
           P="$PWD/install"
