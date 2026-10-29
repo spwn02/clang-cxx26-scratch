@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <cstring>
 #include <text_encoding>
 
 extern "C" __declspec(dllimport) unsigned int __stdcall GetACP(void);
@@ -10,7 +11,11 @@ extern "C" __declspec(dllimport) unsigned int __stdcall GetACP(void);
 int main() {
   const std::text_encoding e = std::text_encoding::environment();
   const unsigned acp         = GetACP();
-  const std::string expected = acp == 65001 ? "UTF-8" : "windows-" + std::to_string(acp);
-  std::printf("environment = %s, GetACP = %u (expected %s)\n", e.name(), acp, expected.c_str());
-  return std::string_view(e.name()) == expected ? 0 : 1;
+  char expected[32];
+  if (acp == 65001)
+    std::strcpy(expected, "UTF-8");
+  else
+    std::snprintf(expected, sizeof(expected), "windows-%u", acp);
+  std::printf("environment = %s, GetACP = %u (expected %s)\n", e.name(), acp, expected);
+  return std::string_view(e.name()) == std::string_view(expected) ? 0 : 1;
 }

@@ -167,6 +167,20 @@ jobs:
         run: |
           P="$(cygpath -m "$PWD/install")"; cd scratch-examples
           "$P/bin/clang-cl.exe" -clang:-std=c++26 -MD -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" probe_macros.cpp -Fe:probe.exe -link "$P/lib/libc++.lib" msvcprt.lib && ./probe.exe
+      - name: Duplicate definitions between the headers and libc++.lib
+        if: steps.runtimes.outcome == 'success'
+        continue-on-error: true
+        env:
+          MSYS2_ARG_CONV_EXCL: "*"
+        run: |
+          P="$(cygpath -m "$PWD/install")"; cd scratch-examples
+          # every inline function of every header is emitted (-fkeep-inline-functions), so that a symbol that libc++.lib also
+          # defines out of line shows up as a duplicate for the linker of COFF
+          "$P/bin/clang-cl.exe" -clang:-std=c++26 -MD -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" -clang:-fkeep-inline-functions \
+            all_headers.cpp -Fe:all_headers.exe -link "$P/lib/libc++.lib" msvcprt.lib -errorlimit:0 > ../diag/duplicates.log 2>&1 || true
+          grep -c "duplicate symbol" ../diag/duplicates.log || true
+          grep "duplicate symbol" ../diag/duplicates.log | sed 's/lld-link: error: duplicate symbol: //' | sort -u | head -150
+          grep -E "error" ../diag/duplicates.log | grep -v "duplicate symbol" | head -10 || true
       - name: Summary
         if: always()
         run: |
