@@ -173,17 +173,21 @@ jobs:
         env:
           MSYS2_ARG_CONV_EXCL: "*"
         run: |
-          P="$(cygpath -m "$PWD/install")"; cd scratch-examples
-          # every inline function of every header is emitted (-fkeep-inline-functions), so that a symbol that libc++.lib also
-          # defines out of line shows up as a duplicate for the linker of COFF
-          "$P/bin/clang-cl.exe" -clang:-std=c++26 -MD -EHsc -Xclang -nostdinc++ -I "$P/include/c++/v1" -Xclang -femit-all-decls \
-            -c all_headers.cpp -Fo:all_headers.obj > dup_compile.log 2>&1 || true
-          echo "compile: $(grep -c 'error' dup_compile.log) errors, object $(stat -c %s all_headers.obj 2>/dev/null || echo missing) bytes"
-          grep -E "error" dup_compile.log | head -5 || true
-          echo "symbols with to_string in the object: $(dumpbin /symbols all_headers.obj 2>/dev/null | grep -c to_string)"
-          "$P/bin/clang-cl.exe" -fuse-ld=lld all_headers.obj -Fe:all_headers.exe -link -wholearchive:"$P/lib/libc++.lib" msvcprt.lib -errorlimit:0 > dup_link.log 2>&1 || true
+          P="$(cygpath -m "$PWD/install")"; cd scratch-examples; mkdir -p dupobj
+          # every header in a translation unit of its own, with every inline function emitted (-femit-all-decls), then all of
+          # them against the whole libc++.lib: a symbol that the headers define inline and the library defines out of line
+          # is a duplicate for the linker of COFF
+          CL="$P/bin/clang-cl.exe"; failed=0
+          for h in $(cat headers.txt); do
+            printf '#include <%s>\n' "$h" > "dup_$h.cpp"
+            "$CL" -clang:-std=c++26 -MD -EHsc -Xclang -nostdinc++ -I "$P/include/c++/v1" -Xclang -femit-all-decls -c "dup_$h.cpp" -Fo:"dupobj/$h.obj" > "dup_$h.log" 2>&1 || { echo "does not compile: $h"; grep -m2 "error" "dup_$h.log"; failed=$((failed+1)); }
+          done
+          echo "compiled $(ls dupobj | wc -l) of $(wc -l < headers.txt) headers, $failed failed"
+          printf 'int main() {}\n' > dup_main.cpp
+          "$CL" -clang:-std=c++26 -MD -EHsc -Xclang -nostdinc++ -I "$P/include/c++/v1" -c dup_main.cpp -Fo:dupobj/main.obj
+          "$CL" -fuse-ld=lld dupobj/*.obj -Fe:dup.exe -link -wholearchive:"$P/lib/libc++.lib" msvcprt.lib -errorlimit:0 > dup_link.log 2>&1 || true
           echo "link: $(grep -c 'duplicate symbol' dup_link.log) duplicate symbols"
-          grep "duplicate symbol" dup_link.log | sed 's/lld-link: error: duplicate symbol: //' | sort -u | head -200
+          grep "duplicate symbol" dup_link.log | sed 's/lld-link: error: duplicate symbol: //' | sort -u | head -300
           grep -E "error" dup_link.log | grep -v "duplicate symbol" | head -10 || true
       - name: Summary
         if: always()
