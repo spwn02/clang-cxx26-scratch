@@ -5342,6 +5342,43 @@ Sema::PerformImplicitConversion(Expr *From, QualType ToType,
                ? diag::err_function_pointer_language_linkage_conversion
                : diag::ext_function_pointer_language_linkage_conversion)
           << From->getType() << ToType << From->getSourceRange();
+    // When a function with C++ language linkage is passed where a pointer to a
+    // function with C language linkage is expected, say how to give the
+    // function C language linkage: that is the way to get the type the callee
+    // asks for.
+    if (!isUnevaluatedContext())
+      if (const auto *ToFn = ToType->getPointeeType()->getAs<FunctionType>())
+        if (ToFn->getExtInfo().getCLanguageLinkage())
+          if (const auto *Ref = dyn_cast<DeclRefExpr>(
+                  [&] {
+                    const Expr *E = From->IgnoreParenImpCasts();
+                    if (const auto *UO = dyn_cast<UnaryOperator>(E))
+                      if (UO->getOpcode() == UO_AddrOf)
+                        E = UO->getSubExpr()->IgnoreParenImpCasts();
+                    return E;
+                  }()))
+            if (const auto *Used = dyn_cast<FunctionDecl>(Ref->getDecl())) {
+              // The language linkage is given by the first declaration:
+              // a redeclaration without a linkage-specification keeps it, and
+              // one with a linkage-specification may not follow a declaration
+              // without one.
+              const FunctionDecl *FD = Used->getFirstDecl();
+              if (!isa<CXXMethodDecl>(FD) && !FD->isExternC() &&
+                  !FD->getDescribedFunctionTemplate() &&
+                  !FD->isTemplateInstantiation() &&
+                  !SourceMgr.isInSystemHeader(FD->getLocation())) {
+                // A declaration directly in a linkage-specification shall not
+                // specify a storage class ([dcl.link]p1): a block is needed.
+                bool NeedsBlock = FD->getStorageClass() != SC_None;
+                SourceLocation Start = FD->getOuterLocStart();
+                auto Note = Diag(
+                    FD->getLocation(),
+                    diag::note_function_language_linkage_declare_extern_c)
+                            << FD << NeedsBlock;
+                if (!NeedsBlock && Start.isValid() && Start.isFileID())
+                  Note << FixItHint::CreateInsertion(Start, "extern \"C\" ");
+              }
+            }
     // The two function types have the same representation.
     From = ImpCastExprToType(From, ToType.getUnqualifiedType(),
                              ToType->isMemberPointerType()

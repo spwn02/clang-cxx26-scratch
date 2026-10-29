@@ -34,8 +34,11 @@ C library and the GCC runtime on the host (`build-essential` on Debian and Ubunt
 headers and `crtbeginS.o`/`libgcc`) and `zstd` to unpack the archive. CMake's `import std` additionally
 needs CMake 4.4 or newer and Ninja 1.11 or newer.
 
-Platform: the published toolchain is Linux x86_64 only. The fork is not inherently tied to it, but no
-other platform is built or tested.
+Platform: the published toolchain is a Linux x86_64 archive. The compiler and libc++ also build from source on
+macOS arm64 (Apple Silicon) and on Windows with the MSVC ABI (`clang-cl`), where six small
+programs (hello world, reflection, expansion statements, contracts, `std::execution` and `<simd>`) compile and run; there are
+no binary releases for them yet. See the
+[FAQ](cxx26/FAQ.md#which-platforms-are-supported) for what was checked and the known issues.
 
 ## Try it
 
@@ -133,14 +136,18 @@ int main() {
 }
 ```
 
-## Deviations from the standard
+## Differences from stock Clang
 
-The deviations are deliberate and documented in `clang/docs/ReleaseNotes.rst`. The one
-that affects ordinary code: function types with C and C++ language linkage are distinct
-types ([dcl.link]), as the standard requires, but converting between pointers to such
-functions is diagnosed with `-Wfunction-type-language-linkage`, an error by default that
-`-Wno-error=function-type-language-linkage` downgrades, and a use inside a system header
-does not tell the linkages apart, so the headers of the host C++ library keep compiling.
+The differences are deliberate and documented in `clang/docs/ReleaseNotes.rst`. The one
+that affects ordinary code is the language linkage of function types. [dcl.link] says that
+function types with C and C++ language linkage are distinct types, so a pointer to a C++
+function does not convert to a pointer to an `extern "C"` function (`atexit`, `qsort`,
+`sigaction`, `pthread_create` and the like). GCC, MSVC and stock Clang accept that code; this
+fork follows the standard and diagnoses it with `-Wfunction-type-language-linkage`, an error by
+default. `-Wno-error=function-type-language-linkage` downgrades it to a warning, which is still
+a diagnostic. The one place where the fork accepts more than the standard does is a system
+header: there the two linkages are not told apart, so that the headers of the host C++ library,
+which assume the old behavior, keep compiling.
 
 This fork preserves upstream LLVM history and the history of its Bloomberg-originated
 reflection implementation. That provenance does not imply Bloomberg endorsement

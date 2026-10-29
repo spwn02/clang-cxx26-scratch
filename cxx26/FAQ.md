@@ -14,8 +14,15 @@ See the [README](../README.md#release). A release is a Linux x86_64 archive: unp
 
 ## Which platforms are supported?
 
-Only Linux x86_64 is built and tested today. The host needs a C library and the GCC runtime (on Debian and Ubuntu,
-`build-essential`). The fork is not inherently tied to Linux or x86, but no other platform is validated.
+The release is a Linux x86_64 archive, and Linux x86_64 is the platform where the whole test suite runs. The host needs
+a C library and the GCC runtime (on Debian and Ubuntu, `build-essential`).
+
+The compiler and libc++ also build from source on two more platforms, checked on GitHub-hosted runners: macOS arm64
+(Apple Silicon, Xcode 15.4) and Windows x64 with the MSVC ABI (`clang-cl`, Visual Studio 2022). On both, six small programs
+(hello world, reflection, expansion statements, contracts, `std::execution`, `<simd>`) compile and run, and on macOS three of the new
+libc++ tests do. There are no binary releases for them, and their test suites have not been run. Two problems of the 10.27 sources are fixed on the `cxx26` branch: Apple's `ld` crashed when linking against the libc++
+of the toolchain ([#350](https://github.com/spwn02/clang-cxx26/issues/350)), and `std::exception_ptr` was not constexpr
+with the MSVC ABI ([#351](https://github.com/spwn02/clang-cxx26/issues/351)).
 
 ## Is this the same as Bloomberg's `clang-p2996`?
 
@@ -31,9 +38,10 @@ of LLVM: Apache-2.0 with the LLVM exception (`LICENSE.TXT`).
 ## What does "C++26" mean here?
 
 The N5050 working draft with the defect reports applied (core and library issues the committee has adopted). Where the
-fork deliberately differs from the draft the difference is listed in "Potentially Breaking Changes" in
-`clang/docs/ReleaseNotes.rst`; the README summarizes the one that affects ordinary code (function types and language
-linkage in system headers).
+fork is stricter than stock Clang, because it implements a rule of the standard that other compilers do not, the change
+is listed in "Potentially Breaking Changes" in `clang/docs/ReleaseNotes.rst`; the README summarizes the one that affects
+ordinary code (function types with C and C++ language linkage are distinct types, [dcl.link]). The only leniency
+beyond the standard is that a system header does not tell the two linkages apart.
 
 ## Will my existing code build?
 
