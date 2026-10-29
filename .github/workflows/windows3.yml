@@ -138,7 +138,7 @@ jobs:
           P="$PWD/install"; cd scratch-examples
           for f in hello reflect expansion contracts execution simd; do
             echo "== $f"
-            "$P/bin/clang-cl.exe" /std:c++latest /EHsc -fuse-ld=lld -Xclang -nostdinc++ -imsvc "$P/include/c++/v1" \
+            "$P/bin/clang-cl.exe" /std:c++latest /EHsc -fuse-ld=lld -Xclang -nostdinc++ /I "$P/include/c++/v1" \
               $f.cpp /Fe:$f.exe -link "$P/lib/c++.lib" && ./$f.exe
           done
       - name: Summary
