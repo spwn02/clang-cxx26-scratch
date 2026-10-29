@@ -71,7 +71,7 @@ jobs:
           P="$PWD/install"; cd scratch-examples; fail=0
           for f in hello reflect expansion contracts execution simd; do
             echo "== $f"
-            if "$P/bin/clang++" -std=c++26 -Wall -Wextra -Wpedantic -Werror -nostdlib++ -isystem "$P/include/c++/v1" \
+            if "$P/bin/clang++" -std=c++26 -Wall -Wextra -Wpedantic -Werror -nostdlib++ -isysroot "$(xcrun --show-sdk-path)" -isystem "$P/include/c++/v1" \
                  -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" $f.cpp -o $f && ./$f; then echo "PASS $f"; else echo "FAIL $f"; fail=1; fi
           done
           exit $fail
@@ -80,6 +80,6 @@ jobs:
           P="$PWD/install"
           for t in std/numerics/c.math/stdfloat_nextafter_exact std/numerics/c.math/stdfloat_fma_single_rounding std/numerics/simd/vectorizable_extended_float; do
             echo "== $t"
-            "$P/bin/clang++" -std=c++26 -O1 -Wall -Wextra -nostdlib++ -isystem "$P/include/c++/v1" -I libcxx/test/support \
+            "$P/bin/clang++" -std=c++26 -O1 -Wall -Wextra -nostdlib++ -isysroot "$(xcrun --show-sdk-path)" -isystem "$P/include/c++/v1" -I libcxx/test/support \
               -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" libcxx/test/$t.pass.cpp -o /tmp/t_$(basename $t) && /tmp/t_$(basename $t) && echo "PASS $t"
           done
