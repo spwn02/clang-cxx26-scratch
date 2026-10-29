@@ -69,7 +69,7 @@ jobs:
       - name: Examples
         run: |
           P="$PWD/install"; cd scratch-examples; fail=0
-          for f in hello reflect expansion contracts execution simd; do
+          for f in hello reflect expansion contracts execution simd constexpr_exception; do
             echo "== $f"
             if "$P/bin/clang++" -std=c++26 -Wall -Wextra -Wpedantic -Werror -fuse-ld=lld -nostdlib++ -isysroot "$(xcrun --show-sdk-path)" -isystem "$P/include/c++/v1" \
                  -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" $f.cpp -o $f && ./$f; then echo "PASS $f"; else echo "FAIL $f"; fail=1; fi
