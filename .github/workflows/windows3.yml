@@ -176,11 +176,15 @@ jobs:
           P="$(cygpath -m "$PWD/install")"; cd scratch-examples
           # every inline function of every header is emitted (-fkeep-inline-functions), so that a symbol that libc++.lib also
           # defines out of line shows up as a duplicate for the linker of COFF
-          "$P/bin/clang-cl.exe" -clang:-std=c++26 -MD -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" -clang:-fkeep-inline-functions \
-            all_headers.cpp -Fe:all_headers.exe -link "$P/lib/libc++.lib" msvcprt.lib -errorlimit:0 > ../diag/duplicates.log 2>&1 || true
-          grep -c "duplicate symbol" ../diag/duplicates.log || true
-          grep "duplicate symbol" ../diag/duplicates.log | sed 's/lld-link: error: duplicate symbol: //' | sort -u | head -150
-          grep -E "error" ../diag/duplicates.log | grep -v "duplicate symbol" | head -10 || true
+          "$P/bin/clang-cl.exe" -clang:-std=c++26 -MD -EHsc -Xclang -nostdinc++ -I "$P/include/c++/v1" -Xclang -fkeep-inline-functions \
+            -c all_headers.cpp -Fo:all_headers.obj > dup_compile.log 2>&1 || true
+          echo "compile: $(grep -c 'error' dup_compile.log) errors, object $(stat -c %s all_headers.obj 2>/dev/null || echo missing) bytes"
+          grep -E "error" dup_compile.log | head -5 || true
+          echo "symbols with to_string in the object: $(dumpbin /symbols all_headers.obj 2>/dev/null | grep -c to_string)"
+          "$P/bin/clang-cl.exe" -fuse-ld=lld all_headers.obj -Fe:all_headers.exe -link "$P/lib/libc++.lib" msvcprt.lib -errorlimit:0 > dup_link.log 2>&1 || true
+          echo "link: $(grep -c 'duplicate symbol' dup_link.log) duplicate symbols"
+          grep "duplicate symbol" dup_link.log | sed 's/lld-link: error: duplicate symbol: //' | sort -u | head -200
+          grep -E "error" dup_link.log | grep -v "duplicate symbol" | head -10 || true
       - name: Summary
         if: always()
         run: |
