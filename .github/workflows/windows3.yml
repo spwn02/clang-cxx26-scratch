@@ -138,7 +138,7 @@ jobs:
           MSYS2_ARG_CONV_EXCL: "*"
         run: |
           P="$(cygpath -m "$PWD/install")"; cd scratch-examples; fail=0
-          for f in hello reflect expansion contracts execution simd constexpr_exception constexpr_math; do
+          for f in hello reflect expansion contracts execution simd constexpr_exception constexpr_math text_encoding_env; do
             echo "== $f"
             if "$P/bin/clang-cl.exe" -clang:-std=c++26 -MD -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" \
                  $f.cpp -Fe:$f.exe -link "$P/lib/libc++.lib" msvcprt.lib && ./$f.exe; then echo "PASS $f"; else echo "FAIL $f"; fail=1; fi
