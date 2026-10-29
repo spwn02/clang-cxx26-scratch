@@ -75,6 +75,12 @@ jobs:
                  -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" $f.cpp -o $f && ./$f; then echo "PASS $f"; else echo "FAIL $f"; fail=1; fi
           done
           exit $fail
+      - name: Apple ld (not fatal)
+        continue-on-error: true
+        run: |
+          P="$PWD/install"; cd scratch-examples
+          "$P/bin/clang++" -std=c++26 -nostdlib++ -isysroot "$(xcrun --show-sdk-path)" -isystem "$P/include/c++/v1" \
+            -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" hello.cpp -o hello_ld && ./hello_ld && echo "PASS apple-ld"
       - name: libc++ tests of the fixes
         run: |
           P="$PWD/install"
