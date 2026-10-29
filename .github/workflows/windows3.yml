@@ -181,7 +181,7 @@ jobs:
           echo "compile: $(grep -c 'error' dup_compile.log) errors, object $(stat -c %s all_headers.obj 2>/dev/null || echo missing) bytes"
           grep -E "error" dup_compile.log | head -5 || true
           echo "symbols with to_string in the object: $(dumpbin /symbols all_headers.obj 2>/dev/null | grep -c to_string)"
-          "$P/bin/clang-cl.exe" -fuse-ld=lld all_headers.obj -Fe:all_headers.exe -link "$P/lib/libc++.lib" msvcprt.lib -errorlimit:0 > dup_link.log 2>&1 || true
+          "$P/bin/clang-cl.exe" -fuse-ld=lld all_headers.obj -Fe:all_headers.exe -link -wholearchive:"$P/lib/libc++.lib" msvcprt.lib -errorlimit:0 > dup_link.log 2>&1 || true
           echo "link: $(grep -c 'duplicate symbol' dup_link.log) duplicate symbols"
           grep "duplicate symbol" dup_link.log | sed 's/lld-link: error: duplicate symbol: //' | sort -u | head -200
           grep -E "error" dup_link.log | grep -v "duplicate symbol" | head -10 || true
