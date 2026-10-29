@@ -189,6 +189,7 @@ jobs:
           echo "link: $(grep -c 'duplicate symbol' dup_link.log) duplicate symbols"
           grep "duplicate symbol" dup_link.log | sed 's/lld-link: error: duplicate symbol: //' | sort -u | head -300
           grep -E "error" dup_link.log | grep -v "duplicate symbol" | head -10 || true
+          test "$(grep -c "duplicate symbol" dup_link.log)" = 0
       - name: Summary
         if: always()
         run: |
