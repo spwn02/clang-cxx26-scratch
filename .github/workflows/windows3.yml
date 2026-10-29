@@ -144,6 +144,21 @@ jobs:
                  $f.cpp -Fe:$f.exe -link "$P/lib/libc++.lib" msvcprt.lib && ./$f.exe; then echo "PASS $f"; else echo "FAIL $f"; fail=1; fi
           done
           exit $fail
+      - name: exception_ptr in two language modes
+        id: modes
+        if: steps.runtimes.outcome == 'success'
+        continue-on-error: true
+        env:
+          MSYS2_ARG_CONV_EXCL: "*"
+        run: |
+          P="$(cygpath -m "$PWD/install")"; cd scratch-examples; fail=0
+          CL="$P/bin/clang-cl.exe"
+          echo "== exc23 (C++23 client)"
+          "$CL" -clang:-std=c++23 -MD -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" exc23.cpp -Fe:exc23.exe -link "$P/lib/libc++.lib" msvcprt.lib && ./exc23.exe || fail=1
+          echo "== mixed (C++26 and C++23 translation units)"
+          "$CL" -clang:-std=c++26 -MD -EHsc -Xclang -nostdinc++ -I "$P/include/c++/v1" -c tu26.cpp -Fo:tu26.obj \
+            && "$CL" -clang:-std=c++23 -MD -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" tu23.cpp tu26.obj -Fe:mixed.exe -link "$P/lib/libc++.lib" msvcprt.lib && ./mixed.exe || fail=1
+          exit $fail
       - name: Summary
         if: always()
         run: |
@@ -152,4 +167,5 @@ jobs:
             echo "- compiler cache hit: ${{ steps.compiler.outputs.cache-hit }}"
             echo "- libc++ build: ${{ steps.runtimes.outcome }}"
             echo "- examples: ${{ steps.examples.outcome }}"
+            echo "- exception_ptr modes: ${{ steps.modes.outcome }}"
           } >> "$GITHUB_STEP_SUMMARY"
