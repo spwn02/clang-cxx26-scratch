@@ -71,40 +71,15 @@ jobs:
           P="$PWD/install"; cd scratch-examples; fail=0
           for f in hello reflect expansion contracts execution simd; do
             echo "== $f"
-            if "$P/bin/clang++" -std=c++26 -Wall -Wextra -Wpedantic -Werror -nostdlib++ -isysroot "$(xcrun --show-sdk-path)" -isystem "$P/include/c++/v1" \
+            if "$P/bin/clang++" -std=c++26 -Wall -Wextra -Wpedantic -Werror -fuse-ld=lld -nostdlib++ -isysroot "$(xcrun --show-sdk-path)" -isystem "$P/include/c++/v1" \
                  -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" $f.cpp -o $f && ./$f; then echo "PASS $f"; else echo "FAIL $f"; fail=1; fi
           done
           exit $fail
-      - name: Diagnose the linker crash
-        if: always()
-        run: |
-          P="$PWD/install"
-          env | grep -iE 'DYLD|LIBRARY_PATH|SDKROOT' || echo "no DYLD/LIBRARY_PATH/SDKROOT in env"
-          otool -D "$P/lib/libc++.1.dylib" || true
-          otool -L "$P/lib/libc++.1.dylib" || true
-          nm -gU "$P/lib/libc++.1.dylib" | grep -c . || true
-          nm -gU "$P/lib/libc++.1.dylib" | grep -E "shared_weak_count" | head -5 || echo "no shared_weak_count symbols exported"
-          nm -gU /usr/lib/libc++.1.dylib 2>/dev/null | grep -E "shared_weak_countD2" | head -3 || true
-          cd scratch-examples
-          "$P/bin/clang++" -v -std=c++26 -nostdlib++ -isysroot "$(xcrun --show-sdk-path)" -isystem "$P/include/c++/v1" -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" hello.cpp -o hello 2>&1 | tail -12 || true
-      - name: Linker variants
-        if: always()
-        run: |
-          P="$PWD/install"; cd scratch-examples
-          otool -L "$P/lib/libLTO.dylib" | head -8 || true
-          otool -l "$P/lib/libLTO.dylib" | grep -A2 LC_RPATH || true
-          ls -la "$P/lib" | grep -iE "LTO|libc\+\+" || true
-          SDK="$(xcrun --show-sdk-path)"
-          B="$P/bin/clang++ -std=c++26 -nostdlib++ -isysroot $SDK -isystem $P/include/c++/v1 -L$P/lib -lc++ -lc++abi -Wl,-rpath,$P/lib"
-          echo "== A: lld"; $B -fuse-ld=lld hello.cpp -o helloA && ./helloA && echo "PASS A"
-          echo "== B: apple ld, no lto plugin"; $B -Wl,-no_lto_library hello.cpp -o helloB 2>&1 | tail -3; ./helloB && echo "PASS B"
-          echo "== C: DYLD_PRINT_LIBRARIES"; DYLD_PRINT_LIBRARIES=1 /usr/bin/ld -v 2>&1 | grep -E "libc\+\+|libtapi|libLTO" | head -8
-          echo "== D: apple ld with the fork libLTO"; $B hello.cpp -o helloD 2>&1 | tail -2
       - name: libc++ tests of the fixes
         run: |
           P="$PWD/install"
           for t in std/numerics/c.math/stdfloat_nextafter_exact std/numerics/c.math/stdfloat_fma_single_rounding std/numerics/simd/vectorizable_extended_float; do
             echo "== $t"
-            "$P/bin/clang++" -std=c++26 -O1 -Wall -Wextra -nostdlib++ -isysroot "$(xcrun --show-sdk-path)" -isystem "$P/include/c++/v1" -I libcxx/test/support \
+            "$P/bin/clang++" -std=c++26 -O1 -Wall -Wextra -fuse-ld=lld -nostdlib++ -isysroot "$(xcrun --show-sdk-path)" -isystem "$P/include/c++/v1" -I libcxx/test/support \
               -L"$P/lib" -lc++ -lc++abi -Wl,-rpath,"$P/lib" libcxx/test/$t.pass.cpp -o /tmp/t_$(basename $t) && /tmp/t_$(basename $t) && echo "PASS $t"
           done
