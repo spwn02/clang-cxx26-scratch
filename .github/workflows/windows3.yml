@@ -134,13 +134,16 @@ jobs:
         id: examples
         if: steps.runtimes.outcome == 'success'
         continue-on-error: true
+        env:
+          MSYS2_ARG_CONV_EXCL: "*"
         run: |
-          P="$PWD/install"; cd scratch-examples
+          P="$PWD/install"; cd scratch-examples; fail=0
           for f in hello reflect expansion contracts execution simd; do
             echo "== $f"
-            "$P/bin/clang-cl.exe" /std:c++latest /EHsc -fuse-ld=lld -Xclang -nostdinc++ /I "$P/include/c++/v1" \
-              $f.cpp /Fe:$f.exe -link "$P/lib/c++.lib" && ./$f.exe
+            if "$P/bin/clang-cl.exe" -clang:-std=c++26 -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" \
+                 $f.cpp -Fe:$f.exe -link "$P/lib/libc++.lib" && ./$f.exe; then echo "PASS $f"; else echo "FAIL $f"; fail=1; fi
           done
+          exit $fail
       - name: Summary
         if: always()
         run: |
