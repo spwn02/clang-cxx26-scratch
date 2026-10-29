@@ -159,6 +159,14 @@ jobs:
           "$CL" -clang:-std=c++26 -MD -EHsc -Xclang -nostdinc++ -I "$P/include/c++/v1" -c tu26.cpp -Fo:tu26.obj \
             && "$CL" -clang:-std=c++23 -MD -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" tu23.cpp tu26.obj -Fe:mixed.exe -link "$P/lib/libc++.lib" msvcprt.lib && ./mixed.exe || fail=1
           exit $fail
+      - name: Probe the constexpr exception_ptr gate
+        if: steps.runtimes.outcome == 'success'
+        continue-on-error: true
+        env:
+          MSYS2_ARG_CONV_EXCL: "*"
+        run: |
+          P="$(cygpath -m "$PWD/install")"; cd scratch-examples
+          "$P/bin/clang-cl.exe" -clang:-std=c++26 -MD -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" probe_macros.cpp -Fe:probe.exe -link "$P/lib/libc++.lib" msvcprt.lib && ./probe.exe
       - name: Summary
         if: always()
         run: |
