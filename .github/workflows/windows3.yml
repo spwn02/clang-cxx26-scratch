@@ -178,7 +178,7 @@ jobs:
           # them against the whole libc++.lib: a symbol that the headers define inline and the library defines out of line
           # is a duplicate for the linker of COFF
           CL="$P/bin/clang-cl.exe"; failed=0
-          for h in $(cat headers.txt); do
+          for h in $(tr -d "\r" < headers.txt); do
             printf '#include <%s>\n' "$h" > "dup_$h.cpp"
             "$CL" -clang:-std=c++26 -MD -EHsc -Xclang -nostdinc++ -I "$P/include/c++/v1" -Xclang -femit-all-decls -c "dup_$h.cpp" -Fo:"dupobj/$h.obj" > "dup_$h.log" 2>&1 || { echo "does not compile: $h"; grep -m2 "error" "dup_$h.log"; failed=$((failed+1)); }
           done
