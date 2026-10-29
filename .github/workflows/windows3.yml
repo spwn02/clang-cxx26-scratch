@@ -137,7 +137,7 @@ jobs:
         env:
           MSYS2_ARG_CONV_EXCL: "*"
         run: |
-          P="$PWD/install"; cd scratch-examples; fail=0
+          P="$(cygpath -m "$PWD/install")"; cd scratch-examples; fail=0
           for f in hello reflect expansion contracts execution simd; do
             echo "== $f"
             if "$P/bin/clang-cl.exe" -clang:-std=c++26 -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" \
