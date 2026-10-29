@@ -172,7 +172,8 @@ jobs:
         run: |
           P="$(cygpath -m "$PWD/install")"; cd scratch-examples; fail=0
           CL="$P/bin/clang-cl.exe"
-          for std in c++26 c++20 c++17 c++14 c++11 c++03; do
+          # C++03 is not a mode there: vcruntime_new.h of Visual Studio itself needs noexcept (checked: it fails before libc++ is involved).
+          for std in c++26 c++20 c++17 c++14 c++11; do
             echo "== $std"
             if "$CL" -clang:-std=$std -MD -EHsc -fuse-ld=lld -Xclang -nostdinc++ -I "$P/include/c++/v1" stdmodes_a.cpp stdmodes_b.cpp -Fe:sm.exe -link "$P/lib/libc++.lib" msvcprt.lib && ./sm.exe; then echo "PASS $std"; else echo "FAIL $std"; fail=1; fi
           done
@@ -209,7 +210,7 @@ jobs:
           "$CL" -clang:-std=c++26 -MD -EHsc -Xclang -nostdinc++ -I "$P/include/c++/v1" -c dup_main.cpp -Fo:dupobj/main.obj
           "$CL" -fuse-ld=lld dupobj/*.obj -Fe:dup.exe -link -wholearchive:"$P/lib/libc++.lib" msvcprt.lib -errorlimit:0 > dup_link.log 2>&1 || true
           echo "link: $(grep -c 'duplicate symbol' dup_link.log) duplicate symbols"
-          grep "duplicate symbol" dup_link.log | sed 's/lld-link: error: duplicate symbol: //' | sort -u | head -300
+          { grep "duplicate symbol" dup_link.log || true; } | sed 's/lld-link: error: duplicate symbol: //' | sort -u | head -300
           grep -E "error" dup_link.log | grep -v "duplicate symbol" | head -10 || true
           test "$(grep -c "duplicate symbol" dup_link.log)" = 0
       - name: Summary
