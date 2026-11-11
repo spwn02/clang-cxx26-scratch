@@ -152,7 +152,7 @@ jobs:
           path: |
             diag
             net-tests.log
-            /tmp/nettests/*/*.log
+            nettests/*/*.log
       - name: Gate
         if: always()
         run: |
