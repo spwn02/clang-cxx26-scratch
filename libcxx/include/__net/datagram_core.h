@@ -56,74 +56,35 @@ class __datagram_socket_base : public __socket_core {
     const_buffer __bufs[__sock_max_buffers];
     size_t __n            = io::__collect_buffers(__seq, __bufs);
     __sockaddr_buf __addr = io::__to_sockaddr(__dest);
-    for (;;) {
-      size_t __got    = 0;
-      error_code __ec = io::__sock_send_to(native_handle(), __bufs, __n, static_cast<int>(__flags), &__addr, __got);
-      if (!__ec)
-        co_return io_result<size_t>(error_code(), __got);
-      if (!io::__is_would_block(__ec))
-        co_return io_result<size_t>(__ec, 0);
-      auto [__wec, __ev] = co_await __wait_for(__poll_write);
-      if (__wec)
-        co_return io_result<size_t>(__wec, 0);
-    }
+    __sock_xfer __x       = co_await this->__io_send(__bufs, __n, static_cast<int>(__flags), &__addr);
+    co_return io_result<size_t>(__x.__ec_, __x.__ec_ ? 0 : __x.__n_);
   }
 
   template <class _Seq>
   _LIBCPP_HIDE_FROM_ABI task<io_result<size_t>> __send_op(_Seq __seq, message_flags __flags) {
     const_buffer __bufs[__sock_max_buffers];
-    size_t __n = io::__collect_buffers(__seq, __bufs);
-    for (;;) {
-      size_t __got    = 0;
-      error_code __ec = io::__sock_send_to(native_handle(), __bufs, __n, static_cast<int>(__flags), nullptr, __got);
-      if (!__ec)
-        co_return io_result<size_t>(error_code(), __got);
-      if (!io::__is_would_block(__ec))
-        co_return io_result<size_t>(__ec, 0);
-      auto [__wec, __ev] = co_await __wait_for(__poll_write);
-      if (__wec)
-        co_return io_result<size_t>(__wec, 0);
-    }
+    size_t __n      = io::__collect_buffers(__seq, __bufs);
+    __sock_xfer __x = co_await this->__io_send(__bufs, __n, static_cast<int>(__flags), nullptr);
+    co_return io_result<size_t>(__x.__ec_, __x.__ec_ ? 0 : __x.__n_);
   }
 
   template <class _Seq>
   _LIBCPP_HIDE_FROM_ABI task<io_result<size_t>> __receive_from_op(_Seq __seq, _Ep& __source, message_flags __flags) {
     mutable_buffer __bufs[__sock_max_buffers];
-    size_t __n = io::__collect_buffers(__seq, __bufs);
-    for (;;) {
-      size_t __got = 0;
-      __sockaddr_buf __from;
-      error_code __ec =
-          io::__sock_receive_from(native_handle(), __bufs, __n, static_cast<int>(__flags), __from, __got);
-      if (!__ec) {
-        __source = __to_endpoint(__from);
-        co_return io_result<size_t>(error_code(), __got);
-      }
-      if (!io::__is_would_block(__ec))
-        co_return io_result<size_t>(__ec, 0);
-      auto [__wec, __ev] = co_await __wait_for(__poll_read);
-      if (__wec)
-        co_return io_result<size_t>(__wec, 0);
-    }
+    size_t __n      = io::__collect_buffers(__seq, __bufs);
+    __sock_xfer __x = co_await this->__io_receive(__bufs, __n, static_cast<int>(__flags), true);
+    if (__x.__ec_)
+      co_return io_result<size_t>(__x.__ec_, 0);
+    __source = __to_endpoint(__x.__from_);
+    co_return io_result<size_t>(error_code(), __x.__n_);
   }
 
   template <class _Seq>
   _LIBCPP_HIDE_FROM_ABI task<io_result<size_t>> __receive_op(_Seq __seq, message_flags __flags) {
     mutable_buffer __bufs[__sock_max_buffers];
-    size_t __n = io::__collect_buffers(__seq, __bufs);
-    for (;;) {
-      size_t __got = 0;
-      __sockaddr_buf __from;
-      error_code __ec =
-          io::__sock_receive_from(native_handle(), __bufs, __n, static_cast<int>(__flags), __from, __got);
-      if (!__ec)
-        co_return io_result<size_t>(error_code(), __got);
-      if (!io::__is_would_block(__ec))
-        co_return io_result<size_t>(__ec, 0);
-      auto [__wec, __ev] = co_await __wait_for(__poll_read);
-      if (__wec)
-        co_return io_result<size_t>(__wec, 0);
-    }
+    size_t __n      = io::__collect_buffers(__seq, __bufs);
+    __sock_xfer __x = co_await this->__io_receive(__bufs, __n, static_cast<int>(__flags), false);
+    co_return io_result<size_t>(__x.__ec_, __x.__ec_ ? 0 : __x.__n_);
   }
 
 protected:

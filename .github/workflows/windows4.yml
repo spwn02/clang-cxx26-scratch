@@ -1,0 +1,134 @@
+name: Windows x64 networking (scratch)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# a newer run of this workflow replaces an older one that is still going
+concurrency:
+  group: windows-net
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64 (compiler cache, then libc++)
+    runs-on: windows-2022
+    timeout-minutes: 350
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 4G
+      CCACHE_COMPILERCHECK: content
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 1 }
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      # layer 1: the finished compiler. Its key is the content of the compiler sources, so a change to the libc++
+      # sources (the case being worked on) finds it and skips the 90 minute build altogether.
+      - name: Restore the finished compiler
+        id: compiler
+        uses: actions/cache/restore@v4
+        with:
+          path: install
+          key: win-compiler-${{ hashFiles('clang/include/**', 'clang/lib/**', 'clang/tools/**', 'clang/utils/**', 'llvm/include/**', 'llvm/lib/**', 'llvm/tools/**', 'lld/**', 'cmake/**', 'CMakeLists.txt') }}
+
+      # layer 2: ccache, restored from the newest earlier cache when the compiler sources did change, so that only the
+      # files that changed are compiled again.
+      - name: Restore ccache
+        if: steps.compiler.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: win-ccache-${{ github.run_id }}
+          restore-keys: |
+            win-ccache-
+
+      - name: Tools
+        run: |
+          choco install ccache -y --no-progress >/dev/null || true
+          cmake --version; ninja --version || choco install ninja -y; cl 2>&1 | head -1; ccache --version | head -1; nproc
+
+      - name: Configure the compiler
+        id: configure
+        if: steps.compiler.outputs.cache-hit != 'true'
+        run: |
+          cmake -S llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/install" \
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=2
+      - name: Build the compiler
+        id: build
+        if: steps.compiler.outputs.cache-hit != 'true'
+        run: cmake --build build --target clang lld -- -k 0
+      - name: Install the compiler
+        id: install
+        if: steps.compiler.outputs.cache-hit != 'true'
+        run: cmake --build build --target install-clang install-clang-resource-headers install-lld
+
+      # saved as soon as it exists, not at the end of the job, so that it survives whatever the libc++ stage does
+      - name: Save the finished compiler
+        if: steps.compiler.outputs.cache-hit != 'true' && steps.install.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: install
+          key: win-compiler-${{ hashFiles('clang/include/**', 'clang/lib/**', 'clang/tools/**', 'clang/utils/**', 'llvm/include/**', 'llvm/lib/**', 'llvm/tools/**', 'lld/**', 'cmake/**', 'CMakeLists.txt') }}
+      - name: Save ccache
+        if: always() && steps.compiler.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: win-ccache-${{ github.run_id }}
+
+      - name: The compiler is usable
+        run: |
+          ls install/bin | head
+          install/bin/clang-cl.exe --version
+
+      - name: Build libc++ with the new compiler
+        id: runtimes
+        continue-on-error: true
+        run: |
+          P="$PWD/install"
+          cmake -S runtimes -B build-rt -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$P" \
+            -DCMAKE_C_COMPILER="$P/bin/clang-cl.exe" -DCMAKE_CXX_COMPILER="$P/bin/clang-cl.exe" \
+            -DCMAKE_LINKER="$P/bin/lld-link.exe" \
+            -DLLVM_ENABLE_RUNTIMES="libcxx" -DLIBCXX_ENABLE_SHARED=OFF \
+            -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_BENCHMARKS=OFF -DLIBCXX_INSTALL_MODULES=ON
+          mkdir -p diag
+          set +e
+          cmake --build build-rt --target install-cxx install-cxx-modules -- -k 0 > diag/libcxx-build.log 2>&1
+          rc=$?
+          set -e
+          grep -E 'FAILED:|error:' diag/libcxx-build.log | head -80 || true
+          exit $rc
+      - name: Networking tests (experimental, IOCP)
+        id: net
+        if: steps.runtimes.outcome == 'success'
+        continue-on-error: true
+        run: |
+          P="$(cygpath -m "$PWD/install")"
+          scratch-examples/run_net_tests_win.sh "$P" 2>&1 | tee net-tests.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-net-logs
+          path: |
+            diag
+            net-tests.log
+            /tmp/nettests/*.log
+      - name: Gate
+        if: always()
+        run: |
+          echo "libc++ ${{ steps.runtimes.outcome }}, net ${{ steps.net.outcome }}"
+          test "${{ steps.runtimes.outcome }}" = success && test "${{ steps.net.outcome }}" = success
