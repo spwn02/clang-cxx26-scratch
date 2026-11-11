@@ -146,14 +146,6 @@ jobs:
             grep -v "^PASS\|^SKIP" "net-tests-$b.log" || true
           done
           exit $rc
-      - name: Trace of a failing test
-        if: always()
-        continue-on-error: true
-        run: |
-          for b in iocp; do
-            _LIBCPP_IO_BACKEND=$b _LIBCPP_IO_TRACE=1 ./nettests/$b/libcxx_test_std_net_cancel_inline.pass.cpp.exe > trace.log 2>&1 || true
-            head -60 trace.log
-          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
