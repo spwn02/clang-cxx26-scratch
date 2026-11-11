@@ -112,6 +112,26 @@ jobs:
           set -e
           grep -E 'FAILED:|error:' diag/libcxx-build.log | head -80 || true
           exit $rc
+      - name: Probe the networking configuration
+        id: probe
+        if: steps.runtimes.outcome == 'success'
+        continue-on-error: true
+        env:
+          MSYS2_ARG_CONV_EXCL: "*"
+        run: |
+          P="$(cygpath -m "$PWD/install")"; cd scratch-examples
+          command -v timeout || true; /usr/bin/timeout --version | head -1 || true; command -v perl || true
+          cat > probe_net.cpp <<'PROBE'
+          #include <io_context>
+          #include <io_file>
+          #include <io_signal>
+          #include <net>
+          static_assert(_LIBCPP_HAS_IO_WINSOCK && _LIBCPP_HAS_IO_IOCP && _LIBCPP_HAS_IO_SOCKETS && _LIBCPP_HAS_IO_FILES &&
+                        _LIBCPP_HAS_IO_POSIX_SIGNALS && _LIBCPP_HAS_IO_REACTOR);
+          int main() {}
+          PROBE
+          "$P/bin/clang-cl.exe" -clang:-std=c++29 -MD -EHsc -w -Xclang -fexperimental-library -Xclang -nostdinc++ -I "$P/include/c++/v1" -c probe_net.cpp -Fo:probe_net.obj 2>&1 | head -60
+          test -f probe_net.obj
       - name: Networking tests (experimental, IOCP)
         id: net
         if: steps.runtimes.outcome == 'success'

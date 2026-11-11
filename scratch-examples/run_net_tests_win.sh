@@ -7,6 +7,8 @@ fail=0; pass=0; skipped=0
 out=/tmp/nettests/${_LIBCPP_IO_BACKEND:-auto}; mkdir -p $out
 export MSYS2_ARG_CONV_EXCL="*"
 CL="$P/bin/clang-cl.exe"
+# the coreutils timeout of Git for Windows, not timeout.exe of Windows; perl's alarm if there is none
+with_timeout() { if /usr/bin/timeout --version >/dev/null 2>&1; then /usr/bin/timeout 90 "$@"; else perl -e 'alarm shift; exec @ARGV' 90 "$@"; fi; }
 for d in $dirs; do
   for f in libcxx/test/std/$d/*.pass.cpp libcxx/test/libcxx/$d/*.pass.cpp; do
     [ -f "$f" ] || continue
@@ -23,7 +25,7 @@ for d in $dirs; do
       continue
     fi
     if "$CL" $flags $common -fuse-ld=lld "$f" -Fe:"$out/$n.exe" -link "$P/lib/libc++.lib" msvcprt.lib ws2_32.lib > "$out/$n.compile.log" 2>&1; then
-      if (cd "$out" && timeout 90 "./$n.exe" > "$out/$n.run.log" 2>&1); then echo "PASS $f"; pass=$((pass+1)); else echo "FAIL(run) $f"; tail -5 "$out/$n.run.log"; fail=$((fail+1)); fi
+      if (cd "$out" && with_timeout "./$n.exe" > "$out/$n.run.log" 2>&1); then echo "PASS $f"; pass=$((pass+1)); else echo "FAIL(run) $f"; tail -5 "$out/$n.run.log"; fail=$((fail+1)); fi
     else echo "FAIL(compile) $f"; grep -E "error" "$out/$n.compile.log" | head -5; fail=$((fail+1)); fi
   done
 done
