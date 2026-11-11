@@ -118,7 +118,13 @@ jobs:
         continue-on-error: true
         run: |
           P="$(cygpath -m "$PWD/install")"
-          scratch-examples/run_net_tests_win.sh "$P" 2>&1 | tee net-tests.log
+          rc=0
+          for b in winsock iocp; do
+            echo "=== backend $b"
+            _LIBCPP_IO_BACKEND=$b scratch-examples/run_net_tests_win.sh "$P" 2>&1 | tee -a net-tests.log
+            [ "${PIPESTATUS[0]}" = 0 ] || rc=1
+          done
+          exit $rc
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -126,7 +132,7 @@ jobs:
           path: |
             diag
             net-tests.log
-            /tmp/nettests/*.log
+            /tmp/nettests/*/*.log
       - name: Gate
         if: always()
         run: |

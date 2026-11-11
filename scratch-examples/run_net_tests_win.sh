@@ -4,7 +4,7 @@
 P="$1"; shift
 dirs="${*:-io io_buffer io_stream io_bridge io_context io_timer io_signal net io_file net_tls}"
 fail=0; pass=0; skipped=0
-out=/tmp/nettests; mkdir -p $out
+out=/tmp/nettests/${_LIBCPP_IO_BACKEND:-auto}; mkdir -p $out
 export MSYS2_ARG_CONV_EXCL="*"
 CL="$P/bin/clang-cl.exe"
 for d in $dirs; do
