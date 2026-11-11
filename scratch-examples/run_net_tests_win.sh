@@ -11,9 +11,7 @@ for d in $dirs; do
   for f in libcxx/test/std/$d/*.pass.cpp libcxx/test/libcxx/$d/*.pass.cpp; do
     [ -f "$f" ] || continue
     if grep -qE '^// UNSUPPORTED:.*(windows|msvc|mingw)' "$f"; then echo "SKIP $f"; skipped=$((skipped+1)); continue; fi
-    if grep -qE '^// REQUIRES:' "$f" && ! grep -E '^// REQUIRES:' "$f" | grep -qE 'windows|std-at-least|msvc-abi|no-' ; then
-      if grep -qE '^// REQUIRES:.*(linux|darwin|freebsd|io-backend)' "$f"; then echo "SKIP(not windows) $f"; skipped=$((skipped+1)); continue; fi
-    fi
+    if grep -E '^// REQUIRES:' "$f" | grep -E 'linux|darwin|freebsd|io-backend' | grep -qvE 'windows'; then echo "SKIP(not windows) $f"; skipped=$((skipped+1)); continue; fi
     if grep -qE '^// UNSUPPORTED:.*c\+\+29' "$f"; then echo "SKIP(not c++29) $f"; skipped=$((skipped+1)); continue; fi
     n=$(echo "$f" | tr '/' '_')
     flags="-Xclang -fexperimental-library"
