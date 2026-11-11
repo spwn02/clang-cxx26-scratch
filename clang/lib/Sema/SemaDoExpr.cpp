@@ -1,0 +1,885 @@
+//===--- SemaDoExpr.cpp - Semantic Analysis for do-expressions ----------*-===//
+//
+// Copyright 2026 Jump Trading, LLC
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+//  Implements semantic analysis for do-expressions:
+//  `do [init-capture-seq[opt]] -> Type { ... }`, with `do_return` yielding
+//  the value. Each `[name = init]` capture introduces a `decltype((init))`
+//  local (the value category of the initializer is preserved).
+//
+//===----------------------------------------------------------------------===//
+
+#include "clang/AST/Expr.h"
+#include "clang/AST/ExprCXX.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtCXX.h"
+#include "clang/Analysis/Analyses/ReachableCode.h"
+#include "clang/Analysis/CFG.h"
+#include "clang/Basic/DiagnosticSema.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Sema/Initialization.h"
+#include "clang/Sema/Sema.h"
+#include "llvm/ADT/BitVector.h"
+
+using namespace clang;
+
+static bool doExprHasDeducedResultType(const Sema::DoExprStackEntry &Entry) {
+  return !Entry.TypeIsExplicit || Entry.ExplicitType->getContainedAutoType();
+}
+
+/// Does \p E name a variable that belongs to the body of the do-expression
+/// described by \p Entry (or to a block scope nested inside it)?
+///
+/// [expr.prim.id.unqual]p15.4, as added by P2806, makes that the condition for
+/// a `do_return` operand to be move-eligible. A variable of the *enclosing*
+/// function fails it: the do-expression ends but the variable does not, so it
+/// can still be read afterwards and must be copied.
+///
+/// The test compares source positions rather than walking the parser's Scope
+/// chain because this also runs during template instantiation, where the body
+/// has no Scope but the instantiated declarations keep the pattern's
+/// locations. The positions are compared as they are, not mapped to their
+/// expansion locations first: isBeforeInTranslationUnit already orders a
+/// location inside a macro expansion relative to one outside it (a body local
+/// introduced by a macro is after the `do`), and when the `do` and the
+/// variable come from the *same* expansion -- a do-expression written in a
+/// macro body -- only their offsets within that expansion tell them apart;
+/// their expansion locations are one and the same point.
+static bool namesDoExprBodyLocal(const Expr *E,
+                                 const Sema::DoExprStackEntry &Entry,
+                                 const SourceManager &SM) {
+  const auto *DR = dyn_cast<DeclRefExpr>(E->IgnoreParens());
+  if (!DR)
+    return false;
+  const auto *VD = dyn_cast<VarDecl>(DR->getDecl());
+  if (!VD || !VD->hasLocalStorage())
+    return false;
+  return SM.isBeforeInTranslationUnit(Entry.DoLoc, VD->getLocation());
+}
+
+static bool isParsingExpansionStmtPattern(Sema &S) {
+  if (S.isSynthesizingExpansionStmt())
+    return false;
+
+  for (DeclContext *DC = S.CurContext; DC; DC = DC->getParent())
+    if (isa<ExpansionStmtDecl>(DC))
+      return true;
+  return false;
+}
+
+static VarDecl *findFirstVarDecl(Stmt *S) {
+  if (!S)
+    return nullptr;
+
+  if (auto *DS = dyn_cast<DeclStmt>(S)) {
+    for (Decl *D : DS->decls())
+      if (auto *VD = dyn_cast<VarDecl>(D))
+        return VD;
+    return nullptr;
+  }
+
+  for (Stmt *Sub : S->children())
+    if (auto *VD = findFirstVarDecl(Sub))
+      return VD;
+
+  return nullptr;
+}
+
+enum class ConstevalIfKind {
+  AlwaysConstantEvaluated,
+  NeverConstantEvaluated,
+  PotentiallyConstantEvaluated,
+};
+
+static ConstevalIfKind getConstevalIfKind(Sema &S) {
+  if (S.isConstantEvaluatedContext() ||
+      S.currentEvaluationContext().isImmediateFunctionContext())
+    return ConstevalIfKind::AlwaysConstantEvaluated;
+
+  if (const auto *FD = dyn_cast<FunctionDecl>(S.CurContext)) {
+    if (FD->isConsteval())
+      return ConstevalIfKind::AlwaysConstantEvaluated;
+    if (FD->isConstexpr())
+      return ConstevalIfKind::PotentiallyConstantEvaluated;
+  }
+
+  return ConstevalIfKind::NeverConstantEvaluated;
+}
+
+static CFG::BuildOptions::ConstevalConditionKind
+toConstevalConditionKind(ConstevalIfKind Kind) {
+  switch (Kind) {
+  case ConstevalIfKind::AlwaysConstantEvaluated:
+    return CFG::BuildOptions::CCK_AlwaysConstant;
+  case ConstevalIfKind::NeverConstantEvaluated:
+    return CFG::BuildOptions::CCK_NeverConstant;
+  case ConstevalIfKind::PotentiallyConstantEvaluated:
+    return CFG::BuildOptions::CCK_Unknown;
+  }
+  llvm_unreachable("unhandled ConstevalIfKind");
+}
+
+/// Return true if control may fall off the end of a do-expression body \p Body
+/// (rather than always exiting via `do_return`, an outer-scope
+/// `return`/`break`/`continue`/`goto`, a `throw`, or a call to a `[[noreturn]]`
+/// function).
+///
+/// Reachability is computed from a CFG built in do-expression-body mode (so
+/// escaping `break`/`continue` and `do_return` are modeled as edges to the
+/// exit block, and nested do-expressions are opaque). This reuses the same
+/// graph construction that powers -Wreturn-type, so `&&`/`||`, `?:`, constant
+/// loop conditions, and `if constexpr`/`if consteval` pruning are all handled
+/// accurately. It is deliberately *stricter* than -Wreturn-type for a `switch`
+/// that covers every enumerator of its enumeration; see the note on
+/// AssumeReachableDefaultInSwitchStatements below.
+static bool doExprBodyMayFallThrough(Sema &S, CompoundStmt *Body,
+                                     ConstevalIfKind ConstevalKind) {
+  CFG::BuildOptions Options;
+  Options.DoExpressionBody = true;
+  Options.PruneTriviallyFalseEdges = true;
+  Options.AddEHEdges = false;
+  Options.ConstevalCondition = toConstevalConditionKind(ConstevalKind);
+  // Covering every enumerator of a `switch` does not prove the `switch` cannot
+  // fall through: an enumeration can hold values outside its enumerator set,
+  // and always can when it has a fixed underlying type. Keep the implicit
+  // default edge reachable so that
+  //
+  //   enum Color : int { Red, Green, Blue };
+  //   const char *name = do {
+  //     switch (c) { case Red: do_return "Red"; case Green: do_return "Green";
+  //                  case Blue: do_return "Blue"; }
+  //   };
+  //
+  // is diagnosed instead of yielding an indeterminate value for any other `c`.
+  // For a function that is merely undefined behavior and -Wreturn-type has
+  // long chosen not to warn; for a do-expression it is required to be
+  // ill-formed. Users who know better say so with `std::unreachable()` or a
+  // `default:`.
+  Options.AssumeReachableDefaultInSwitchStatements = true;
+
+  std::unique_ptr<CFG> Cfg =
+      CFG::buildCFG(/*D=*/nullptr, Body, &S.Context, Options);
+  if (!Cfg)
+    // If we can't build a CFG, conservatively assume control may fall off the
+    // end: a spurious diagnostic is safer than silently accepting a body that
+    // never yields a value.
+    return true;
+
+  // Mark blocks reachable from entry so dead code doesn't create phantom
+  // fall-through edges.
+  llvm::BitVector Live(Cfg->getNumBlockIDs());
+  reachable_code::ScanReachableFromBlock(&Cfg->getEntry(), Live);
+
+  // A do-expression "falls off the end" if a live predecessor of the exit block
+  // reaches it via a plain edge — i.e. not through `do_return`, an outer
+  // `return`/`break`/`continue`, a `throw`, or a [[noreturn]] call. Edges from
+  // pruned (unreachable) branches appear as null predecessors and are dropped
+  // by IgnoreNullPredecessors.
+  //
+  // FilterOptions::IgnoreDefaultsWithCoveredEnums is deliberately left clear,
+  // for the same reason AssumeReachableDefaultInSwitchStatements is set above:
+  // it would drop the very edge we just kept.
+  CFGBlock::FilterOptions FO;
+
+  for (CFGBlock::filtered_pred_iterator I =
+           Cfg->getExit().filtered_pred_start_end(FO);
+       I.hasMore(); ++I) {
+    const CFGBlock &B = **I;
+    if (!Live[B.getBlockID()])
+      continue;
+
+    // A call that doesn't return doesn't really reach the exit.
+    if (B.hasNoReturnElement())
+      continue;
+
+    // try/catch boundaries are abnormal edges, not fall-through. (A `break` or
+    // `continue` that leaves the do-expression is routed to a separate sink, so
+    // a `break`/`continue` terminator that reaches the exit here is an
+    // inner-loop break that exits its loop and then falls off the end — a
+    // genuine fall-through, handled by the generic logic below.)
+    if (const Stmt *Term = B.getTerminatorStmt()) {
+      if (isa<CXXTryStmt>(Term))
+        continue;
+    }
+
+    // Find the last real statement in the block, skipping implicit destructors.
+    CFGBlock::const_reverse_iterator RI = B.rbegin(), RE = B.rend();
+    for (; RI != RE; ++RI)
+      if (RI->getAs<CFGStmt>())
+        break;
+
+    if (RI == RE)
+      // Empty block reaching exit (e.g. a labeled empty statement): a plain
+      // fall-through edge.
+      return true;
+
+    const Stmt *Last = RI->castAs<CFGStmt>().getStmt();
+    // `do_return`/`return` leave via the do-expression value or the enclosing
+    // function; `throw` leaves via an exception.
+    if (isa<DoReturnStmt, ReturnStmt, CoreturnStmt>(Last))
+      continue;
+    if (isa<CXXThrowExpr>(Last))
+      continue;
+
+    // An edge to exit that is none of the above is a real fall-through.
+    if (!llvm::is_contained(B.succs(), &Cfg->getExit()))
+      continue; // abnormal edge, not fall-through
+    return true;
+  }
+
+  return false;
+}
+
+bool Sema::isDivergingStmt(const Stmt *S, bool InDoExpr) {
+  if (!S)
+    return false;
+  if (const auto *CS = dyn_cast<CompoundStmt>(S)) {
+    // The last statement, not counting trailing empty statements.
+    for (const Stmt *Sub : llvm::reverse(CS->body()))
+      if (!isa<NullStmt>(Sub))
+        return isDivergingStmt(Sub, InDoExpr);
+    return false;
+  }
+  if (const auto *AS = dyn_cast<AttributedStmt>(S))
+    return isDivergingStmt(AS->getSubStmt(), InDoExpr);
+  if (const auto *LS = dyn_cast<LabelStmt>(S))
+    return isDivergingStmt(LS->getSubStmt(), InDoExpr);
+  if (isa<BreakStmt, ContinueStmt, GotoStmt, IndirectGotoStmt>(S))
+    return true;
+  if (const auto *RS = dyn_cast<ReturnStmt>(S))
+    return InDoExpr || (RS->getRetValue() &&
+                        !RS->getRetValue()->isTypeDependent() &&
+                        RS->getRetValue()->isDiverging());
+  if (isa<CoreturnStmt>(S))
+    return InDoExpr;
+  if (const auto *DR = dyn_cast<DoReturnStmt>(S))
+    return InDoExpr && DR->getOperand() &&
+           !DR->getOperand()->isTypeDependent() &&
+           DR->getOperand()->isDiverging();
+  if (const auto *E = dyn_cast<Expr>(S))
+    return !E->isTypeDependent() && E->isDiverging();
+  if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+    for (const Decl *D : DS->decls())
+      if (const auto *VD = dyn_cast<VarDecl>(D))
+        if (const Expr *Init = VD->getInit();
+            Init && !Init->isTypeDependent() && Init->isDiverging())
+          return true;
+    return false;
+  }
+  if (const auto *If = dyn_cast<IfStmt>(S)) {
+    if (If->isConstexpr()) {
+      if (std::optional<const Stmt *> Taken =
+              If->getNondiscardedCase(Context))
+        return isDivergingStmt(*Taken, InDoExpr);
+      return false;
+    }
+    return If->getElse() && isDivergingStmt(If->getThen(), InDoExpr) &&
+           isDivergingStmt(If->getElse(), InDoExpr);
+  }
+  return false;
+}
+
+namespace {
+/// Finds the `return` or `do_return` statements of one body: not those of a
+/// nested lambda, block, local class, or (for `do_return`) do-expression.
+class DivergingReturnFinder
+    : public RecursiveASTVisitor<DivergingReturnFinder> {
+public:
+  bool IsDoReturn;
+  SmallVector<Stmt *, 4> Found;
+  explicit DivergingReturnFinder(bool IsDoReturn) : IsDoReturn(IsDoReturn) {}
+
+  bool TraverseLambdaExpr(LambdaExpr *) { return true; }
+  bool TraverseBlockExpr(BlockExpr *) { return true; }
+  bool TraverseDecl(Decl *D) {
+    // Local classes and functions have bodies of their own; variables do not.
+    if (D && isa<TagDecl, FunctionDecl>(D))
+      return true;
+    return RecursiveASTVisitor::TraverseDecl(D);
+  }
+  bool TraverseDoExpr(DoExpr *E) {
+    // A nested do-expression's `do_return`s are its own; its `return`s are
+    // still the enclosing function's.
+    return IsDoReturn ? true : RecursiveASTVisitor::TraverseDoExpr(E);
+  }
+  bool VisitReturnStmt(ReturnStmt *S) {
+    if (!IsDoReturn)
+      Found.push_back(S);
+    return true;
+  }
+  bool VisitDoReturnStmt(DoReturnStmt *S) {
+    if (IsDoReturn)
+      Found.push_back(S);
+    return true;
+  }
+};
+} // namespace
+
+void Sema::convertDivergingReturnOperands(Stmt *Body, QualType ResultType,
+                                          bool IsDoReturn) {
+  DivergingReturnFinder Finder(IsDoReturn);
+  Finder.TraverseStmt(Body);
+  ExprValueKind VK = VK_PRValue;
+  if (const auto *RT = ResultType->getAs<ReferenceType>())
+    VK = isa<LValueReferenceType>(RT) ? VK_LValue : VK_XValue;
+  QualType T = ResultType.getNonReferenceType();
+  for (Stmt *S : Finder.Found) {
+    Expr *Op = IsDoReturn ? cast<DoReturnStmt>(S)->getOperand()
+                          : cast<ReturnStmt>(S)->getRetValue();
+    if (!Op || Op->isTypeDependent() || !Op->getType()->isNoReturnType() ||
+        Context.hasSameType(Op->getType(), T))
+      continue;
+    Expr *Converted = T->isVoidType()
+                          ? ImpCastExprToType(Op, T, CK_ToVoid).get()
+                          : BuildNoReturnConversion(Op, T, VK);
+    if (IsDoReturn)
+      cast<DoReturnStmt>(S)->setOperand(Converted);
+    else
+      cast<ReturnStmt>(S)->setRetValue(Converted);
+  }
+}
+
+void Sema::ActOnStartDoExpr(SourceLocation DoLoc, QualType ExplicitType,
+                            unsigned TemplateDepth) {
+  // The body forms a protected target for branch diagnostics: jumps may leave
+  // it, but may not enter it from outside.
+  setFunctionHasBranchProtectedScope();
+
+  DoExprStackEntry Entry;
+  Entry.DoLoc = DoLoc;
+  Entry.TypeIsExplicit = !ExplicitType.isNull();
+  Entry.ExplicitType = ExplicitType;
+  Entry.ExplicitTypeInfo = nullptr;
+  Entry.DeducedType = QualType();
+  Entry.HasDependentDoReturn = false;
+  Entry.TemplateDepth =
+      TemplateDepth == ~0U ? getTemplateDepth(getCurScope()) : TemplateDepth;
+  Entry.OuterScope = getCurScope();
+
+  // Parsing the body has two independent prerequisites, and a do-expression
+  // can be written in a context that supplies one but not the other.
+  //
+  // (1) A FunctionScopeInfo. PushCompoundScope (called by
+  //     ParseCompoundStatementBody) asserts that there is one. At namespace
+  //     scope (e.g. a constexpr variable initializer) there is none, so push a
+  //     synthetic one and remember to pop it on close. This synthetic scope
+  //     only matters for the few Sema checks that consult the function-scope
+  //     info during body parsing; the body's `return`/`break`/`continue`
+  //     lookup is driven by the parser's Scope tree, which we deliberately do
+  //     not augment.
+  if (FunctionScopes.empty()) {
+    PushFunctionScope();
+    Entry.PushedSyntheticFunctionScope = true;
+  }
+
+  // (2) A DeclContext that block-scope declarations can live in. A lambda body
+  //     gets one from its call operator; a do-expression creates no function
+  //     scope by design, so it has to supply one itself. This is a separate
+  //     question from (1): while parsing a default member initializer or a
+  //     default argument there *is* a function scope, but CurContext is the
+  //     CXXRecordDecl, and a declaration in the body would be built as a
+  //     member of the class -- which is wrong, and asserts outright for a
+  //     const variable or a local class (AccessDeclContextCheck).
+  if (!CurContext->isFunctionOrMethod()) {
+    // `void ()`, with a prototype: a local class declared in the body records
+    // this as its enclosing function, and the Itanium mangler casts that
+    // function's type to FunctionProtoType unconditionally.
+    QualType FnTy = Context.getFunctionType(Context.VoidTy, {},
+                                            FunctionProtoType::ExtProtoInfo());
+    auto *SyntheticFD =
+        FunctionDecl::Create(Context, CurContext, DoLoc, DoLoc,
+                             &Context.Idents.get(FunctionDecl::DoExprBodyName),
+                             FnTy, /*TInfo=*/nullptr, SC_None);
+    SyntheticFD->setImplicit();
+    // Parented in a class (the default-member-initializer case) it needs an
+    // access specifier of its own, for the same assertion it exists to avoid.
+    // It is never added to the class's lookup, so the value is immaterial.
+    if (CurContext->isRecord())
+      SyntheticFD->setAccess(AS_public);
+    Entry.SavedContext = CurContext;
+    CurContext = SyntheticFD;
+  }
+  Entry.FunctionScopeDepth = FunctionScopes.size();
+  DoExprStack.push_back(Entry);
+}
+
+void Sema::ActOnDoExprExplicitType(TypeSourceInfo *ExplicitType) {
+  assert(!DoExprStack.empty() &&
+         "ActOnDoExprExplicitType without ActOnStartDoExpr");
+  DoExprStackEntry &Entry = DoExprStack.back();
+  Entry.TypeIsExplicit = ExplicitType;
+  Entry.ExplicitType = ExplicitType ? ExplicitType->getType() : QualType();
+  Entry.ExplicitTypeInfo = ExplicitType;
+}
+
+DeclResult Sema::ActOnDoExprInitCapture(Scope *S, IdentifierInfo *Id,
+                                        SourceLocation IdLoc,
+                                        SourceLocation EqLoc, Expr *Init) {
+  assert(Init && "do-expression init-capture without an initializer");
+
+  // `[name = init]` has `decltype((auto))` semantics: the capture's type is
+  // `decltype((init))`, i.e. the value category of the initializer is preserved
+  // (lvalue -> T&, xvalue -> T&&, prvalue -> T), exactly as if the initializer
+  // were a parenthesized expression. ASTContext::getReferenceQualifiedType
+  // implements that rule directly for non-dependent initializers; for dependent
+  // ones we form a `decltype` type over the parenthesized initializer so the
+  // same rule is re-applied at instantiation.
+  QualType T;
+  if (Init->isTypeDependent() || Init->isValueDependent()) {
+    Expr *Paren =
+        new (Context) ParenExpr(Init->getBeginLoc(), Init->getEndLoc(), Init);
+    T = BuildDecltypeType(Paren, /*AsUnevaluated=*/false);
+  } else {
+    T = Context.getReferenceQualifiedType(Init);
+  }
+
+  TypeSourceInfo *TSI = Context.getTrivialTypeSourceInfo(T, IdLoc);
+  VarDecl *VD =
+      VarDecl::Create(Context, CurContext, IdLoc, IdLoc, Id, T, TSI, SC_None);
+  // Mark this as a do-expression init-capture. Its lifetime extends to the end
+  // of the enclosing full-expression, so the lifetime analysis must not treat a
+  // reference into it like a reference into an ordinary block-scoped local.
+  VD->setDoExprInitCapture(true);
+
+  // Register the variable before initializing it (and before the next capture is
+  // parsed) so later captures and the body can name it.
+  PushOnScopeChains(VD, S);
+
+  AddInitializerToDecl(VD, Init, /*DirectInit=*/false);
+  FinalizeDeclaration(VD);
+
+  if (VD->isInvalidDecl())
+    return DeclResult(true);
+  return VD;
+}
+
+StmtResult Sema::ActOnDoExprInitStmt(SourceLocation LParenLoc,
+                                     SourceLocation RParenLoc,
+                                     ArrayRef<Stmt *> InitStmts,
+                                     ArrayRef<MaterializeTemporaryExpr *>
+                                         LifetimeExtendTemps) {
+  if (InitStmts.empty())
+    return StmtEmpty();
+
+  Stmt *InitStmt = CompoundStmt::Create(Context, InitStmts, FPOptionsOverride(),
+                                        LParenLoc, RParenLoc);
+  ActOnDoExprInitStmt(InitStmt, LifetimeExtendTemps);
+  return InitStmt;
+}
+
+void Sema::ActOnDoExprInitStmt(
+    Stmt *InitStmt, ArrayRef<MaterializeTemporaryExpr *> LifetimeExtendTemps) {
+  if (InitStmt)
+    setFunctionHasBranchProtectedScope();
+
+  if (!LifetimeExtendTemps.empty()) {
+    if (VarDecl *ExtendingVar = findFirstVarDecl(InitStmt)) {
+      InitializedEntity Entity =
+          InitializedEntity::InitializeVariable(ExtendingVar);
+      for (auto *MTE : LifetimeExtendTemps)
+        MTE->setExtendingDecl(ExtendingVar, Entity.allocateManglingNumber());
+    }
+  }
+
+  if (InitStmt || !LifetimeExtendTemps.empty())
+    Cleanup.setExprNeedsCleanups(true);
+}
+
+void Sema::ActOnDoExprError() {
+  if (DoExprStack.empty())
+    return;
+  bool PoppedSynthetic = DoExprStack.back().PushedSyntheticFunctionScope;
+  DeclContext *SavedContext = DoExprStack.back().SavedContext;
+  DoExprStack.pop_back();
+  if (PoppedSynthetic)
+    PopFunctionScopeInfo();
+  if (SavedContext)
+    CurContext = SavedContext;
+}
+
+ExprResult Sema::ActOnDoExpr(SourceLocation DoLoc, SourceLocation LBraceLoc,
+                             Stmt *InitStmt, Stmt *Body,
+                             SourceLocation RBraceLoc,
+                             TypeSourceInfo *ExplicitType) {
+  return BuildDoExpr(DoLoc, LBraceLoc, InitStmt, Body, RBraceLoc, ExplicitType,
+                     getTemplateDepth(getCurScope()));
+}
+
+ExprResult Sema::BuildDoExpr(SourceLocation DoLoc, SourceLocation LBraceLoc,
+                             Stmt *InitStmt, Stmt *Body,
+                             SourceLocation RBraceLoc,
+                             TypeSourceInfo *ExplicitType,
+                             unsigned TemplateDepth) {
+  assert(!DoExprStack.empty() && "BuildDoExpr without ActOnStartDoExpr");
+  DoExprStackEntry Entry = DoExprStack.pop_back_val();
+  if (Entry.PushedSyntheticFunctionScope)
+    PopFunctionScopeInfo();
+  if (Entry.SavedContext)
+    CurContext = Entry.SavedContext;
+
+  auto *Compound = cast<CompoundStmt>(Body);
+
+  // A do_return already produced an unrecoverable deduction error; don't
+  // pile on with a misleading "no do_return statements" diagnostic.
+  if (Entry.DeductionFailed)
+    return ExprError();
+
+  QualType ResultType;
+  if (Entry.TypeIsExplicit &&
+      !Entry.ExplicitType->getContainedAutoType()) {
+    ResultType = Entry.ExplicitType;
+  } else if (!Entry.DeducedType.isNull()) {
+    ResultType = Entry.DeducedType;
+  } else if (TemplateDepth > 0 || Entry.HasDependentDoReturn) {
+    // Inside a template, defer: no do_return yet seen with a non-dependent
+    // operand. Use a dependent placeholder.
+    ResultType = Context.DependentTy;
+  } else if (getLangOpts().DivergingExpressions &&
+             isDivergingStmt(Compound, /*InDoExpr=*/true)) {
+    // P3549: no `do_return` yields a value (any there are diverge), and the
+    // body diverges: the do-expression diverges, with type std::noreturn_t.
+    // With a placeholder type as written, deduce it from a std::noreturn_t.
+    ResultType = Context.NoReturnTy;
+    if (Entry.TypeIsExplicit) {
+      OpaqueValueExpr Diverging(DoLoc, Context.NoReturnTy, VK_PRValue);
+      sema::TemplateDeductionInfo Info(DoLoc);
+      if (DeduceAutoType(Entry.ExplicitTypeInfo->getTypeLoc(), &Diverging,
+                         Entry.DeducedType, Info) !=
+          TemplateDeductionResult::Success) {
+        Diag(DoLoc, diag::err_auto_fn_deduction_failure)
+            << Entry.ExplicitType << Context.NoReturnTy;
+        return ExprError();
+      }
+      ResultType = Entry.DeducedType;
+    }
+  } else if (Entry.TypeIsExplicit &&
+             Entry.ExplicitType->getContainedAutoType()) {
+    // No do_return statements: deduce against void, as if the body ended in
+    // `do_return;` (mirrors the no-operand case in BuildDoReturnStmt). As
+    // with functions, the type as written must be 'auto' or
+    // 'decltype(auto)', possibly cv-qualified or constrained: 'auto*' and
+    // the like cannot deduce from void.
+    if (!Entry.ExplicitType->getAs<AutoType>()) {
+      Diag(DoLoc, diag::err_do_expr_no_return_but_not_auto)
+          << Entry.ExplicitType;
+      return ExprError();
+    }
+    CXXScalarValueInitExpr VoidVal(Context.VoidTy, nullptr, DoLoc);
+    sema::TemplateDeductionInfo Info(DoLoc);
+    TemplateDeductionResult Res =
+        DeduceAutoType(Entry.ExplicitTypeInfo->getTypeLoc(), &VoidVal,
+                       Entry.DeducedType, Info);
+    if (Res != TemplateDeductionResult::Success)
+      return ExprError();
+    ResultType = Entry.DeducedType;
+  } else {
+    // No do_return statements and no explicit type: the result is void, like
+    // a function with a deduced return type and no return statements.
+    ResultType = Context.VoidTy;
+  }
+
+  // The result is an object the do-expression creates, like the return value
+  // of a function: its type must be complete and not abstract, and not an
+  // array or a function type (neither can be returned). (A reference
+  // or void creates no object.) The check also keeps MaybeBindToTemporary
+  // below from looking up the destructor of an incomplete class.
+  if (!ResultType->isDependentType() &&
+      (ResultType->isArrayType() || ResultType->isFunctionType())) {
+    Diag(DoLoc, diag::err_do_expr_array_or_function_result_type)
+        << ResultType->isFunctionType() << ResultType;
+    return ExprError();
+  }
+  if (!ResultType->isVoidType() && !ResultType->isDependentType() &&
+      !ResultType->isReferenceType() &&
+      (RequireCompleteType(DoLoc, ResultType,
+                           diag::err_do_expr_incomplete_result_type) ||
+       RequireNonAbstractType(DoLoc, ResultType,
+                              diag::err_abstract_type_in_decl,
+                              AbstractReturnType)))
+    return ExprError();
+
+  // Reachability: a do-expression with a non-void result type is ill-formed
+  // if control can fall off the end of the body without exiting via
+  // `do_return`, an outer-scope return/break/continue, a throw, or a
+  // [[noreturn]] call. (Void do-expressions are like void functions:
+  // falling off the end is fine.) Skip the check for dependent types so the
+  // analysis runs on each instantiation rather than on the template.
+  if (!ResultType->isVoidType() && !ResultType->isDependentType() &&
+      doExprBodyMayFallThrough(*this, Compound, getConstevalIfKind(*this))) {
+    Diag(RBraceLoc, diag::err_do_expr_falls_off_end) << ResultType;
+    return ExprError();
+  }
+
+  // Expressions can't have reference type. If the user wrote
+  // `do -> T &` / `T &&`, the do-expression itself is a glvalue of T:
+  // strip the reference for the stored type and pick the right value
+  // category.
+  ExprValueKind VK = VK_PRValue;
+  if (const auto *Ref = ResultType->getAs<ReferenceType>()) {
+    VK = isa<RValueReferenceType>(Ref) ? VK_XValue : VK_LValue;
+    ResultType = Ref->getPointeeType();
+  } else {
+    // A prvalue of non-class, non-array type never has cv-qualified type
+    // ([expr.type]p2) — e.g. `do -> const auto { do_return 42; }` is a
+    // prvalue of type 'int', just like calling a function returning
+    // 'const int'.
+    ResultType = ResultType.getNonLValueExprType(Context);
+  }
+
+  if (InitStmt)
+    Cleanup.setExprNeedsCleanups(true);
+
+  // The diverging `do_return`s took no part in deducing the type; convert
+  // their operands to it now.
+  if (Entry.HasDivergingDoReturn && !ResultType->isDependentType())
+    convertDivergingReturnOperands(
+        Compound,
+        VK == VK_LValue   ? Context.getLValueReferenceType(ResultType)
+        : VK == VK_XValue ? Context.getRValueReferenceType(ResultType)
+                          : ResultType,
+        /*IsDoReturn=*/true);
+
+  auto *Result = new (Context)
+      DoExpr(InitStmt, Compound, ResultType, VK, ExplicitType, DoLoc, LBraceLoc,
+             RBraceLoc, TemplateDepth, Entry.ContainsUnexpandedParameterPack);
+
+  // Apply the named return value optimization if every value-yielding
+  // `do_return` in the body agreed on one candidate -- unless an outer-scope
+  // `return` in the body already claimed that variable for the enclosing
+  // function's return slot, which it cannot share with ours.
+  if (const VarDecl *NRVOCandidate = Entry.NRVOCandidate.value_or(nullptr))
+    if (!NRVOCandidate->isNRVOVariable())
+      Result->setNRVOCandidate(NRVOCandidate);
+
+  // A do-expression yielding a class prvalue produces a temporary that nobody
+  // else owns, exactly like a function call does, so it needs the same
+  // CXXBindTemporaryExpr to get it destroyed at the end of the full-expression.
+  // Without it a discarded `(void)(do { do_return T{}; });` never runs ~T.
+  // MaybeBindToTemporary is a no-op for the glvalue, void, dependent and
+  // trivially-destructible cases.
+  return MaybeBindToTemporary(Result);
+}
+
+StmtResult Sema::ActOnDoReturnStmt(SourceLocation DoReturnLoc, Expr *Operand,
+                                   Scope *CurScope) {
+  return BuildDoReturnStmt(DoReturnLoc, Operand);
+}
+
+StmtResult Sema::BuildDoReturnStmt(SourceLocation DoReturnLoc, Expr *Operand) {
+  if (DoExprStack.empty()) {
+    Diag(DoReturnLoc, diag::err_do_return_outside_do_expr);
+    return StmtError();
+  }
+
+  DoExprStackEntry &Entry = DoExprStack.back();
+
+  // Reject `do_return` that crossed a lambda / nested function-scope boundary.
+  if (FunctionScopes.size() != Entry.FunctionScopeDepth) {
+    Diag(DoReturnLoc, diag::err_do_return_crosses_function_scope);
+    return StmtError();
+  }
+
+  // A pack named by the operand is either expanded by an expansion enclosing
+  // the do-expression -- in which case this records the fact on the
+  // do-expression, the way a lambda body does -- or it is genuinely unexpanded
+  // and has to be diagnosed here, since no later step looks at the operand as a
+  // whole. `return ts;` gets the same treatment from BuildReturnStmt.
+  if (Operand && DiagnoseUnexpandedParameterPack(Operand, UPPC_Expression))
+    return StmtError();
+
+  // C++17: do_return statements in discarded statements are not considered when
+  // deducing a do-expression's result type.
+  if (ExprEvalContexts.back().isDiscardedStatementContext()) {
+    if (Operand) {
+      ExprResult ER =
+          ActOnFinishFullExpr(Operand, DoReturnLoc, /*DiscardedValue=*/false);
+      if (ER.isInvalid())
+        return StmtError();
+      Operand = ER.get();
+    }
+    return new (Context) DoReturnStmt(DoReturnLoc, Operand);
+  }
+
+  // Match function return type deduction: in a dependent context, do not
+  // deduce the result type yet, even from non-dependent operands. Instantiation
+  // will rebuild the live do_return statements and deduce from those.
+  if ((Entry.TemplateDepth > 0 || isParsingExpansionStmtPattern(*this)) &&
+      doExprHasDeducedResultType(Entry)) {
+    Entry.HasDependentDoReturn = true;
+    return new (Context) DoReturnStmt(DoReturnLoc, Operand);
+  }
+
+  if (!Operand) {
+    // `do_return;` with no expression: only valid for void result.
+    QualType ResultType =
+        Entry.TypeIsExplicit && !Entry.ExplicitType->getContainedAutoType()
+            ? Entry.ExplicitType
+            : Entry.DeducedType;
+    if (!ResultType.isNull() && !ResultType->isDependentType() &&
+        !ResultType->isVoidType()) {
+      Diag(DoReturnLoc, diag::err_do_return_missing_value);
+      return StmtError();
+    }
+    if (Entry.TypeIsExplicit && Entry.ExplicitType->getContainedAutoType()) {
+      // As with `return;` in a function with a deduced return type, the type
+      // as written must be 'auto' or 'decltype(auto)', possibly cv-qualified
+      // or constrained: 'auto*' and the like cannot deduce from void.
+      if (!Entry.ExplicitType->getAs<AutoType>()) {
+        Diag(DoReturnLoc, diag::err_do_return_void_but_not_auto)
+            << Entry.ExplicitType;
+        Entry.DeductionFailed = true;
+        return StmtError();
+      }
+      CXXScalarValueInitExpr VoidVal(Context.VoidTy, nullptr, DoReturnLoc);
+      sema::TemplateDeductionInfo Info(DoReturnLoc);
+      TemplateDeductionResult Res =
+          DeduceAutoType(Entry.ExplicitTypeInfo->getTypeLoc(), &VoidVal,
+                         Entry.DeducedType, Info);
+      if (Res != TemplateDeductionResult::Success)
+        return StmtError();
+    } else if (!Entry.TypeIsExplicit && Entry.DeducedType.isNull()) {
+      Entry.DeducedType = Context.VoidTy;
+    }
+    return new (Context) DoReturnStmt(DoReturnLoc, nullptr);
+  }
+
+  // Defer typing for dependent operands; they'll be re-checked at template
+  // instantiation via TreeTransform.
+  if (Operand->isTypeDependent()) {
+    Entry.HasDependentDoReturn = true;
+    return new (Context) DoReturnStmt(DoReturnLoc, Operand);
+  }
+
+  // P3549: a diverging operand never yields a value. It takes no part in
+  // deducing the type (BuildDoExpr converts it once the type is known), and
+  // converts to any type as written. A [[noreturn]] call is treated as a
+  // std::noreturn_t for that, whatever its declared type.
+  if (getLangOpts().DivergingExpressions && Operand->isDiverging()) {
+    bool VoidResult = Entry.TypeIsExplicit &&
+                      !Entry.ExplicitType->getContainedAutoType() &&
+                      Entry.ExplicitType->isVoidType();
+    if (VoidResult) {
+      if (!Operand->getType()->isVoidType())
+        Operand = ImpCastExprToType(Operand, Context.VoidTy, CK_ToVoid).get();
+      return new (Context) DoReturnStmt(DoReturnLoc, Operand);
+    }
+    if (!Operand->getType()->isNoReturnType())
+      Operand =
+          BuildNoReturnConversion(Operand, Context.NoReturnTy, VK_PRValue);
+    if (doExprHasDeducedResultType(Entry)) {
+      Entry.HasDivergingDoReturn = true;
+      return new (Context) DoReturnStmt(DoReturnLoc, Operand);
+    }
+    // An explicit type: the ordinary initialization below converts it.
+  }
+
+  // Determine move-eligibility BEFORE applying any conversions, so that a
+  // named local variable in `do_return r;` gets the same implicit-move
+  // treatment as in `return r;` (C++20 [class.copy.elision]p3) -- but only for
+  // a variable of the do-expression body itself
+  // ([expr.prim.id.unqual]p15.4). Anything declared outside the body outlives
+  // the do-expression and stays usable after it, so it is copied.
+  // NamedReturnInfo has no default member initializers -- every other user
+  // assigns it from getNamedReturnInfo unconditionally -- so value-initialize
+  // it here, where the operand may not be a body local at all.
+  NamedReturnInfo NRInfo = {};
+  if (namesDoExprBodyLocal(Operand, Entry, getSourceManager()))
+    NRInfo = getNamedReturnInfo(Operand);
+
+  // Compute the result type. For deduced types, this is the operand's value
+  // type after lvalue-to-rvalue/array-to-pointer/function-to-pointer
+  // conversions on scalar operands; for class operands, the operand stays an
+  // lvalue and the deduced type is its non-reference type.
+  QualType ResultType;
+  if (Entry.TypeIsExplicit && Entry.ExplicitType->getContainedAutoType()) {
+    sema::TemplateDeductionInfo Info(Operand->getExprLoc());
+    TemplateDeductionResult Res =
+        DeduceAutoType(Entry.ExplicitTypeInfo->getTypeLoc(), Operand,
+                       Entry.DeducedType, Info);
+    switch (Res) {
+    case TemplateDeductionResult::Success:
+      break;
+    case TemplateDeductionResult::AlreadyDiagnosed:
+      return StmtError();
+    case TemplateDeductionResult::Inconsistent:
+      Diag(DoReturnLoc, diag::err_do_return_type_mismatch)
+          << Info.SecondArg << Info.FirstArg;
+      Entry.DeductionFailed = true;
+      return StmtError();
+    default:
+      Diag(Operand->getExprLoc(), diag::err_auto_fn_deduction_failure)
+          << Entry.ExplicitType << Operand->getType();
+      return StmtError();
+    }
+    ResultType = Entry.DeducedType;
+  } else if (Entry.TypeIsExplicit) {
+    ResultType = Entry.ExplicitType;
+  } else {
+    QualType OperandType;
+    if (Operand->getType()->isRecordType()) {
+      // Don't apply lvalue-to-rvalue to class types — that would force a
+      // copy/move and defeat NRVO/move-eligibility. Use the value type.
+      //
+      // Strip its top-level cv-qualification, though: [expr.prim.do] deduces
+      // by the rules in [dcl.spec.auto.general], i.e. as if by `auto x = e;`,
+      // and a by-value `auto` never deduces a cv-qualified type. Keeping it
+      // made `do_return *p;` for a `const S *p` deduce `const S`, which then
+      // conflicts with a later `do_return S{};` that a lambda unifies.
+      // Deducing the type is a separate question from how the operand is
+      // converted, so this costs the elision nothing.
+      OperandType =
+          Operand->getType().getNonReferenceType().getUnqualifiedType();
+    } else {
+      ExprResult Conv = DefaultFunctionArrayLvalueConversion(Operand);
+      if (Conv.isInvalid())
+        return StmtError();
+      Operand = Conv.get();
+      OperandType = Operand->getType();
+    }
+
+    if (Entry.DeducedType.isNull()) {
+      Entry.DeducedType = OperandType;
+    } else if (!Context.hasSameType(Entry.DeducedType, OperandType)) {
+      Diag(DoReturnLoc, diag::err_do_return_type_mismatch)
+          << OperandType << Entry.DeducedType;
+      Entry.DeductionFailed = true;
+      return StmtError();
+    }
+    ResultType = Entry.DeducedType;
+  }
+
+  // Initialize the do-expression's result from the operand. For reference
+  // result types, this triggers the same lifetime checks as a function
+  // returning a reference (so e.g. `do_return prvalue();` for a
+  // reference-typed do-expression diagnoses the same dangling reference
+  // that the equivalent IIFE would) — except that declarations OUTSIDE the
+  // do-expression are not "stack memory being returned": they outlive the
+  // do-expression, and any dangle through them is diagnosed where the
+  // completed do-expression is consumed.
+  // As in a function, the copy out of a named body local can be elided by
+  // building the local in the result slot to begin with. Record the candidate
+  // so BuildDoExpr can check that the whole body agrees on it; the call also
+  // brings NRInfo to its final state for the initialization below, exactly as
+  // BuildReturnStmt does.
+  const VarDecl *NRVOCandidate = getCopyElisionCandidate(NRInfo, ResultType);
+  if (!Entry.NRVOCandidate)
+    Entry.NRVOCandidate = NRVOCandidate;
+  else if (*Entry.NRVOCandidate != NRVOCandidate)
+    Entry.NRVOCandidate = nullptr;
+
+  InitializedEntity InitEntity = InitializedEntity::InitializeDoExprResult(
+      DoReturnLoc, ResultType, Entry.OuterScope);
+  ExprResult Init =
+      PerformMoveOrCopyInitialization(InitEntity, NRInfo, Operand);
+  if (Init.isInvalid())
+    return StmtError();
+  Operand = Init.get();
+
+  return new (Context) DoReturnStmt(DoReturnLoc, Operand);
+}

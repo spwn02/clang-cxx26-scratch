@@ -28,6 +28,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/Assumptions.h"
@@ -41,6 +42,83 @@
 
 using namespace clang;
 using namespace CodeGen;
+
+void CodeGenFunction::EmitCaseConditionChain(
+    const Expr *Condition,
+    llvm::function_ref<void(const MatchTestInstantiation *)> EmitSuccess,
+    JumpDest FailureDest) {
+  RunCleanupsScope ConditionScope(*this);
+  SmallVector<EHScopeStack::stable_iterator, 4> TemporaryCleanups;
+  EmitCaseConditionChainImpl(
+      Condition,
+      [&](const MatchTestInstantiation *Instantiation) {
+        EmitConditionTemporaryCleanups(TemporaryCleanups);
+        EmitSuccess(Instantiation);
+      },
+      FailureDest, TemporaryCleanups);
+}
+
+void CodeGenFunction::EmitCaseConditionChainImpl(
+    const Expr *Condition,
+    llvm::function_ref<void(const MatchTestInstantiation *)> EmitSuccess,
+    JumpDest FailureDest,
+    SmallVectorImpl<EHScopeStack::stable_iterator> &TemporaryCleanups) {
+  unsigned OldSize = TemporaryCleanups.size();
+  llvm::scope_exit RestoreCleanups([&] { TemporaryCleanups.resize(OldSize); });
+  Condition = MatchTestExpr::getConditionSubExpr(Condition);
+
+  if (const auto *And = dyn_cast<BinaryOperator>(Condition);
+      And && And->getOpcode() == BO_LAnd) {
+    EmitCaseConditionChainImpl(
+        And->getLHS(),
+        [&](const MatchTestInstantiation *LeftInstantiation) {
+          EmitCaseConditionChainImpl(
+              And->getRHS(),
+              [&](const MatchTestInstantiation *RightInstantiation) {
+                EmitSuccess(RightInstantiation ? RightInstantiation
+                                               : LeftInstantiation);
+              },
+              FailureDest, TemporaryCleanups);
+        },
+        FailureDest, TemporaryCleanups);
+    return;
+  }
+
+  if (const auto *Match = dyn_cast<MatchTestExpr>(Condition);
+      Match && isa<CaseConditionExpr>(Match)) {
+    EmitMatchTestDispatch(
+        *Match, FailureDest,
+        [&](const MatchTestInstantiation &Instantiation) {
+          if (Instantiation.Condition) {
+            EmitCaseConditionChainImpl(
+                Instantiation.Condition,
+                [&](const MatchTestInstantiation *NestedInstantiation) {
+                  EmitSuccess(NestedInstantiation ? NestedInstantiation
+                                                  : &Instantiation);
+                },
+                FailureDest, TemporaryCleanups);
+          } else {
+            EmitSuccess(&Instantiation);
+          }
+        },
+        FailureDest, [] {});
+    return;
+  }
+
+  llvm::BasicBlock *Passed = createBasicBlock("case.condition.next");
+  llvm::BasicBlock *Failed = createBasicBlock("case.condition.failed");
+  auto OldDepth = EHStack.stable_begin();
+  llvm::Instruction *InitIP =
+      Builder.CreateFlagLoad(llvm::Constant::getNullValue(Int8PtrTy));
+  EmitBranchOnBoolExpr(Condition, Passed, Failed, getProfileCount(Condition));
+  CaptureConditionTemporaryCleanups(OldDepth, InitIP, TemporaryCleanups);
+
+  EmitBlock(Failed);
+  EmitBranchThroughCleanup(FailureDest);
+
+  EmitBlock(Passed);
+  EmitSuccess(nullptr);
+}
 
 //===----------------------------------------------------------------------===//
 //                              Statement Emission
@@ -164,6 +242,9 @@ void CodeGenFunction::EmitStmt(const Stmt *S, ArrayRef<const Attr *> Attrs) {
   case Stmt::ForStmtClass:     EmitForStmt(cast<ForStmt>(*S), Attrs);     break;
 
   case Stmt::ReturnStmtClass:  EmitReturnStmt(cast<ReturnStmt>(*S));      break;
+  case Stmt::DoReturnStmtClass:
+    EmitDoReturnStmt(cast<DoReturnStmt>(*S));
+    break;
 
   case Stmt::SwitchStmtClass:  EmitSwitchStmt(cast<SwitchStmt>(*S));      break;
   case Stmt::GCCAsmStmtClass:  // Intentional fall-through.
@@ -798,7 +879,9 @@ void CodeGenFunction::EmitLabelStmt(const LabelStmt &S) {
   EmitStmt(S.getSubStmt());
 }
 
-void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
+void CodeGenFunction::EmitWithStmtAttributes(
+    const Stmt *S, ArrayRef<const Attr *> Attrs,
+    llvm::function_ref<void()> Emit) {
   bool nomerge = false;
   bool noinline = false;
   bool alwaysinline = false;
@@ -808,7 +891,7 @@ void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
   const CallExpr *musttail = nullptr;
   const AtomicAttr *AA = nullptr;
 
-  for (const auto *A : S.getAttrs()) {
+  for (const Attr *A : Attrs) {
     switch (A->getKind()) {
     default:
       break;
@@ -825,8 +908,7 @@ void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
       noconvergent = true;
       break;
     case attr::MustTail: {
-      const Stmt *Sub = S.getSubStmt();
-      const ReturnStmt *R = cast<ReturnStmt>(Sub);
+      const ReturnStmt *R = cast<ReturnStmt>(S);
       musttail = cast<CallExpr>(R->getRetValue()->IgnoreParens());
     } break;
     case attr::CXXAssume: {
@@ -852,7 +934,12 @@ void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
   SaveAndRestore save_musttail(MustTailCall, musttail);
   SaveAndRestore save_flattenOrBranch(HLSLControlFlowAttr, flattenOrBranch);
   CGAtomicOptionsRAII AORAII(CGM, AA);
-  EmitStmt(S.getSubStmt(), S.getAttrs());
+  Emit();
+}
+
+void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
+  EmitWithStmtAttributes(S.getSubStmt(), S.getAttrs(),
+                         [&] { EmitStmt(S.getSubStmt(), S.getAttrs()); });
 }
 
 void CodeGenFunction::EmitGotoStmt(const GotoStmt &S) {
@@ -915,6 +1002,87 @@ void CodeGenFunction::EmitIfStmt(const IfStmt &S) {
 
   if (S.getConditionVariable())
     EmitDecl(*S.getConditionVariable());
+
+  if (MatchTestExpr::isCaseConditionChain(S.getCond())) {
+    if (S.isConstexpr()) {
+      bool CondConstant;
+      if (!ConstantFoldsToSimpleInteger(S.getCond(), CondConstant,
+                                        /*AllowLabels=*/true))
+        llvm_unreachable("constexpr case condition chain is not constant");
+      if (!CondConstant) {
+        PGO->markStmtMaybeUsed(S.getThen());
+        if (Else) {
+          RunCleanupsScope ElseScope(*this);
+          EmitStmt(Else);
+        }
+        return;
+      }
+    }
+
+    JumpDest Cont = getJumpDestInCurrentScope("if.end");
+    JumpDest Failed = Else ? getJumpDestInCurrentScope("if.else") : Cont;
+    EmitCaseConditionChain(
+        S.getCond(),
+        [&](const MatchTestInstantiation *Instantiation) {
+          incrementProfileCounter(UseExecPath, &S);
+          EmitStmt(Instantiation && Instantiation->Handler
+                       ? Instantiation->Handler
+                       : S.getThen());
+          if (HaveInsertPoint())
+            EmitBranchThroughCleanup(Cont);
+        },
+        Failed);
+
+    if (Else) {
+      EmitBlock(Failed.getBlock(), true);
+      RunCleanupsScope ElseScope(*this);
+      EmitStmt(Else);
+      if (HaveInsertPoint())
+        EmitBranchThroughCleanup(Cont);
+    }
+    EmitBlock(Cont.getBlock(), true);
+    return;
+  }
+
+  if (auto *Match = MatchTestExpr::findInCondition(S.getCond());
+      Match && Match->hasConditionInstantiations()) {
+    if (S.isConstexpr()) {
+      bool CondConstant;
+      if (!ConstantFoldsToSimpleInteger(S.getCond(), CondConstant,
+                                        /*AllowLabels=*/true) ||
+          !CondConstant)
+        llvm_unreachable(
+            "constexpr match condition with a handler must be true");
+      const MatchTestInstantiation *Selected = llvm::find_if(
+          Match->getInstantiations(), [](const auto &Instantiation) {
+            return Instantiation.Handler != nullptr;
+          });
+      assert(Selected != Match->getInstantiations().end() &&
+             "constexpr match condition has no selected handler");
+      incrementProfileCounter(UseExecPath, &S, /*UseBoth=*/true);
+      EmitSelectedMatchTestInstantiation(*Match, *Selected,
+                                         [&] { EmitStmt(Selected->Handler); });
+      PGO->markStmtMaybeUsed(Else);
+      return;
+    }
+
+    JumpDest Cont = getJumpDestInCurrentScope("if.end");
+    EmitMatchTestDispatch(
+        *Match, Cont,
+        [&](const MatchTestInstantiation &Instantiation) {
+          incrementProfileCounter(UseExecPath, &S);
+          EmitStmt(Instantiation.Handler);
+        },
+        Cont,
+        [&] {
+          if (Else) {
+            RunCleanupsScope ElseScope(*this);
+            EmitStmt(Else);
+          }
+        });
+    EmitBlock(Cont.getBlock(), true);
+    return;
+  }
 
   // If the condition constant folds and can be elided, try to avoid emitting
   // the condition and the dead arm of the if/else.
@@ -1090,6 +1258,75 @@ template <typename LoopStmt> static bool hasEmptyLoopBody(const LoopStmt &S) {
 
 void CodeGenFunction::EmitWhileStmt(const WhileStmt &S,
                                     ArrayRef<const Attr *> WhileAttrs) {
+  if (MatchTestExpr::isCaseConditionChain(S.getCond())) {
+    JumpDest LoopHeader = getJumpDestInCurrentScope("while.cond");
+    EmitBlock(LoopHeader.getBlock());
+    if (CGM.shouldEmitConvergenceTokens())
+      ConvergenceTokenStack.push_back(
+          emitConvergenceLoopToken(LoopHeader.getBlock()));
+    JumpDest LoopExit = getJumpDestInCurrentScope("while.end");
+    BreakContinueStack.push_back(BreakContinue(S, LoopExit, LoopHeader));
+
+    const SourceRange &R = S.getSourceRange();
+    LoopStack.push(LoopHeader.getBlock(), CGM.getContext(),
+                   CGM.getCodeGenOpts(), WhileAttrs,
+                   SourceLocToDebugLoc(R.getBegin()),
+                   SourceLocToDebugLoc(R.getEnd()),
+                   checkIfLoopMustProgress(
+                       S.getCond(), hasEmptyLoopBody(S)));
+    EmitCaseConditionChain(
+        S.getCond(),
+        [&](const MatchTestInstantiation *Instantiation) {
+          incrementProfileCounter(UseExecPath, &S);
+          EmitStmt(Instantiation && Instantiation->Handler
+                       ? Instantiation->Handler
+                       : S.getBody());
+          if (HaveInsertPoint())
+            EmitBranchThroughCleanup(LoopHeader);
+        },
+        LoopExit);
+
+    BreakContinueStack.pop_back();
+    LoopStack.pop();
+    EmitBlock(LoopExit.getBlock(), true);
+    if (CGM.shouldEmitConvergenceTokens())
+      ConvergenceTokenStack.pop_back();
+    return;
+  }
+
+  if (auto *Match = MatchTestExpr::findInCondition(S.getCond());
+      Match && Match->hasConditionInstantiations()) {
+    JumpDest LoopHeader = getJumpDestInCurrentScope("while.cond");
+    EmitBlock(LoopHeader.getBlock());
+    if (CGM.shouldEmitConvergenceTokens())
+      ConvergenceTokenStack.push_back(
+          emitConvergenceLoopToken(LoopHeader.getBlock()));
+    JumpDest LoopExit = getJumpDestInCurrentScope("while.end");
+    BreakContinueStack.push_back(BreakContinue(S, LoopExit, LoopHeader));
+
+    const SourceRange &R = S.getSourceRange();
+    LoopStack.push(LoopHeader.getBlock(), CGM.getContext(),
+                   CGM.getCodeGenOpts(), WhileAttrs,
+                   SourceLocToDebugLoc(R.getBegin()),
+                   SourceLocToDebugLoc(R.getEnd()),
+                   checkIfLoopMustProgress(
+                       S.getCond(), hasEmptyLoopBody(S)));
+    EmitMatchTestDispatch(
+        *Match, LoopHeader,
+        [&](const MatchTestInstantiation &Instantiation) {
+          incrementProfileCounter(UseExecPath, &S);
+          EmitStmt(Instantiation.Handler);
+        },
+        LoopExit, [] {});
+
+    BreakContinueStack.pop_back();
+    LoopStack.pop();
+    EmitBlock(LoopExit.getBlock(), true);
+    if (CGM.shouldEmitConvergenceTokens())
+      ConvergenceTokenStack.pop_back();
+    return;
+  }
+
   // Emit the header for the loop, which will also become
   // the continue target.
   JumpDest LoopHeader = getJumpDestInCurrentScope("while.cond");
@@ -1314,6 +1551,89 @@ void CodeGenFunction::EmitForStmt(const ForStmt &S,
   // Evaluate the first part before the loop.
   if (S.getInit())
     EmitStmt(S.getInit());
+
+  if (MatchTestExpr::isCaseConditionChain(S.getCond())) {
+    JumpDest CondDest = getJumpDestInCurrentScope("for.cond");
+    EmitBlock(CondDest.getBlock());
+    if (CGM.shouldEmitConvergenceTokens())
+      ConvergenceTokenStack.push_back(
+          emitConvergenceLoopToken(CondDest.getBlock()));
+    const SourceRange &R = S.getSourceRange();
+    LoopStack.push(CondDest.getBlock(), CGM.getContext(), CGM.getCodeGenOpts(),
+                   ForAttrs, SourceLocToDebugLoc(R.getBegin()),
+                   SourceLocToDebugLoc(R.getEnd()),
+                   checkIfLoopMustProgress(
+                       S.getCond(), hasEmptyLoopBody(S)));
+    BreakContinueStack.push_back(BreakContinue(S, LoopExit, CondDest));
+
+    EmitCaseConditionChain(
+        S.getCond(),
+        [&](const MatchTestInstantiation *Instantiation) {
+          JumpDest Increment = getJumpDestInCurrentScope("for.case.increment");
+          BreakContinueStack.back().ContinueBlock = Increment;
+          incrementProfileCounter(UseExecPath, &S);
+          EmitStmt(Instantiation && Instantiation->Handler
+                       ? Instantiation->Handler
+                       : S.getBody());
+          EmitBlock(Increment.getBlock());
+          if (const Expr *Inc = Instantiation && Instantiation->Increment
+                                    ? Instantiation->Increment
+                                    : S.getInc())
+            EmitStmt(Inc);
+          BreakContinueStack.back().ContinueBlock = CondDest;
+          if (HaveInsertPoint())
+            EmitBranchThroughCleanup(CondDest);
+        },
+        LoopExit);
+
+    BreakContinueStack.pop_back();
+    if (ForScope)
+      ForScope->ForceCleanup();
+    LoopStack.pop();
+    EmitBlock(LoopExit.getBlock(), true);
+    if (CGM.shouldEmitConvergenceTokens())
+      ConvergenceTokenStack.pop_back();
+    return;
+  }
+
+  if (auto *Match = MatchTestExpr::findInCondition(S.getCond());
+      Match && Match->hasConditionInstantiations()) {
+    JumpDest CondDest = getJumpDestInCurrentScope("for.cond");
+    EmitBlock(CondDest.getBlock());
+    if (CGM.shouldEmitConvergenceTokens())
+      ConvergenceTokenStack.push_back(
+          emitConvergenceLoopToken(CondDest.getBlock()));
+    const SourceRange &R = S.getSourceRange();
+    LoopStack.push(CondDest.getBlock(), CGM.getContext(), CGM.getCodeGenOpts(),
+                   ForAttrs, SourceLocToDebugLoc(R.getBegin()),
+                   SourceLocToDebugLoc(R.getEnd()),
+                   checkIfLoopMustProgress(
+                       S.getCond(), hasEmptyLoopBody(S)));
+    BreakContinueStack.push_back(BreakContinue(S, LoopExit, CondDest));
+
+    EmitMatchTestDispatch(
+        *Match, CondDest,
+        [&](const MatchTestInstantiation &Instantiation) {
+          JumpDest Increment = getJumpDestInCurrentScope("for.case.increment");
+          BreakContinueStack.back().ContinueBlock = Increment;
+          incrementProfileCounter(UseExecPath, &S);
+          EmitStmt(Instantiation.Handler);
+          EmitBlock(Increment.getBlock());
+          if (Instantiation.Increment)
+            EmitStmt(Instantiation.Increment);
+          BreakContinueStack.back().ContinueBlock = CondDest;
+        },
+        LoopExit, [] {});
+
+    BreakContinueStack.pop_back();
+    if (ForScope)
+      ForScope->ForceCleanup();
+    LoopStack.pop();
+    EmitBlock(LoopExit.getBlock(), true);
+    if (CGM.shouldEmitConvergenceTokens())
+      ConvergenceTokenStack.pop_back();
+    return;
+  }
 
   // Start the loop with a block that tests the condition.
   // If there's an increment, the continue scope will be overwritten
@@ -1844,6 +2164,126 @@ void CodeGenFunction::EmitContinueStmt(const ContinueStmt &S) {
 
   ApplyAtomGroup Grp(getDebugInfo());
   EmitBranchThroughCleanup(GetDestForLoopControlStmt(S)->ContinueBlock);
+}
+
+void CodeGenFunction::EmitDoReturnStmt(const DoReturnStmt &S) {
+  assert(!DoExprStack.empty() && "do_return stmt not in a do-expression!");
+
+  if (HaveInsertPoint())
+    EmitStopPoint(&S);
+
+  const DoExprEmitInfo &Info = DoExprStack.back();
+  if (const Expr *Operand = S.getOperand()) {
+    if (Info.NRVOCandidate) {
+      // The named return value optimization applies: the operand names the
+      // candidate, which was already built in Info.Slot, so there is nothing
+      // to do but tell the cleanup not to destroy it.
+      if (llvm::Value *NRVOFlag = NRVOFlags[Info.NRVOCandidate])
+        Builder.CreateFlagStore(Builder.getTrue(), NRVOFlag);
+    } else if (Info.IsReference) {
+      // Reference result: emit the operand as a glvalue and store its
+      // address into the pointer slot. A `MaterializeTemporaryExpr`
+      // inserted by Sema for a prvalue operand is itself a glvalue (the
+      // materialized temporary), so EmitLValue handles both cases. We do
+      // *not* attempt lifetime extension across the do-expression: a
+      // prvalue-operand binding dangles, exactly like the equivalent IIFE
+      // would, and Sema's standard return-binding lifetime checks fire
+      // accordingly.
+      LValue OpLV = EmitLValue(Operand);
+      Builder.CreateStore(OpLV.getPointer(*this), Info.Slot);
+    } else if (Info.Slot.isValid()) {
+      EmitAnyExprToMem(Operand, Info.Slot, Qualifiers(), /*IsInit=*/true);
+    } else {
+      // Void-typed do-expression: evaluate for side effects only.
+      EmitIgnoredExpr(Operand);
+    }
+  }
+  EmitBranchThroughCleanup(Info.EndBlock);
+}
+
+Address CodeGenFunction::EmitDoExpr(const DoExpr &E, AggValueSlot AVS) {
+  // Everything this do-expression declares -- init-captures and body locals
+  // alike -- has to come back out of LocalDeclMap on the way out, so that a
+  // second emission of the same AST gets its own storage. See
+  // DoExprEmittedLocals. Covers the init-captures too, so it is entered before
+  // they are emitted.
+  DoExprEmittedLocals.emplace_back();
+  auto ForgetEmittedLocals = llvm::make_scope_exit([&] {
+    for (const VarDecl *VD : DoExprEmittedLocals.back())
+      LocalDeclMap.erase(VD);
+    DoExprEmittedLocals.pop_back();
+  });
+
+  QualType Ty = E.getType();
+  bool IsVoid = Ty->isVoidType();
+  bool IsReference = E.isGLValue();
+
+  Address Slot = Address::invalid();
+  if (IsReference) {
+    // Allocate a pointer slot; do_return stores the referent's address into
+    // it, and EmitDoExprLValue loads it back as the result lvalue.
+    QualType PtrTy = getContext().getPointerType(Ty);
+    Slot = CreateMemTemp(PtrTy, "doexpr.refresult");
+  } else if (!IsVoid) {
+    // Use the slot the caller supplied, whatever the evaluation kind. For an
+    // aggregate that is the usual AggValueSlot threading; for a scalar it is
+    // the destination of an initialization that is exactly this do-expression
+    // (see EmitExprAsInit), and using it saves a temporary plus the store and
+    // load that copy out of it. Otherwise allocate.
+    if (!AVS.isIgnored() && AVS.getAddress().isValid())
+      Slot = AVS.getAddress();
+    else
+      Slot = CreateMemTemp(Ty, "doexpr.result");
+  }
+
+  // Init declarations live until the enclosing full-expression, so emit them
+  // in the surrounding cleanup scope rather than in the do-body lexical scope.
+  size_t OldLifetimeExtendedSize = LifetimeExtendedCleanupStack.size();
+  if (const Stmt *Init = E.getInitStmt()) {
+    if (const auto *CS = dyn_cast<CompoundStmt>(Init))
+      EmitCompoundStmtWithoutScope(*CS, /*GetLast=*/false);
+    else
+      EmitStmt(Init);
+  }
+  PushLifetimeExtendedCleanups(OldLifetimeExtendedSize);
+
+  JumpDest EndBlock = getJumpDestInCurrentScope("doexpr.end");
+  // The NRVO candidate is looked up out of this frame when its declaration is
+  // emitted, so a second emission of the same body aliases that emission's
+  // slot rather than a remembered one.
+  DoExprStack.push_back(
+      {Slot, EndBlock, IsReference,
+       getLangOpts().ElideConstructors ? E.getNRVOCandidate() : nullptr});
+
+  // Emit the body inside its own lexical scope so locals declared in the body
+  // get proper destruction on `do_return`.
+  {
+    LexicalScope BodyScope(*this, E.getBody()->getSourceRange());
+    EmitCompoundStmtWithoutScope(*E.getBody(), /*GetLast=*/false);
+
+    // If control flowed off the end of the body without a do_return, this
+    // is UB at runtime (Sema rejects do-expressions with no do_return for
+    // non-void result types). Insert an unreachable so the verifier is
+    // happy.
+    if (HaveInsertPoint() && !IsVoid) {
+      Builder.CreateUnreachable();
+      Builder.ClearInsertionPoint();
+    }
+  }
+
+  DoExprStack.pop_back();
+
+  // Emit the join block.
+  EmitBlock(EndBlock.getBlock());
+  return Slot;
+}
+
+LValue CodeGenFunction::EmitDoExprLValue(const DoExpr *E) {
+  CodeGenFunction::StmtExprEvaluation eval(*this);
+  Address PtrSlot = EmitDoExpr(*E, AggValueSlot::ignored());
+  // PtrSlot holds a `T*`. Load it and turn it into an LValue of T.
+  llvm::Value *Ptr = Builder.CreateLoad(PtrSlot);
+  return MakeNaturalAlignAddrLValue(Ptr, E->getType());
 }
 
 /// EmitCaseStmtRange - If case statement range is not too big then

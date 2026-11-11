@@ -775,6 +775,14 @@ bool Compiler<Emitter>::VisitCastExpr(const CastExpr *CE) {
   case CK_ToVoid:
     return discard(SubExpr);
 
+  case CK_TokenArrayToSequence:
+  case CK_SequenceToTokenArray:
+    // Token sequences are the tree evaluator's (P4380).
+    return this->emitInvalid(CE);
+  case CK_NoReturnToAny:
+    // The operand diverges (P3549); there is never a value.
+    return this->emitInvalid(CE);
+
   case CK_Dynamic:
     // This initially goes through VisitCXXDynamicCastExpr, where we emit
     // a diagnostic if appropriate.
@@ -2190,6 +2198,14 @@ template <class Emitter>
 bool Compiler<Emitter>::VisitSubstNonTypeTemplateParmExpr(
     const SubstNonTypeTemplateParmExpr *E) {
   return this->delegate(E->getReplacement());
+}
+
+template <class Emitter>
+bool Compiler<Emitter>::VisitCXXMacroInvocationExpr(
+    const CXXMacroInvocationExpr *E) {
+  if (!E->isResolved())
+    return false;
+  return this->delegate(E->getExpansion());
 }
 
 template <class Emitter>
@@ -5619,7 +5635,7 @@ bool Compiler<Emitter>::visitCompoundStmt(const CompoundStmt *S) {
 template <class Emitter>
 bool Compiler<Emitter>::maybeEmitDeferredVarInit(const VarDecl *VD) {
   if (auto *DD = dyn_cast_if_present<DecompositionDecl>(VD)) {
-    for (auto *BD : DD->flat_bindings())
+    for (auto *BD : DD->all_bindings())
       if (auto *KD = BD->getHoldingVar();
           KD && !this->visitVarDecl(KD, KD->getInit()))
         return false;

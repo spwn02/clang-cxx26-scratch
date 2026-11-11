@@ -128,6 +128,7 @@ bool shouldSkipTypedef(const TypedefNameDecl *TD) {
 //      template<class X> using pvec = vector<x*>; pvec<int> x;
 //    There's no Decl `pvec<int>`, we must choose `pvec<X>` or `vector<int*>`
 //    and both are lossy. We must know upfront what the caller ultimately wants.
+
 struct TargetFinder {
   using RelSet = DeclRelationSet;
   using Rel = DeclRelation;
@@ -449,7 +450,13 @@ public:
         else if (auto *TD = TST->getTemplateName().getAsTemplateDecl())
           // fallback: the (un-specialized) declaration from primary template.
           Outer.add(TD->getTemplatedDecl(), Flags | Rel::TemplatePattern);
-        else if (Outer.Resolver)
+        // P3670R4: TT...[N]<args> refers to the template template parameter
+        // pack that was written.
+        else if (const auto *PI =
+                     TST->getTemplateName().getAsPackIndexingTemplate()) {
+          if (TemplateDecl *Pack = PI->getPattern().getAsTemplateDecl())
+            Outer.add(Pack, Flags);
+        } else if (Outer.Resolver)
           for (const NamedDecl *ND :
                Outer.Resolver->resolveTemplateSpecializationType(TST))
             Outer.add(ND, Flags);
@@ -519,7 +526,7 @@ public:
   }
 
   void add(const ConceptReference *CR, RelSet Flags) {
-    add(CR->getNamedConcept(), Flags);
+    add(getWrittenConceptDecl(CR->getNamedConcept()), Flags);
   }
 };
 
@@ -1034,6 +1041,14 @@ private:
   ///     be references. However, declarations can have references inside them,
   ///     e.g. 'namespace foo = std' references namespace 'std' and this
   ///     function will return the corresponding reference.
+  // The declaration a concept name refers to; for a pack-index-template-name
+  // (P3670R4) the written pack of concepts.
+  static const NamedDecl *conceptDeclOf(TemplateName TN) {
+    if (const auto *PI = TN.getAsPackIndexingTemplate())
+      return PI->getPattern().getAsTemplateDecl();
+    return TN.getAsTemplateDecl();
+  }
+
   llvm::SmallVector<ReferenceLoc> explicitReference(DynTypedNode N) {
     if (auto *D = N.get<Decl>())
       return refInDecl(D, Resolver);
@@ -1072,7 +1087,7 @@ private:
       return {ReferenceLoc{CR->getNestedNameSpecifierLoc(),
                            CR->getConceptNameLoc(),
                            /*IsDecl=*/false,
-                           {CR->getNamedConcept()}}};
+                           {conceptDeclOf(CR->getNamedConcept())}}};
 
     // We do not have location information for other nodes (QualType, etc)
     return {};

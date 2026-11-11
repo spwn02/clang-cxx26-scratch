@@ -41,7 +41,9 @@
 #include "clang/AST/StmtCXX.h"
 #include "clang/AST/StmtObjC.h"
 #include "clang/AST/StmtVisitor.h"
+#include "clang/AST/Reflection.h"
 #include "clang/AST/SpliceSpecifier.h"
+#include "clang/Lex/Token.h"
 #include "clang/AST/TemplateBase.h"
 #include "clang/AST/TemplateName.h"
 #include "clang/AST/Type.h"
@@ -70,6 +72,7 @@
 #include <memory>
 #include <optional>
 #include <type_traits>
+#include <functional>
 #include <utility>
 
 namespace clang {
@@ -652,6 +655,26 @@ namespace clang {
     ExpectedStmt VisitParenExpr(ParenExpr *E);
     ExpectedStmt VisitParenListExpr(ParenListExpr *E);
     ExpectedStmt VisitStmtExpr(StmtExpr *E);
+    ExpectedStmt VisitDoExpr(DoExpr *E);
+    ExpectedStmt VisitMatchTestExpr(MatchTestExpr *E);
+    ExpectedStmt VisitCaseConditionExpr(CaseConditionExpr *E);
+    ExpectedStmt VisitMatchSelectExpr(MatchSelectExpr *E);
+    ExpectedStmt VisitCXXTokenSequenceExpr(CXXTokenSequenceExpr *E);
+    ExpectedStmt VisitCXXMacroInvocationExpr(CXXMacroInvocationExpr *E);
+    ExpectedStmt VisitCXXReflectExpr(CXXReflectExpr *E);
+    ExpectedStmt VisitCXXBuiltinInjectExpr(CXXBuiltinInjectExpr *E);
+    ExpectedStmt VisitCXXBuiltinReportTokensExpr(CXXBuiltinReportTokensExpr *E);
+    ExpectedStmt
+    VisitCXXTokenInterpolationListExpr(CXXTokenInterpolationListExpr *E);
+    ExpectedStmt VisitCXXBuiltinIdExpr(CXXBuiltinIdExpr *E);
+    ExpectedStmt VisitCXXBuiltinStrLiteralExpr(CXXBuiltinStrLiteralExpr *E);
+    ExpectedStmt VisitCXXBuiltinTokenizeExpr(CXXBuiltinTokenizeExpr *E);
+    ExpectedStmt VisitCXXBuiltinStringizeExpr(CXXBuiltinStringizeExpr *E);
+    template <typename ExprT> ExpectedStmt importBuiltinStringExpr(ExprT *E);
+    // CXXMacroInvocationExpr is not imported (its unparsed-argument
+    // environment names parser state): importing one reports an unsupported
+    // construct instead of producing a half-built node.
+    ExpectedStmt VisitDoReturnStmt(DoReturnStmt *S);
     ExpectedStmt VisitUnaryOperator(UnaryOperator *E);
     ExpectedStmt VisitUnaryExprOrTypeTraitExpr(UnaryExprOrTypeTraitExpr *E);
     ExpectedStmt VisitBinaryOperator(BinaryOperator *E);
@@ -1179,19 +1202,28 @@ ASTNodeImporter::ImportExprRequirement(concepts::ExprRequirement *From) {
   if (!NoexceptLocOrErr)
     return NoexceptLocOrErr.takeError();
 
+  Expr *NoexceptCond = nullptr;
+  if (Expr *FromCond = From->getNoexceptCondition()) {
+    Expected<Expr *> CondOrErr = import(FromCond);
+    if (!CondOrErr)
+      return CondOrErr.takeError();
+    NoexceptCond = *CondOrErr;
+  }
+
   if (Status == ExprRequirement::SS_ExprSubstitutionFailure) {
     auto DiagOrErr = import(From->getExprSubstitutionDiagnostic());
     if (!DiagOrErr)
       return DiagOrErr.takeError();
     return new (Importer.getToContext()) ExprRequirement(
-        *DiagOrErr, IsRKSimple, *NoexceptLocOrErr, std::move(*Req));
+        *DiagOrErr, IsRKSimple, *NoexceptLocOrErr, NoexceptCond,
+        std::move(*Req));
   } else {
     Expected<Expr *> ExprOrErr = import(From->getExpr());
     if (!ExprOrErr)
       return ExprOrErr.takeError();
     return new (Importer.getToContext()) concepts::ExprRequirement(
-        *ExprOrErr, IsRKSimple, *NoexceptLocOrErr, std::move(*Req), Status,
-        SubstitutedConstraintExpr);
+        *ExprOrErr, IsRKSimple, *NoexceptLocOrErr, NoexceptCond,
+        std::move(*Req), Status, SubstitutedConstraintExpr);
   }
 }
 
@@ -1756,9 +1788,14 @@ ExpectedType ASTNodeImporter::VisitAutoType(const AutoType *T) {
   if (!ToDeducedTypeOrErr)
     return ToDeducedTypeOrErr.takeError();
 
-  ExpectedDecl ToTypeConstraintConcept = import(T->getTypeConstraintConcept());
-  if (!ToTypeConstraintConcept)
-    return ToTypeConstraintConcept.takeError();
+  TemplateName ToTypeConstraintConcept;
+  if (T->isConstrained()) {
+    Expected<TemplateName> ToConceptOrErr =
+        import(T->getTypeConstraintConcept());
+    if (!ToConceptOrErr)
+      return ToConceptOrErr.takeError();
+    ToTypeConstraintConcept = *ToConceptOrErr;
+  }
 
   SmallVector<TemplateArgument, 2> ToTemplateArgs;
   if (Error Err = ImportTemplateArguments(T->getTypeConstraintArguments(),
@@ -1767,8 +1804,7 @@ ExpectedType ASTNodeImporter::VisitAutoType(const AutoType *T) {
 
   return Importer.getToContext().getAutoType(
       *ToDeducedTypeOrErr, T->getKeyword(), /*IsDependent*/false,
-      /*IsPack=*/false, cast_or_null<ConceptDecl>(*ToTypeConstraintConcept),
-      ToTemplateArgs);
+      /*IsPack=*/false, ToTypeConstraintConcept, ToTemplateArgs);
 }
 
 ExpectedType ASTNodeImporter::VisitDeducedTemplateSpecializationType(
@@ -2819,11 +2855,14 @@ ExpectedDecl ASTNodeImporter::VisitBindingDecl(BindingDecl *D) {
   QualType ToType = importChecked(Err, D->getType());
   Expr *ToBinding = importChecked(Err, D->getBinding());
   ValueDecl *ToDecomposedDecl = importChecked(Err, D->getDecomposedDecl());
+  DecompositionDecl *ToNestedDecomposition =
+      importChecked(Err, D->getNestedDecomposition());
   if (Err)
     return std::move(Err);
 
   ToD->setBinding(ToType, ToBinding);
   ToD->setDecomposedDecl(ToDecomposedDecl);
+  ToD->setNestedDecomposition(ToNestedDecomposition);
   addDeclToContexts(D, ToD);
 
   return ToD;
@@ -4923,6 +4962,13 @@ ExpectedDecl ASTNodeImporter::VisitVarDecl(VarDecl *D) {
 
   if (D->isConstexpr())
     ToVar->setConstexpr(true);
+  if (D->isPatternVariable())
+    ToVar->setPatternVariable();
+  // (A pattern variable has no initializer of its own; this keeps it from
+  // being diagnosed as an uninitialized deduced declaration when it is
+  // instantiated.)
+  if (D->isCXXForRangeDecl())
+    ToVar->setCXXForRangeDecl(true);
 
   addDeclToContexts(D, ToVar);
 
@@ -8083,6 +8129,804 @@ ExpectedStmt ASTNodeImporter::VisitStmtExpr(StmtExpr *E) {
                E->getTemplateDepth());
 }
 
+ExpectedStmt
+ASTNodeImporter::VisitCXXTokenSequenceExpr(CXXTokenSequenceExpr *E) {
+  Error Err = Error::success();
+  auto ToOperatorLoc = importChecked(Err, E->getOperatorLoc());
+  auto ToRange = importChecked(Err, E->getOperandRange());
+  auto ToType = importChecked(Err, E->getType());
+  APValue FromValue = E->getValue();
+  auto ToValue = importChecked(Err, FromValue);
+  if (Err)
+    return std::move(Err);
+
+  SmallVector<TokenSequenceParamBinding, 4> ToBindings;
+  for (const TokenSequenceParamBinding &B : E->getParamBindings()) {
+    auto ToParam = import(B.Param);
+    if (!ToParam)
+      return ToParam.takeError();
+    ToBindings.push_back({B.TokenIndex, *ToParam});
+  }
+
+  ASTContext &Ctx = Importer.getToContext();
+  CXXTokenSequenceExpr *ToE = CXXTokenSequenceExpr::Create(
+      Ctx, ToOperatorLoc, ToRange, ToValue.getTokenSequence(), ToBindings,
+      ToType);
+  {
+    auto Children = E->children();
+    auto It = Children.begin();
+    for (unsigned I = 0, N = E->getNumInterpolationExprs(); I != N; ++I, ++It) {
+      auto ToInterp = import(cast<Expr>(*It));
+      if (!ToInterp)
+        return ToInterp.takeError();
+      ToE->setInterpolationExpr(I, *ToInterp);
+    }
+  }
+  return ToE;
+}
+
+ExpectedStmt ASTNodeImporter::VisitCXXReflectExpr(CXXReflectExpr *E) {
+  Error Err = Error::success();
+  auto ToOperatorLoc = importChecked(Err, E->getOperatorLoc());
+  if (E->hasDependentSubExpr()) {
+    auto ToSub = importChecked(Err, E->getDependentSubExpr());
+    if (Err)
+      return std::move(Err);
+    return CXXReflectExpr::Create(Importer.getToContext(), ToOperatorLoc,
+                                  ToSub);
+  }
+  auto ToRange = importChecked(Err, E->getOperandRange());
+  auto ToType = importChecked(Err, E->getType());
+  APValue FromValue = E->getReflection();
+  auto ToValue = importChecked(Err, FromValue);
+  if (Err)
+    return std::move(Err);
+  return CXXReflectExpr::Create(Importer.getToContext(), ToOperatorLoc,
+                                ToRange, ToValue, ToType);
+}
+
+ExpectedStmt
+ASTNodeImporter::VisitCXXMacroInvocationExpr(CXXMacroInvocationExpr *E) {
+  // Unparsed arguments are parsed at instantiation in the context the
+  // invocation was written in, which has no counterpart in another AST.
+  if (E->areArgsUnparsed())
+    return make_error<ASTImportError>(ASTImportError::UnsupportedConstruct);
+
+  Error Err = Error::success();
+  auto ToExclaimLoc = importChecked(Err, E->getExclaimLoc());
+  auto ToLParenLoc = importChecked(Err, E->getLParenLoc());
+  auto ToRParenLoc = importChecked(Err, E->getRParenLoc());
+  auto ToOperatorLoc = importChecked(Err, E->getOperatorLoc());
+  if (Err)
+    return std::move(Err);
+
+  SmallVector<Expr *, 4> ToArgs(E->getNumArgs());
+  if (Error Err2 = ImportContainerChecked(E->getArgs(), ToArgs))
+    return std::move(Err2);
+
+  ASTContext &Ctx = Importer.getToContext();
+  if (!E->isMemberInvocation()) {
+    auto ToCallee = import(E->getCallee());
+    if (!ToCallee)
+      return ToCallee.takeError();
+    auto *ToE = CXXMacroInvocationExpr::Create(
+        Ctx, *ToCallee, ToArgs, ToExclaimLoc, ToLParenLoc, ToRParenLoc);
+    if (E->isResolved()) {
+      auto ToExpansion = import(E->getExpansion());
+      if (!ToExpansion)
+        return ToExpansion.takeError();
+      ToE->setExpansion(*ToExpansion);
+    }
+    return ToE;
+  }
+
+  auto ToBase = import(E->getBase());
+  if (!ToBase)
+    return ToBase.takeError();
+  DeclarationNameInfo FromNI = E->getMemberNameInfo();
+  auto ToName = import(FromNI.getName());
+  if (!ToName)
+    return ToName.takeError();
+  auto ToNameLoc = import(FromNI.getLoc());
+  if (!ToNameLoc)
+    return ToNameLoc.takeError();
+  DeclarationNameInfo ToNI(*ToName, *ToNameLoc);
+  if (Error Err3 = ImportDeclarationNameLoc(FromNI, ToNI))
+    return std::move(Err3);
+
+  TemplateArgumentListInfo ToTAInfo;
+  const TemplateArgumentListInfo *ToTA = nullptr;
+  if (const auto *FromTA = E->getMemberTemplateArgs()) {
+    if (Error Err4 = ImportTemplateArgumentListInfo(*FromTA, ToTAInfo))
+      return std::move(Err4);
+    ToTA = &ToTAInfo;
+  }
+  auto *ToE = CXXMacroInvocationExpr::CreateMember(
+      Ctx, *ToBase, E->isArrow(), ToOperatorLoc, ToNI, ToArgs, ToExclaimLoc,
+      ToLParenLoc, ToRParenLoc, ToTA);
+  if (E->isResolved()) {
+    auto ToCallee = import(E->getCallee());
+    if (!ToCallee)
+      return ToCallee.takeError();
+    auto ToExpansion = import(E->getExpansion());
+    if (!ToExpansion)
+      return ToExpansion.takeError();
+    ToE->setCallee(*ToCallee);
+    ToE->setExpansion(*ToExpansion);
+  }
+  return ToE;
+}
+
+ExpectedStmt
+ASTNodeImporter::VisitCXXBuiltinInjectExpr(CXXBuiltinInjectExpr *E) {
+  Error Err = Error::success();
+  auto ToType = importChecked(Err, E->getType());
+  auto ToOperand = importChecked(Err, E->getOperand());
+  // The target namespace is optional: queue_injection(tokens) has none.
+  Expr *ToTarget =
+      E->hasTargetNS() ? importChecked(Err, E->getTargetNS()) : nullptr;
+  auto ToKw = importChecked(Err, E->getKwLoc());
+  auto ToLParen = importChecked(Err, E->getLParenLoc());
+  auto ToRParen = importChecked(Err, E->getRParenLoc());
+  if (Err)
+    return std::move(Err);
+  return CXXBuiltinInjectExpr::Create(Importer.getToContext(), ToType,
+                                      ToOperand, ToKw, ToLParen, ToRParen,
+                                      ToTarget);
+}
+
+ExpectedStmt ASTNodeImporter::VisitCXXBuiltinReportTokensExpr(
+    CXXBuiltinReportTokensExpr *E) {
+  Error Err = Error::success();
+  auto ToType = importChecked(Err, E->getType());
+  auto ToMsg = importChecked(Err, E->getMessage());
+  auto ToSize = importChecked(Err, E->getMsgSizeCall());
+  auto ToData = importChecked(Err, E->getMsgDataCall());
+  auto ToOperand = importChecked(Err, E->getOperand());
+  auto ToKw = importChecked(Err, E->getKwLoc());
+  auto ToLParen = importChecked(Err, E->getLParenLoc());
+  auto ToRParen = importChecked(Err, E->getRParenLoc());
+  if (Err)
+    return std::move(Err);
+  return CXXBuiltinReportTokensExpr::Create(Importer.getToContext(), ToType,
+                                            ToMsg, ToSize, ToData, ToOperand,
+                                            ToKw, ToLParen, ToRParen);
+}
+
+ExpectedStmt ASTNodeImporter::VisitCXXTokenInterpolationListExpr(
+    CXXTokenInterpolationListExpr *E) {
+  Error Err = Error::success();
+  auto ToType = importChecked(Err, E->getType());
+  auto ToSeparator = importChecked(Err, E->getSeparator());
+  auto ToBegin = importChecked(Err, E->getBeginLoc());
+  auto ToEnd = importChecked(Err, E->getEndLoc());
+  SmallVector<Expr *, 4> ToElements(E->getNumElements());
+  if (Err)
+    return std::move(Err);
+  if (Error Err2 = ImportContainerChecked(E->getElements(), ToElements))
+    return std::move(Err2);
+  return CXXTokenInterpolationListExpr::Create(Importer.getToContext(), ToType,
+                                               ToElements, ToSeparator,
+                                               ToBegin, ToEnd);
+}
+
+template <typename ExprT>
+ExpectedStmt ASTNodeImporter::importBuiltinStringExpr(ExprT *E) {
+  Error Err = Error::success();
+  auto ToType = importChecked(Err, E->getType());
+  auto ToKw = importChecked(Err, E->getKwLoc());
+  auto ToLParen = importChecked(Err, E->getLParenLoc());
+  auto ToRParen = importChecked(Err, E->getRParenLoc());
+  if (Err)
+    return std::move(Err);
+  SmallVector<Expr *, 4> ToArgs, ToSizes, ToDatas;
+  for (unsigned I = 0, N = E->getNumArgs(); I != N; ++I) {
+    auto A = Importer.Import(E->getArg(I));
+    auto S = Importer.Import(E->getSizeCall(I));
+    auto D = Importer.Import(E->getDataCall(I));
+    if (!A)
+      return A.takeError();
+    if (!S)
+      return S.takeError();
+    if (!D)
+      return D.takeError();
+    ToArgs.push_back(*A);
+    ToSizes.push_back(*S);
+    ToDatas.push_back(*D);
+  }
+  return ExprT::Create(Importer.getToContext(), ToType, ToArgs, ToSizes,
+                       ToDatas, ToKw, ToLParen, ToRParen);
+}
+
+ExpectedStmt ASTNodeImporter::VisitCXXBuiltinIdExpr(CXXBuiltinIdExpr *E) {
+  return importBuiltinStringExpr(E);
+}
+ExpectedStmt
+ASTNodeImporter::VisitCXXBuiltinStrLiteralExpr(CXXBuiltinStrLiteralExpr *E) {
+  return importBuiltinStringExpr(E);
+}
+ExpectedStmt
+ASTNodeImporter::VisitCXXBuiltinTokenizeExpr(CXXBuiltinTokenizeExpr *E) {
+  return importBuiltinStringExpr(E);
+}
+
+ExpectedStmt
+ASTNodeImporter::VisitCXXBuiltinStringizeExpr(CXXBuiltinStringizeExpr *E) {
+  Error Err = Error::success();
+  auto ToType = importChecked(Err, E->getType());
+  auto ToOperand = importChecked(Err, E->getOperand());
+  auto ToKw = importChecked(Err, E->getKwLoc());
+  auto ToLParen = importChecked(Err, E->getLParenLoc());
+  auto ToRParen = importChecked(Err, E->getRParenLoc());
+  if (Err)
+    return std::move(Err);
+  return CXXBuiltinStringizeExpr::Create(Importer.getToContext(), ToType,
+                                         ToOperand, ToKw, ToLParen, ToRParen);
+}
+
+namespace {
+/// Imports the pattern-matching structures of a MatchTestExpr or a
+/// MatchSelectExpr. A pattern, a pattern instantiation and a projection can be
+/// shared inside one expression (a MatchPatternInfo is found by the identity of
+/// its pattern), so each is imported once.
+struct MatchImporter {
+  ASTImporter &Importer;
+  std::function<Expected<ConceptReference *>(ConceptReference *)> ImportConcept;
+  ASTContext &Ctx;
+  llvm::DenseMap<const MatchPattern *, MatchPattern *> Patterns;
+  llvm::DenseMap<const MatchPatternInstantiation *, MatchPatternInstantiation *>
+      Instantiations;
+  llvm::DenseMap<const MatchProjection *, MatchProjection *> Projections;
+
+  MatchImporter(
+      ASTImporter &Importer,
+      std::function<Expected<ConceptReference *>(ConceptReference *)> Concept)
+      : Importer(Importer), ImportConcept(std::move(Concept)),
+        Ctx(Importer.getToContext()) {}
+
+  template <class T> ArrayRef<T> copy(ArrayRef<T> Values) {
+    if (Values.empty())
+      return {};
+    T *Storage = Ctx.Allocate<T>(Values.size());
+    std::uninitialized_copy(Values.begin(), Values.end(), Storage);
+    return ArrayRef<T>(Storage, Values.size());
+  }
+
+  template <class T> Error stmt(T *&To, T *From) {
+    if (!From) {
+      To = nullptr;
+      return Error::success();
+    }
+    auto Imported = Importer.Import(From);
+    if (!Imported)
+      return Imported.takeError();
+    To = cast<T>(*Imported);
+    return Error::success();
+  }
+
+  Expected<MatchGuard> guard(const MatchGuard &From) {
+    MatchGuard To;
+    if (Error Err = stmt(To.Init, From.Init))
+      return std::move(Err);
+    if (Error Err = stmt(To.ConditionVariable, From.ConditionVariable))
+      return std::move(Err);
+    if (Error Err = stmt(To.Condition, From.Condition))
+      return std::move(Err);
+    return To;
+  }
+
+  Expected<SmallVector<MatchPattern *, 4>>
+  patterns(ArrayRef<MatchPattern *> From) {
+    SmallVector<MatchPattern *, 4> To;
+    for (MatchPattern *P : From) {
+      auto Imported = pattern(P);
+      if (!Imported)
+        return Imported.takeError();
+      To.push_back(*Imported);
+    }
+    return To;
+  }
+
+  Expected<SmallVector<SourceLocation, 4>>
+  locations(ArrayRef<SourceLocation> From) {
+    SmallVector<SourceLocation, 4> To;
+    for (SourceLocation Loc : From) {
+      auto Imported = Importer.Import(Loc);
+      if (!Imported)
+        return Imported.takeError();
+      To.push_back(*Imported);
+    }
+    return To;
+  }
+
+  Expected<MatchPattern *> pattern(MatchPattern *From) {
+    if (!From)
+      return nullptr;
+    if (auto It = Patterns.find(From); It != Patterns.end())
+      return It->second;
+    MatchPattern *To = nullptr;
+    switch (From->getMatchPatternClass()) {
+    case MatchPattern::WildcardPatternClass: {
+      auto *W = cast<WildcardPattern>(From);
+      auto Loc = Importer.Import(W->getBeginLoc());
+      if (!Loc)
+        return Loc.takeError();
+      To = new (Ctx) WildcardPattern(*Loc, W->isPackExpansion());
+      break;
+    }
+    case MatchPattern::ExpressionPatternClass: {
+      auto *X = cast<ExpressionPattern>(From);
+      auto E = Importer.Import(X->getExpr());
+      if (!E)
+        return E.takeError();
+      To = new (Ctx) ExpressionPattern(*E, X->isPackExpansion());
+      break;
+    }
+    case MatchPattern::ParenPatternClass: {
+      auto *Paren = cast<ParenPattern>(From);
+      auto Range = Importer.Import(Paren->getParens());
+      auto Sub = pattern(Paren->getSubPattern());
+      if (!Range)
+        return Range.takeError();
+      if (!Sub)
+        return Sub.takeError();
+      To = new (Ctx) ParenPattern(*Range, *Sub);
+      break;
+    }
+    case MatchPattern::DeclarationPatternClass: {
+      auto *D = cast<DeclarationPattern>(From);
+      VarDecl *Declaration = nullptr, *PackSource = nullptr;
+      if (Error Err = stmt(Declaration, D->getDeclaration()))
+        return std::move(Err);
+      if (Error Err = stmt(PackSource, D->getPackSourceDeclaration()))
+        return std::move(Err);
+      auto Range =
+          Importer.Import(SourceRange(D->getBeginLoc(), D->getEndLoc()));
+      if (!Range)
+        return Range.takeError();
+      To = new (Ctx) DeclarationPattern(Declaration, *Range, PackSource);
+      break;
+    }
+    case MatchPattern::TypePatternClass: {
+      auto TInfo = Importer.Import(cast<TypePattern>(From)->getTypeSourceInfo());
+      if (!TInfo)
+        return TInfo.takeError();
+      To = new (Ctx) TypePattern(*TInfo);
+      break;
+    }
+    case MatchPattern::OrPatternClass: {
+      auto *O = cast<OrPattern>(From);
+      auto Children = patterns(O->alternatives());
+      auto Locs = locations(O->orLocations());
+      if (!Children)
+        return Children.takeError();
+      if (!Locs)
+        return Locs.takeError();
+      SmallVector<VarDecl *, 4> Bindings;
+      for (VarDecl *B : O->bindings()) {
+        VarDecl *Imported = nullptr;
+        if (Error Err = stmt(Imported, B))
+          return std::move(Err);
+        Bindings.push_back(Imported);
+      }
+      MatchPattern **Storage = Ctx.Allocate<MatchPattern *>(Children->size());
+      std::uninitialized_copy(Children->begin(), Children->end(), Storage);
+      To = new (Ctx) OrPattern(
+          MutableArrayRef<MatchPattern *>(Storage, Children->size()),
+          copy(ArrayRef<SourceLocation>(*Locs)),
+          copy(ArrayRef<VarDecl *>(Bindings)));
+      break;
+    }
+    case MatchPattern::AlternativePatternClass: {
+      auto *A = cast<AlternativePattern>(From);
+      auto Braces = Importer.Import(A->getBraces());
+      auto Discriminator = Importer.Import(A->getDiscriminatorRange());
+      auto Colon = Importer.Import(A->getColonLoc());
+      auto Selector = pattern(A->getSelector());
+      auto Sub = pattern(A->getSubPattern());
+      if (!Braces)
+        return Braces.takeError();
+      if (!Discriminator)
+        return Discriminator.takeError();
+      if (!Colon)
+        return Colon.takeError();
+      if (!Selector)
+        return Selector.takeError();
+      if (!Sub)
+        return Sub.takeError();
+      IdentifierInfo *Name = Importer.Import(A->getName());
+      switch (A->getAlternativeKind()) {
+      case AlternativePattern::Generic:
+        To = new (Ctx) AlternativePattern(*Braces, *Sub);
+        break;
+      case AlternativePattern::Named:
+        To = new (Ctx)
+            AlternativePattern(*Braces, *Discriminator, Name, *Colon, *Sub);
+        break;
+      case AlternativePattern::ParameterizedName:
+        To = new (Ctx) AlternativePattern(*Braces, *Discriminator, Name,
+                                          *Selector, *Colon, *Sub);
+        break;
+      case AlternativePattern::Type:
+        To = new (Ctx) AlternativePattern(*Braces, *Selector, *Colon, *Sub);
+        break;
+      case AlternativePattern::TypeConstraint: {
+        auto Constraint = ImportConcept(
+            const_cast<ConceptReference *>(A->getTypeConstraintSelector()));
+        if (!Constraint)
+          return Constraint.takeError();
+        To = new (Ctx)
+            AlternativePattern(*Braces, *Discriminator, *Constraint, *Colon, *Sub);
+        break;
+      }
+      case AlternativePattern::Empty:
+        To = new (Ctx) AlternativePattern(*Braces);
+        break;
+      }
+      break;
+    }
+    case MatchPattern::DecompositionPatternClass: {
+      auto *D = cast<DecompositionPattern>(From);
+      auto Children = patterns(D->patterns());
+      auto Squares = Importer.Import(D->getSquares());
+      if (!Children)
+        return Children.takeError();
+      if (!Squares)
+        return Squares.takeError();
+      To = DecompositionPattern::Create(Ctx, *Children, *Squares);
+      break;
+    }
+    }
+    Patterns[From] = To;
+    return To;
+  }
+
+  Expected<MatchProjection *> projection(const MatchProjection *From) {
+    if (!From)
+      return nullptr;
+    if (auto It = Projections.find(From); It != Projections.end())
+      return It->second;
+    auto *To = new (Ctx) MatchProjection(From->getKind());
+    VarDecl *V = nullptr;
+    if (Error Err = stmt(V, From->getHoldingVar()))
+      return std::move(Err);
+    To->setHoldingVar(V);
+    if (Error Err = stmt(V, From->getIntermediateVar()))
+      return std::move(Err);
+    To->setIntermediateVar(V);
+    if (Error Err = stmt(V, From->getConditionVar()))
+      return std::move(Err);
+    To->setConditionVar(V);
+    if (Error Err = stmt(V, From->getProjectedVar()))
+      return std::move(Err);
+    To->setProjectedVar(V);
+    DecompositionDecl *DD = nullptr;
+    if (Error Err = stmt(DD, From->getDecomposedDecl()))
+      return std::move(Err);
+    To->setDecomposedDecl(DD);
+    Expr *E = nullptr;
+    if (Error Err = stmt(E, From->getConditionExpr()))
+      return std::move(Err);
+    To->setConditionExpr(E);
+    if (Error Err = stmt(E, From->getProjectedExpr()))
+      return std::move(Err);
+    To->setProjectedExpr(E);
+    Projections[From] = To;
+    return To;
+  }
+
+  Expected<MatchPatternInfo> info(const MatchPatternInfo &From) {
+    MatchPatternInfo To = From;
+    auto P = pattern(From.Pattern);
+    if (!P)
+      return P.takeError();
+    To.Pattern = *P;
+    if (Error Err = stmt(To.Condition, From.Condition))
+      return std::move(Err);
+    auto Proj = projection(From.Projection);
+    if (!Proj)
+      return Proj.takeError();
+    To.Projection = *Proj;
+    auto Checked = Importer.Import(From.CheckedSubjectType);
+    auto Traits = Importer.Import(From.AlternativeTraitsType);
+    auto Open = Importer.Import(From.OpenAlternativeType);
+    if (!Checked)
+      return Checked.takeError();
+    if (!Traits)
+      return Traits.takeError();
+    if (!Open)
+      return Open.takeError();
+    To.CheckedSubjectType = *Checked;
+    To.AlternativeTraitsType = *Traits;
+    To.OpenAlternativeType = *Open;
+    SmallVector<QualType, 4> Types;
+    for (QualType T : From.AlternativeTypes) {
+      auto Imported = Importer.Import(T);
+      if (!Imported)
+        return Imported.takeError();
+      Types.push_back(*Imported);
+    }
+    To.AlternativeTypes = copy(ArrayRef<QualType>(Types));
+    SmallVector<Expr *, 4> Values;
+    for (Expr *E : From.AlternativeValues) {
+      Expr *Imported = nullptr;
+      if (Error Err = stmt(Imported, E))
+        return std::move(Err);
+      Values.push_back(Imported);
+    }
+    To.AlternativeValues = copy(ArrayRef<Expr *>(Values));
+    auto Expanded = patterns(From.ExpandedPatterns);
+    if (!Expanded)
+      return Expanded.takeError();
+    To.ExpandedPatterns = copy(ArrayRef<MatchPattern *>(*Expanded));
+    // The remaining arrays hold numbers.
+    To.ProjectableAlternatives = copy(From.ProjectableAlternatives);
+    To.EmptyAlternatives = copy(From.EmptyAlternatives);
+    To.SelectedAlternatives = copy(From.SelectedAlternatives);
+    To.ViableOrAlternatives = copy(From.ViableOrAlternatives);
+    return To;
+  }
+
+  Expected<MatchPatternInstantiation *>
+  instantiation(MatchPatternInstantiation *From) {
+    if (!From)
+      return nullptr;
+    if (auto It = Instantiations.find(From); It != Instantiations.end())
+      return It->second;
+    auto P = pattern(From->getPattern());
+    if (!P)
+      return P.takeError();
+    SmallVector<MatchPatternInfo, 4> Infos;
+    for (const MatchPatternInfo &Info : From->infos()) {
+      auto Imported = info(Info);
+      if (!Imported)
+        return Imported.takeError();
+      Infos.push_back(*Imported);
+    }
+    auto *To = MatchPatternInstantiation::Create(Ctx, *P, Infos);
+    Instantiations[From] = To;
+    return To;
+  }
+
+  Expected<MatchTestInstantiation> testInstantiation(
+      const MatchTestInstantiation &From) {
+    MatchTestInstantiation To = From;
+    auto P = pattern(From.Pattern);
+    auto Loc = Importer.Import(From.IfLoc);
+    auto G = guard(From.Guard);
+    auto PI = instantiation(From.PatternInstantiation);
+    if (!P)
+      return P.takeError();
+    if (!Loc)
+      return Loc.takeError();
+    if (!G)
+      return G.takeError();
+    if (!PI)
+      return PI.takeError();
+    To.Pattern = *P;
+    To.IfLoc = *Loc;
+    To.Guard = *G;
+    To.PatternInstantiation = *PI;
+    if (Error Err = stmt(To.Condition, From.Condition))
+      return std::move(Err);
+    if (Error Err = stmt(To.Handler, From.Handler))
+      return std::move(Err);
+    if (Error Err = stmt(To.Increment, From.Increment))
+      return std::move(Err);
+    return To;
+  }
+
+  Expected<ArrayRef<const Attr *>> attributes(ArrayRef<const Attr *> From) {
+    SmallVector<const Attr *, 2> To;
+    for (const Attr *A : From) {
+      auto Imported = Importer.Import(A);
+      if (!Imported)
+        return Imported.takeError();
+      To.push_back(*Imported);
+    }
+    return copy(ArrayRef<const Attr *>(To));
+  }
+};
+} // namespace
+
+ExpectedStmt ASTNodeImporter::VisitMatchTestExpr(MatchTestExpr *E) {
+  MatchImporter M(Importer, [this](ConceptReference *From) {
+    return import(From);
+  });
+  Error Err = Error::success();
+  auto ToHoldingVar = importChecked(Err, E->getHoldingVar());
+  auto ToSubject = importChecked(Err, E->getSubject());
+  auto ToMatchLoc = importChecked(Err, E->getMatchLoc());
+  auto ToRParenLoc = importChecked(Err, E->getRParenLoc());
+  auto ToIfLoc = importChecked(Err, E->getIfLoc());
+  if (Err)
+    return std::move(Err);
+  auto ToPattern = M.pattern(E->getPattern());
+  if (!ToPattern)
+    return ToPattern.takeError();
+  auto ToPatternInstantiation = M.instantiation(E->getPatternInstantiation());
+  if (!ToPatternInstantiation)
+    return ToPatternInstantiation.takeError();
+  auto ToGuard = M.guard(E->getGuard());
+  if (!ToGuard)
+    return ToGuard.takeError();
+  SmallVector<MatchTestInstantiation, 2> ToInstantiations;
+  for (const MatchTestInstantiation &I : E->getInstantiations()) {
+    auto Imported = M.testInstantiation(I);
+    if (!Imported)
+      return Imported.takeError();
+    ToInstantiations.push_back(*Imported);
+  }
+  // The expression is created from the pieces; the subject is the holding
+  // variable's reference or the subject itself, as in the source expression.
+  ASTContext &Ctx = Importer.getToContext();
+  MatchTestExpr *ToE;
+  if (auto *CC = dyn_cast<CaseConditionExpr>(E)) {
+    auto *ToCC = new (Ctx) CaseConditionExpr(
+        Ctx, ToHoldingVar, ToSubject, ToMatchLoc, *ToPattern,
+        *ToPatternInstantiation, CC->isPatternIrrefutable(),
+        CC->needsCaseInstantiation(), ToInstantiations,
+        CC->hasSemanticInstantiations());
+    ToE = ToCC;
+  } else {
+    ToE = new (Ctx) MatchTestExpr(
+        Ctx, ToHoldingVar, ToSubject, ToMatchLoc, *ToPattern,
+        *ToPatternInstantiation, ToIfLoc, *ToGuard, E->isPatternIrrefutable(),
+        E->needsCaseInstantiation(), ToInstantiations,
+        E->hasSemanticInstantiations(), E->hasSubjectProduct());
+  }
+  ToE->setRParenLoc(ToRParenLoc);
+  return ToE;
+}
+
+ExpectedStmt ASTNodeImporter::VisitCaseConditionExpr(CaseConditionExpr *E) {
+  return VisitMatchTestExpr(E);
+}
+
+ExpectedStmt ASTNodeImporter::VisitMatchSelectExpr(MatchSelectExpr *E) {
+  MatchImporter M(Importer, [this](ConceptReference *From) {
+    return import(From);
+  });
+  Error Err = Error::success();
+  auto ToInit = importChecked(Err, E->getInitStmt());
+  auto ToHoldingVar = importChecked(Err, E->getHoldingVar());
+  auto ToSubject = importChecked(Err, E->getSubject());
+  auto ToMatchLoc = importChecked(Err, E->getMatchLoc());
+  auto ToType = importChecked(Err, E->getType());
+  auto ToBraces = importChecked(Err, E->getBraces());
+  if (Err)
+    return std::move(Err);
+  // The type given to the constructor carries the value category.
+  if (E->isLValue())
+    ToType = Importer.getToContext().getLValueReferenceType(ToType);
+  else if (E->isXValue())
+    ToType = Importer.getToContext().getRValueReferenceType(ToType);
+
+  // The result type as written.
+  TypeLoc ToOrigResultType;
+  if (!E->getOrigResultType().isNull()) {
+    auto ToTy = Importer.Import(E->getOrigResultType().getType());
+    if (!ToTy)
+      return ToTy.takeError();
+    ToOrigResultType =
+        Importer.getToContext().getTrivialTypeSourceInfo(*ToTy)->getTypeLoc();
+  }
+
+  SmallVector<Stmt *, 4> ToPreamble;
+  for (Stmt *S : E->getPreamble()) {
+    auto Imported = Importer.Import(S);
+    if (!Imported)
+      return Imported.takeError();
+    ToPreamble.push_back(*Imported);
+  }
+
+  SmallVector<MatchCase, 8> ToCases;
+  for (const MatchCase &C : E->getCases()) {
+    MatchCase To = C;
+    auto P = M.pattern(C.Pattern);
+    auto Loc = Importer.Import(C.IfLoc);
+    auto G = M.guard(C.Guard);
+    auto PI = M.instantiation(C.PatternInstantiation);
+    auto Attrs = M.attributes(C.Attributes);
+    auto NotReturn = Importer.Import(C.NotReturnLoc);
+    if (!P)
+      return P.takeError();
+    if (!Loc)
+      return Loc.takeError();
+    if (!G)
+      return G.takeError();
+    if (!PI)
+      return PI.takeError();
+    if (!Attrs)
+      return Attrs.takeError();
+    if (!NotReturn)
+      return NotReturn.takeError();
+    To.Pattern = *P;
+    To.IfLoc = *Loc;
+    To.Guard = *G;
+    To.PatternInstantiation = *PI;
+    To.Attributes = *Attrs;
+    To.NotReturnLoc = *NotReturn;
+    auto Handler = Importer.Import(C.Handler);
+    if (!Handler)
+      return Handler.takeError();
+    To.Handler = *Handler;
+    ToCases.push_back(To);
+  }
+
+  SmallVector<MatchCaseInstantiation, 8> ToInstantiations;
+  for (const MatchCaseInstantiation &C : E->getCaseInstantiations()) {
+    MatchCaseInstantiation To = C;
+    auto P = M.pattern(C.Pattern);
+    auto Loc = Importer.Import(C.IfLoc);
+    auto G = M.guard(C.Guard);
+    auto PI = M.instantiation(C.PatternInstantiation);
+    auto Attrs = M.attributes(C.Attributes);
+    auto NotReturn = Importer.Import(C.NotReturnLoc);
+    if (!P)
+      return P.takeError();
+    if (!Loc)
+      return Loc.takeError();
+    if (!G)
+      return G.takeError();
+    if (!PI)
+      return PI.takeError();
+    if (!Attrs)
+      return Attrs.takeError();
+    if (!NotReturn)
+      return NotReturn.takeError();
+    To.Pattern = *P;
+    To.IfLoc = *Loc;
+    To.Guard = *G;
+    To.PatternInstantiation = *PI;
+    To.Attributes = *Attrs;
+    To.NotReturnLoc = *NotReturn;
+    auto Handler = Importer.Import(C.Handler);
+    if (!Handler)
+      return Handler.takeError();
+    To.Handler = *Handler;
+    ToInstantiations.push_back(To);
+  }
+
+  return MatchSelectExpr::Create(
+      Importer.getToContext(), ToInit, ToHoldingVar, ToSubject, ToMatchLoc,
+      E->isConstexpr(), E->isStatement(), E->hasSubjectProduct(),
+      E->isFullyCovered(), ToOrigResultType, ToType, ToPreamble, ToCases,
+      ToInstantiations, ToBraces);
+}
+
+ExpectedStmt ASTNodeImporter::VisitDoExpr(DoExpr *E) {
+  Error Err = Error::success();
+  auto ToInitStmt = importChecked(Err, E->getInitStmt());
+  auto ToBody = importChecked(Err, static_cast<Stmt *>(E->getBody()));
+  auto ToType = importChecked(Err, E->getType());
+  auto ToExplicitType = importChecked(Err, E->getExplicitType());
+  auto ToDoLoc = importChecked(Err, E->getDoLoc());
+  auto ToLBraceLoc = importChecked(Err, E->getLBraceLoc());
+  auto ToRBraceLoc = importChecked(Err, E->getRBraceLoc());
+  auto ToNRVOCandidate = importChecked(Err, E->getNRVOCandidate());
+  if (Err)
+    return std::move(Err);
+
+  auto *ToE = new (Importer.getToContext())
+      DoExpr(ToInitStmt, cast<CompoundStmt>(ToBody), ToType,
+             E->getValueKind(), ToExplicitType, ToDoLoc, ToLBraceLoc,
+             ToRBraceLoc, E->getTemplateDepth(),
+             E->containsUnexpandedParameterPack());
+  ToE->setNRVOCandidate(ToNRVOCandidate);
+  return ToE;
+}
+
+ExpectedStmt ASTNodeImporter::VisitDoReturnStmt(DoReturnStmt *S) {
+  Error Err = Error::success();
+  auto ToKeywordLoc = importChecked(Err, S->getKeywordLoc());
+  auto ToOperand = importChecked(Err, S->getOperand());
+  if (Err)
+    return std::move(Err);
+
+  return new (Importer.getToContext()) DoReturnStmt(ToKeywordLoc, ToOperand);
+}
+
 ExpectedStmt ASTNodeImporter::VisitUnaryOperator(UnaryOperator *E) {
   Error Err = Error::success();
   auto ToSubExpr = importChecked(Err, E->getSubExpr());
@@ -10423,6 +11267,27 @@ Expected<TemplateName> ASTImporter::Import(TemplateName From) {
         *ArgPackOrErr, *AssociatedDeclOrErr, SubstPack->getIndex(),
         SubstPack->getFinal());
   }
+  case TemplateName::PackIndexingTemplate: {
+    PackIndexingTemplateStorage *PI = From.getAsPackIndexingTemplate();
+    auto PatternOrErr = Import(PI->getPattern());
+    if (!PatternOrErr)
+      return PatternOrErr.takeError();
+
+    auto IndexExprOrErr = Import(PI->getIndexExpr());
+    if (!IndexExprOrErr)
+      return IndexExprOrErr.takeError();
+
+    SmallVector<TemplateName, 4> Expansions;
+    for (TemplateName T : PI->getExpansions()) {
+      auto ExpansionOrErr = Import(T);
+      if (!ExpansionOrErr)
+        return ExpansionOrErr.takeError();
+      Expansions.push_back(*ExpansionOrErr);
+    }
+
+    return ToContext.getPackIndexingTemplateName(
+        *PatternOrErr, *IndexExprOrErr, PI->isFullySubstituted(), Expansions);
+  }
   case TemplateName::UsingTemplate: {
     auto UsingOrError = Import(From.getAsUsingShadowDecl());
     if (!UsingOrError)
@@ -10803,9 +11668,138 @@ ASTNodeImporter::ImportAPValue(const APValue &FromValue) {
   case APValue::FixedPoint:
   case APValue::ComplexInt:
   case APValue::ComplexFloat:
-  case APValue::Reflection:
     Result = FromValue;
     break;
+  case APValue::Reflection: {
+    // A reflection points into the context it was made in: import what it
+    // names. The kinds that carry other state (objects, values, base and
+    // member specifiers, annotations, expressions) and lifted reflections
+    // are not importable yet.
+    if (FromValue.getReflectionDepth() != 0)
+      return make_error<ASTImportError>(ASTImportError::UnsupportedConstruct);
+    switch (FromValue.getReflectionKind()) {
+    case ReflectionKind::Null:
+      Result = FromValue;
+      break;
+    case ReflectionKind::Type: {
+      auto ToTy = Importer.Import(FromValue.getReflectedType());
+      if (!ToTy)
+        return ToTy.takeError();
+      Result = APValue(ReflectionKind::Type, ToTy->getAsOpaquePtr());
+      break;
+    }
+    case ReflectionKind::Declaration: {
+      auto ToD = Importer.Import(FromValue.getReflectedDecl());
+      if (!ToD)
+        return ToD.takeError();
+      Result = APValue(ReflectionKind::Declaration, *ToD);
+      break;
+    }
+    case ReflectionKind::Namespace: {
+      auto ToD = Importer.Import(FromValue.getReflectedNamespace());
+      if (!ToD)
+        return ToD.takeError();
+      Result = APValue(ReflectionKind::Namespace, *ToD);
+      break;
+    }
+    case ReflectionKind::Parameter: {
+      auto ToD = Importer.Import(FromValue.getReflectedParameter());
+      if (!ToD)
+        return ToD.takeError();
+      Result = APValue(ReflectionKind::Parameter, *ToD);
+      break;
+    }
+    case ReflectionKind::Template: {
+      auto ToT = Importer.Import(FromValue.getReflectedTemplate());
+      if (!ToT)
+        return ToT.takeError();
+      Result = APValue(ReflectionKind::Template, ToT->getAsVoidPointer());
+      break;
+    }
+    default:
+      return make_error<ASTImportError>(ASTImportError::UnsupportedConstruct);
+    }
+    break;
+  }
+  case APValue::TokenSequence: {
+    if (Err)
+      return std::move(Err);
+    // Rebuild the token array in the destination context: locations,
+    // identifiers, spellings and what the annotation tokens carry are all
+    // imported; an annotation token that cannot be becomes tok::unknown.
+    ASTContext &ToCtx = Importer.getToContext();
+    SmallVector<Token, 16> ToToks;
+    for (const Token &T : FromValue.getTokenSequence()) {
+      Token N = T;
+      auto ToLoc = Importer.Import(T.getLocation());
+      if (!ToLoc)
+        return ToLoc.takeError();
+      N.setLocation(*ToLoc);
+      if (T.isAnnotation()) {
+        auto ToEnd = Importer.Import(T.getAnnotationEndLoc());
+        if (!ToEnd)
+          return ToEnd.takeError();
+        N.setAnnotationEndLoc(*ToEnd);
+        switch (T.getKind()) {
+        case tok::annot_typename: {
+          auto ToTy = Importer.Import(QualType::getFromOpaquePtr(
+              T.getAnnotationValue()));
+          if (!ToTy)
+            return ToTy.takeError();
+          N.setAnnotationValue(ToTy->getAsOpaquePtr());
+          break;
+        }
+        case tok::annot_template_name: {
+          auto ToName = Importer.Import(
+              TemplateName::getFromVoidPointer(T.getAnnotationValue()));
+          if (!ToName)
+            return ToName.takeError();
+          N.setAnnotationValue(ToName->getAsVoidPointer());
+          break;
+        }
+        case tok::annot_primary_expr:
+        case tok::annot_token_seq_expr: {
+          auto ToE =
+              Importer.Import(static_cast<Expr *>(T.getAnnotationValue()));
+          if (!ToE)
+            return ToE.takeError();
+          N.setAnnotationValue(static_cast<void *>(*ToE));
+          break;
+        }
+        case tok::annot_splice: {
+          auto ToSS = Importer.Import(
+              static_cast<SpliceSpecifier *>(T.getAnnotationValue()));
+          if (!ToSS)
+            return ToSS.takeError();
+          N.setAnnotationValue(static_cast<void *>(*ToSS));
+          break;
+        }
+        default:
+          N.startToken();
+          N.setKind(tok::unknown);
+          N.setLocation(*ToLoc);
+          break;
+        }
+      } else if (T.isLiteral() || T.is(tok::raw_identifier)) {
+        unsigned Len = T.getLength();
+        if (T.isLiteral()) {
+          // CreateTokenSequenceData below gives the literal storage of its
+          // own in ToCtx.
+          N.setLiteralData(T.getLiteralData());
+        } else {
+          char *Buf = new (ToCtx) char[Len];
+          const char *From = T.getRawIdentifier().data();
+          std::copy(From, From + Len, Buf);
+          N.setRawIdentifierData(Buf);
+        }
+      } else if (const IdentifierInfo *II = T.getIdentifierInfo()) {
+        N.setIdentifierInfo(Importer.Import(II));
+      }
+      ToToks.push_back(N);
+    }
+    Result = APValue(CreateTokenSequenceData(ToCtx, ToToks));
+    break;
+  }
   case APValue::Vector: {
     Result.MakeVector();
     MutableArrayRef<APValue> Elts =
@@ -10939,6 +11933,7 @@ ASTNodeImporter::ImportAPValue(const APValue &FromValue) {
     } else
       Result.setLValue(Base, Offset, APValue::NoLValuePath{},
                        FromValue.isNullPointer());
+    Result.setLValueTag(FromValue.getLValueTag());
   }
   if (Err)
     return std::move(Err);

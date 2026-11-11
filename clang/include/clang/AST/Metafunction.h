@@ -33,6 +33,9 @@ public:
   enum ResultKind : unsigned {
     MFRK_bool,
     MFRK_metaInfo,
+    MFRK_tokenSequence,
+    MFRK_token,
+    MFRK_tokenPtr,
     MFRK_sizeT,
     MFRK_sourceLoc,
     MFRK_spliceFromArg,
@@ -59,19 +62,48 @@ private:
   unsigned MaxArgs;
   impl_fn_t ImplFn;
   bool Throws;
+  bool WantsMacroExpansionContext;
 
 public:
   constexpr Metafunction(ResultKind ResultKind,
                          unsigned MinArgs,
                          unsigned MaxArgs,
                          impl_fn_t ImplFn,
-                         bool Throws = false)
+                         bool Throws = false,
+                         bool WantsMacroExpansionContext = false)
       : Kind(ResultKind), MinArgs(MinArgs), MaxArgs(MaxArgs),
-        ImplFn(ImplFn), Throws(Throws) { }
+        ImplFn(ImplFn), Throws(Throws),
+        WantsMacroExpansionContext(WantsMacroExpansionContext) { }
 
   ResultKind getResultKind() const {
     return Kind;
   }
+
+  // When set, the 'ContainingDecl' argument delivers the context the expansion
+  // of the enclosing expression macro lands in, rather than the declaration
+  // being constant-evaluated. Null outside a macro body. This is opt-in
+  // because 'ContainingDecl' otherwise carries the injection target, which
+  // define_aggregate and annotate depend on.
+  bool wantsMacroExpansionContext() const {
+    return WantsMacroExpansionContext;
+  }
+
+  // Whether the metafunction asks only what a reflected expression is (its
+  // spelling, location, type, or operator structure), never what it
+  // evaluates to -- so it can answer for a value-dependent expression.
+  bool isSafeOnValueDependentExpressions() const;
+
+  // EXPERIMENTAL (benchmarking a vector<token> model): metafunctions the
+  // constant evaluator implements natively on an array of token sequences,
+  // as it does __builtin_memcpy -- reading the array (Join) or writing a
+  // token sequence's tokens into it (Fill).
+  enum class TokenArrayOp { None, Join, Fill };
+  TokenArrayOp getTokenArrayOp() const;
+
+  // The member queries (members_of, bases_of, ...), gathered natively: the
+  // constant evaluator writes the reflections straight into the caller's
+  // buffer (or, given a null one, returns their count).
+  bool isMemberGather() const;
 
   unsigned getMinArgs() const {
     return MinArgs;

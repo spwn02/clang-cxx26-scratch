@@ -323,6 +323,7 @@ FEATURE(shadow_call_stack,
         LangOpts.Sanitize.has(SanitizerKind::ShadowCallStack))
 FEATURE(tls, PP.getTargetInfo().isTLSSupported())
 FEATURE(underlying_type, LangOpts.CPlusPlus)
+FEATURE(experimental_library, LangOpts.ExperimentalLibrary)
 
 // C11 features supported by other languages as extensions.
 EXTENSION(c_alignas, true)
@@ -379,6 +380,10 @@ FEATURE(cxx_abi_relative_vtable, LangOpts.CPlusPlus && LangOpts.RelativeCXXABIVT
 
 FEATURE(clang_atomic_attributes, true)
 
+
+FEATURE(do_expressions, LangOpts.DoExpressions)
+FEATURE(pattern_matching, LangOpts.PatternMatching)
+FEATURE(do_expressions, LangOpts.DoExpressions)
 
 // CUDA/HIP Features
 FEATURE(cuda_noinline_keyword, LangOpts.CUDA)

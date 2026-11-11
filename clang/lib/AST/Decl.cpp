@@ -2202,6 +2202,10 @@ VarDecl::TLSKind VarDecl::getTLSKind() const {
 }
 
 SourceRange VarDecl::getSourceRange() const {
+  // The initializer of a variable declared by a pattern is implicit; it spans
+  // the subject, which is not part of the declaration.
+  if (isPatternVariable())
+    return DeclaratorDecl::getSourceRange();
   if (const Expr *Init = getInit()) {
     SourceLocation InitEnd = Init->getEndLoc();
     // If Init is implicit, ignore its source range and fallback on
@@ -3429,6 +3433,18 @@ bool FunctionDecl::isImmediateEscalating() const {
   return false;
 }
 
+bool FunctionDecl::isExpressionMacro() const {
+  if (hasAttr<ExpressionMacroAttr>())
+    return true;
+  if (const FunctionDecl *Pattern =
+          getTemplateInstantiationPattern(/*ForDefinition=*/false))
+    if (Pattern->hasAttr<ExpressionMacroAttr>())
+      return true;
+  if (const FunctionTemplateDecl *Primary = getPrimaryTemplate())
+    return Primary->getTemplatedDecl()->hasAttr<ExpressionMacroAttr>();
+  return false;
+}
+
 bool FunctionDecl::isImmediateFunction() const {
   // C++23 [expr.const]/p18
   // An immediate function is a function or constructor that is
@@ -3746,7 +3762,9 @@ bool FunctionDecl::isNoReturn() const {
     return true;
 
   if (auto *FnTy = getType()->getAs<FunctionType>())
-    return FnTy->getNoReturnAttr();
+    // A function returning std::noreturn_t (P3549) cannot return: there is
+    // no value to return.
+    return FnTy->getNoReturnAttr() || FnTy->getReturnType()->isNoReturnType();
 
   return false;
 }

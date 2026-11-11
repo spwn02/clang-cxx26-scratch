@@ -26,6 +26,7 @@
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Lex/Token.h"
 #include "clang/Sema/HeuristicResolver.h"
 #include "clang/Tooling/Syntax/Tokens.h"
 #include "llvm/ADT/STLExtras.h"
@@ -1047,6 +1048,19 @@ public:
     return true;
   }
 
+  // The identifiers a token sequence literal ^^{ ... } holds are text, not yet
+  // names: nothing binds them until the sequence is injected. They are shown
+  // like other names that cannot be resolved here (dependent names). The
+  // interpolated expressions \(...) are ordinary expressions of the AST.
+  bool VisitCXXTokenSequenceExpr(CXXTokenSequenceExpr *E) {
+    APValue Value = E->getValue();
+    for (const Token &T : Value.getTokenSequence())
+      if (T.is(tok::identifier))
+        H.addToken(T.getLocation(), HighlightingKind::Unknown)
+            .addModifier(HighlightingModifier::DependentName);
+    return true;
+  }
+
   bool VisitCXXDependentScopeMemberExpr(CXXDependentScopeMemberExpr *E) {
     H.addToken(E->getMemberNameInfo().getLoc(), HighlightingKind::Unknown)
         .addModifier(HighlightingModifier::DependentName)
@@ -1117,6 +1131,7 @@ public:
     case TemplateName::SubstTemplateTemplateParmPack:
     case TemplateName::UsingTemplate:
     case TemplateName::DeducedTemplate:
+    case TemplateName::PackIndexingTemplate:
       // Names that could be resolved to a TemplateDecl are handled elsewhere.
       break;
     }

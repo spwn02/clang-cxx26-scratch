@@ -250,8 +250,10 @@ getDeducedNTTParameterFromExpr(const Expr *E, unsigned Depth) {
       if (NTTP->getDepth() == Depth)
         return NTTP;
 
+  // A pack-index-template-name is not deducible.
   if (const auto *DTI = dyn_cast<DependentTemplateIdExpr>(E))
-    if (DTI->getParameter()->getDepth() == Depth)
+    if (!DTI->getTemplateName().getAsPackIndexingTemplate() &&
+        DTI->getParameter()->getDepth() == Depth)
       return DTI->getParameter();
 
   return nullptr;
@@ -5242,7 +5244,11 @@ namespace {
       QualType Result = SemaRef.Context.getReflectionSpliceType(
           TL.getTypePtr()->getTypenameKWLoc(), TL.getTypePtr()->getSplice(),
           Replacement);
-      TLB.push<ReflectionSpliceTypeLoc>(Result);
+      ReflectionSpliceTypeLoc NewTL =
+          TLB.push<ReflectionSpliceTypeLoc>(Result);
+      NewTL.setTypenameKWLoc(TL.getTypenameKWLoc());
+      NewTL.setSpliceBeginLoc(TL.getSpliceBeginLoc());
+      NewTL.setSpliceEndLoc(TL.getSpliceEndLoc());
       return Result;
     }
 
@@ -5276,7 +5282,8 @@ static bool CheckDeducedPlaceholderConstraints(Sema &S, const AutoType &Type,
                                                AutoTypeLoc TypeLoc,
                                                QualType Deduced) {
   ConstraintSatisfaction Satisfaction;
-  ConceptDecl *Concept = cast<ConceptDecl>(Type.getTypeConstraintConcept());
+  ConceptDecl *Concept =
+      cast<ConceptDecl>(Type.getTypeConstraintConcept().getAsTemplateDecl());
   TemplateArgumentListInfo TemplateArgs(TypeLoc.getLAngleLoc(),
                                         TypeLoc.getRAngleLoc());
   TemplateArgs.addArgument(
@@ -5302,9 +5309,13 @@ static bool CheckDeducedPlaceholderConstraints(Sema &S, const AutoType &Type,
     llvm::raw_string_ostream OS(Buf);
     OS << "'" << Concept->getName();
     if (TypeLoc.hasExplicitTemplateArgs()) {
-      printTemplateArgumentList(
-          OS, Type.getTypeConstraintArguments(), S.getPrintingPolicy(),
-          Type.getTypeConstraintConcept()->getTemplateParameters());
+      printTemplateArgumentList(OS, Type.getTypeConstraintArguments(),
+                                S.getPrintingPolicy(),
+                                Type.getTypeConstraintConcept().getAsTemplateDecl()
+                                    ? Type.getTypeConstraintConcept()
+                                          .getAsTemplateDecl()
+                                          ->getTemplateParameters()
+                                    : nullptr);
     }
     OS << "'";
     S.Diag(TypeLoc.getConceptNameLoc(),
@@ -5979,6 +5990,20 @@ FunctionTemplateDecl *Sema::getMoreSpecializedTemplate(
     TemplatePartialOrderingContext TPOC, unsigned NumCallArguments1,
     QualType RawObj1Ty, QualType RawObj2Ty, bool Reversed,
     bool PartialOverloading) {
+  // Deduction here treats the parameters of a function template as the
+  // outermost level (depth 0). A member template of a class template that is
+  // still dependent (not instantiated), for example the candidates of signature
+  // help for the injected class name inside the class's own member function,
+  // has its own parameters at a deeper level, and the enclosing template's
+  // parameters would be deduced against an argument vector sized for the
+  // member's own parameters. Such templates have no partial order here (#494).
+  auto HasOuterTemplateLevel = [](const FunctionTemplateDecl *FT) {
+    const TemplateParameterList *TPL = FT->getTemplateParameters();
+    return TPL->size() != 0 && TPL->getDepth() != 0;
+  };
+  if (PartialOverloading && (HasOuterTemplateLevel(FT1) || HasOuterTemplateLevel(FT2)))
+    return nullptr;
+
   SmallVector<QualType> Args1;
   SmallVector<QualType> Args2;
   const FunctionDecl *FD1 = FT1->getTemplatedDecl();
@@ -6790,12 +6815,14 @@ struct MarkUsedTemplateParameterVisitor : DynamicRecursiveASTVisitor {
     return true;
   }
 
-  bool TraverseTemplateName(TemplateName Template) override {
+  bool TraverseTemplateName(TemplateName Template,
+                            bool TraverseQualifier) override {
     if (auto *TTP = llvm::dyn_cast_or_null<TemplateTemplateParmDecl>(
             Template.getAsTemplateDecl()))
       if (TTP->getDepth() == Depth)
         Used[TTP->getIndex()] = true;
-    DynamicRecursiveASTVisitor::TraverseTemplateName(Template);
+    DynamicRecursiveASTVisitor::TraverseTemplateName(Template,
+                                                     TraverseQualifier);
     return true;
   }
 

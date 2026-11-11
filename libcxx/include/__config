@@ -37,6 +37,14 @@
 // defined to XXYYZZ.
 #  define _LIBCPP_VERSION 220108
 
+// The C++29 networking and I/O library (P4100, P4003) is experimental until its design is complete and has no
+// known gaps: it is available in C++29 mode with -fexperimental-library only.
+#  if _LIBCPP_STD_VER >= 29 && __has_feature(experimental_library)
+#    define _LIBCPP_HAS_EXPERIMENTAL_NETWORKING 1
+#  else
+#    define _LIBCPP_HAS_EXPERIMENTAL_NETWORKING 0
+#  endif
+
 #  define _LIBCPP_CONCAT_IMPL(_X, _Y) _X##_Y
 #  define _LIBCPP_CONCAT(_X, _Y) _LIBCPP_CONCAT_IMPL(_X, _Y)
 #  define _LIBCPP_CONCAT3(X, Y, Z) _LIBCPP_CONCAT(X, _LIBCPP_CONCAT(Y, Z))
@@ -605,6 +613,12 @@ typedef __char32_t char32_t;
 #    define _LIBCPP_DEPRECATED_IN_CXX26_(m)
 #  endif
 
+#  if _LIBCPP_STD_VER >= 29
+#    define _LIBCPP_DEPRECATED_IN_CXX29_(m) _LIBCPP_DEPRECATED_(m)
+#  else
+#    define _LIBCPP_DEPRECATED_IN_CXX29_(m)
+#  endif
+
 #  if _LIBCPP_HAS_CHAR8_T
 #    define _LIBCPP_DEPRECATED_WITH_CHAR8_T _LIBCPP_DEPRECATED
 #  else
@@ -651,6 +665,12 @@ typedef __char32_t char32_t;
 #    define _LIBCPP_CONSTEXPR_SINCE_CXX26 constexpr
 #  else
 #    define _LIBCPP_CONSTEXPR_SINCE_CXX26
+#  endif
+
+#  if _LIBCPP_STD_VER >= 29
+#    define _LIBCPP_CONSTEXPR_SINCE_CXX29 constexpr
+#  else
+#    define _LIBCPP_CONSTEXPR_SINCE_CXX29
 #  endif
 
 #  ifndef _LIBCPP_WEAK
@@ -1097,6 +1117,9 @@ typedef __char32_t char32_t;
 
 #endif // __cplusplus
 
+// Both macros are used by C++ headers only; <__config> is also included when compiling as C, where _LIBCPP_STD_VER does not exist.
+#ifdef __cplusplus
+
 // In C++26 the members of the exception classes that libc++abi defines (exception, bad_exception, bad_alloc,
 // bad_array_new_length, bad_cast, bad_typeid) are inline constexpr. On Apple's platforms libc++.dylib re-exports
 // libc++abi.dylib, and the linker rejects a symbol that is re-exported and also defined in an object file of libc++:
@@ -1120,5 +1143,7 @@ typedef __char32_t char32_t;
 #else
 #  define _LIBCPP_HAS_INLINE_CXX26_DEFINITIONS 0
 #endif
+
+#endif // __cplusplus
 
 #endif // _LIBCPP___CONFIG

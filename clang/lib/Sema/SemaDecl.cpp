@@ -2019,7 +2019,7 @@ static bool ShouldDiagnoseUnusedDecl(const LangOptions &LangOpts,
     // referenced, instead of if the variable itself is referenced (which
     // it is, by the bindings' expressions).
     bool IsAllIgnored = true;
-    for (const auto *BD : DD->bindings()) {
+    for (const auto *BD : DD->source_leaf_bindings()) {
       if (BD->isReferenced())
         return false;
       IsAllIgnored = IsAllIgnored && (BD->isPlaceholderVar(LangOpts) ||
@@ -2283,7 +2283,7 @@ static void CheckPoppedLabel(LabelDecl *L, Sema &S,
                                        << L);
 }
 
-void Sema::ActOnPopScope(SourceLocation Loc, Scope *S) {
+void Sema::ActOnPopScope(SourceLocation Loc, Scope *S, bool DiagnoseDecls) {
   S->applyNRVO();
 
   if (S->decl_empty()) return;
@@ -2316,21 +2316,24 @@ void Sema::ActOnPopScope(SourceLocation Loc, Scope *S) {
     NamedDecl *D = cast<NamedDecl>(TmpD);
 
     // Diagnose unused variables in this scope.
-    if (!S->hasUnrecoverableErrorOccurred()) {
+    if (DiagnoseDecls && !S->hasUnrecoverableErrorOccurred()) {
       DiagnoseUnusedDecl(D, addDiag);
       if (const auto *RD = dyn_cast<RecordDecl>(D))
         DiagnoseUnusedNestedTypedefs(RD, addDiag);
       if (VarDecl *VD = dyn_cast<VarDecl>(D)) {
         DiagnoseUnusedButSetDecl(VD, addDiag);
-        RefsMinusAssignments.erase(VD);
       }
     }
+    if (const auto *VD = dyn_cast<VarDecl>(D))
+      RefsMinusAssignments.erase(VD);
 
     if (!D->getDeclName()) continue;
 
     // If this was a forward reference to a label, verify it was defined.
-    if (LabelDecl *LD = dyn_cast<LabelDecl>(D))
-      CheckPoppedLabel(LD, *this, addDiag);
+    if (DiagnoseDecls) {
+      if (LabelDecl *LD = dyn_cast<LabelDecl>(D))
+        CheckPoppedLabel(LD, *this, addDiag);
+    }
 
     // Partial translation units that are created in incremental processing must
     // not clean up the IdResolver because PTUs should take into account the
@@ -2342,10 +2345,12 @@ void Sema::ActOnPopScope(SourceLocation Loc, Scope *S) {
     // Warn on it if we are shadowing a declaration.
     auto ShadowI = ShadowingDecls.find(D);
     if (ShadowI != ShadowingDecls.end()) {
-      if (const auto *FD = dyn_cast<FieldDecl>(ShadowI->second)) {
-        addDiagWithPrev(D->getLocation(), FD->getLocation(),
-                        PDiag(diag::warn_ctor_parm_shadows_field)
-                            << D << FD << FD->getParent());
+      if (DiagnoseDecls) {
+        if (const auto *FD = dyn_cast<FieldDecl>(ShadowI->second)) {
+          addDiagWithPrev(D->getLocation(), FD->getLocation(),
+                          PDiag(diag::warn_ctor_parm_shadows_field)
+                              << D << FD << FD->getParent());
+        }
       }
       ShadowingDecls.erase(ShadowI);
     }
@@ -6388,7 +6393,7 @@ void Sema::warnOnReservedIdentifier(const NamedDecl *D) {
   }
 }
 
-Decl *Sema::ActOnDeclarator(Scope *S, Declarator &D) {
+Decl *Sema::ActOnDeclarator(Scope *S, Declarator &D, bool IsPatternDecl) {
   D.setFunctionDefinitionKind(FunctionDefinitionKind::Declaration);
 
   // Check if we are in an `omp begin/end declare variant` scope. Handle this
@@ -6401,7 +6406,10 @@ Decl *Sema::ActOnDeclarator(Scope *S, Declarator &D) {
       OpenMP().ActOnStartOfFunctionDefinitionInOpenMPDeclareVariantScope(
           S, D, MultiTemplateParamsArg(), Bases);
 
-  Decl *Dcl = HandleDeclarator(S, D, MultiTemplateParamsArg());
+  Decl *Dcl = HandleDeclarator(S, D, MultiTemplateParamsArg(), IsPatternDecl);
+  if (IsPatternDecl)
+    if (auto *VD = dyn_cast_or_null<VarDecl>(Dcl); VD && !isa<ParmVarDecl>(VD))
+      VD->setPatternVariable();
 
   if (OriginalLexicalContext && OriginalLexicalContext->isObjCContainer() &&
       Dcl && Dcl->getDeclContext()->isFileContext())
@@ -6584,7 +6592,8 @@ bool Sema::diagnoseQualifiedDeclaration(CXXScopeSpec &SS, DeclContext *DC,
 }
 
 NamedDecl *Sema::HandleDeclarator(Scope *S, Declarator &D,
-                                  MultiTemplateParamsArg TemplateParamLists) {
+                                  MultiTemplateParamsArg TemplateParamLists,
+                                  bool IsPatternDecl) {
   // TODO: consider using NameInfo for diagnostic.
   DeclarationNameInfo NameInfo = GetNameForDeclarator(D);
   DeclarationName Name = NameInfo.getName();
@@ -6592,7 +6601,8 @@ NamedDecl *Sema::HandleDeclarator(Scope *S, Declarator &D,
   // All of these full declarators require an identifier.  If it doesn't have
   // one, the ParsedFreeStandingDeclSpec action should be used.
   if (D.isDecompositionDeclarator()) {
-    return ActOnDecompositionDeclarator(S, D, TemplateParamLists);
+    return ActOnDecompositionDeclarator(S, D, TemplateParamLists,
+                                        IsPatternDecl);
   } else if (!Name) {
     if (!D.isInvalidType())  // Reject this if we think it is valid.
       Diag(D.getDeclSpec().getBeginLoc(), diag::err_declarator_need_ident)
@@ -7914,7 +7924,19 @@ NamedDecl *Sema::ActOnVariableDeclarator(
     // purposes.
     auto &Decomp = D.getDecompositionDeclarator();
     if (!Decomp.bindings().empty()) {
-      II = Decomp.bindings()[0].Name;
+      auto FindFirstName =
+          [&](auto &&Self,
+              const DecompositionDeclarator &Current) -> IdentifierInfo * {
+        for (const auto &Binding : Current.bindings()) {
+          if (Binding.Name)
+            return Binding.Name;
+          if (Binding.Nested)
+            if (IdentifierInfo *NestedName = Self(Self, *Binding.Nested))
+              return NestedName;
+        }
+        return nullptr;
+      };
+      II = FindFirstName(FindFirstName, Decomp);
       Name = II;
     }
   } else if (!II) {
@@ -10271,6 +10293,78 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
   FunctionDecl *NewFD = CreateNewFunctionDecl(*this, D, DC, R, TInfo, SC,
                                               isVirtualOkay);
   if (!NewFD) return nullptr;
+
+  if (D.getDeclSpec().isMacroSpecified()) {
+    SourceLocation MacroLoc = D.getDeclSpec().getMacroSpecLoc();
+    NewFD->addAttr(ExpressionMacroAttr::CreateImplicit(Context, MacroLoc));
+    // A member macro is reached through an object expression, which binds to
+    // an explicit object parameter; there is no implicit 'this' to bind.
+    if (DC->isRecord() && !D.isStaticMember() &&
+        !D.isExplicitObjectMemberFunction()) {
+      Diag(MacroLoc, diag::err_macro_member);
+      NewFD->setInvalidDecl();
+    }
+    if (D.getDeclSpec().isVirtualSpecified()) {
+      Diag(MacroLoc, diag::err_macro_virtual);
+      NewFD->setInvalidDecl();
+    }
+    // Operators whose operands are not expressions of the operator expression
+    // (or that are not invoked through an expression at all).
+    int BadOperatorKind = -1;
+    switch (D.getName().getKind()) {
+    case UnqualifiedIdKind::IK_ConversionFunctionId:
+      BadOperatorKind = 0;
+      break;
+    case UnqualifiedIdKind::IK_LiteralOperatorId:
+      BadOperatorKind = 1;
+      break;
+    case UnqualifiedIdKind::IK_OperatorFunctionId:
+      switch (D.getName().OperatorFunctionId.Operator) {
+      case OO_New:
+      case OO_Delete:
+      case OO_Array_New:
+      case OO_Array_Delete:
+        BadOperatorKind = 2;
+        break;
+      case OO_Coawait:
+        BadOperatorKind = 3;
+        break;
+      default:
+        break;
+      }
+      break;
+    default:
+      break;
+    }
+    if (BadOperatorKind >= 0) {
+      Diag(MacroLoc, diag::err_macro_operator_kind) << BadOperatorKind;
+      NewFD->setInvalidDecl();
+    }
+    if (D.isFunctionDeclarator()) {
+      const DeclaratorChunk::FunctionTypeInfo &FTI = D.getFunctionTypeInfo();
+      bool IsOperator =
+          D.getName().getKind() == UnqualifiedIdKind::IK_OperatorFunctionId;
+      for (unsigned I = 0; I != FTI.NumParams; ++I) {
+        auto *P = dyn_cast_or_null<ParmVarDecl>(FTI.Params[I].Param);
+        if (!P)
+          continue;
+        // Operator syntax supplies expression operands only.
+        if (IsOperator && (P->isMacroRawPack() ||
+                           P->getType()
+                               .getNonReferenceType()
+                               .getUnqualifiedType()
+                               ->isTokenSequenceLikeType())) {
+          Diag(P->getLocation(), diag::err_macro_operator_raw_parameter);
+          NewFD->setInvalidDecl();
+        }
+        // A raw pack takes the remaining arguments, so it comes last.
+        if (P->isMacroRawPack() && I + 1 != FTI.NumParams) {
+          Diag(P->getLocation(), diag::err_macro_raw_pack_not_last);
+          NewFD->setInvalidDecl();
+        }
+      }
+    }
+  }
 
   if (OriginalLexicalContext && OriginalLexicalContext->isObjCContainer())
     NewFD->setTopLevelDeclInObjCContainer();
@@ -14084,7 +14178,8 @@ void Sema::DiagnoseUniqueObjectDuplication(const VarDecl *VD) {
   }
 }
 
-void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init, bool DirectInit) {
+void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init, bool DirectInit,
+                                bool IsFullExpression) {
   llvm::scope_exit ResetDeclForInitializer([this]() {
     if (this->ExprEvalContexts.empty())
       this->ExprEvalContexts.back().DeclForInitializer = nullptr;
@@ -14426,14 +14521,18 @@ void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init, bool DirectInit) {
   //   struct T { S a, b; } t = { Temp(), Temp() }
   //
   // we should destroy the first Temp before constructing the second.
-  ExprResult Result =
-      ActOnFinishFullExpr(Init, VDecl->getLocation(),
-                          /*DiscardedValue*/ false, VDecl->isConstexpr());
-  if (!Result.isUsable()) {
-    VDecl->setInvalidDecl();
-    return;
+  if (IsFullExpression) {
+    ExprResult Result =
+        ActOnFinishFullExpr(Init, VDecl->getLocation(),
+                            /*DiscardedValue*/ false, VDecl->isConstexpr());
+    if (!Result.isUsable()) {
+      VDecl->setInvalidDecl();
+      return;
+    }
+    Init = Result.get();
+  } else {
+    CheckCompletedExpr(Init, VDecl->getLocation(), VDecl->isConstexpr());
   }
-  Init = Result.get();
 
   // Attach the initializer to the decl.
   VDecl->setInit(Init);
@@ -14629,7 +14728,7 @@ void Sema::ActOnInitializerError(Decl *D) {
 
   // Bindings are not usable if we can't make sense of the initializer.
   if (auto *DD = dyn_cast<DecompositionDecl>(D))
-    for (auto *BD : DD->bindings())
+    for (auto *BD : DD->all_source_bindings())
       BD->setInvalidDecl();
 
   // Auto types are meaningless if we can't make sense of the initializer.
@@ -14985,14 +15084,15 @@ void Sema::ActOnUninitializedDecl(Decl *RealDecl) {
   }
 }
 
-void Sema::ActOnCXXForRangeDecl(Decl *D) {
+void Sema::ActOnCXXForRangeDecl(Decl *D, bool IsPattern) {
   // If there is no declaration, there was an error parsing it. Ignore it.
   if (!D)
     return;
 
   VarDecl *VD = dyn_cast<VarDecl>(D);
   if (!VD) {
-    Diag(D->getLocation(), diag::err_for_range_decl_must_be_var);
+    Diag(D->getLocation(), IsPattern ? diag::err_pattern_decl_must_be_var
+                                     : diag::err_for_range_decl_must_be_var);
     D->setInvalidDecl();
     return;
   }
@@ -15033,7 +15133,8 @@ void Sema::ActOnCXXForRangeDecl(Decl *D) {
   }
 
   if (Error != -1) {
-    Diag(VD->getOuterLocStart(), diag::err_for_range_storage_class)
+    Diag(VD->getOuterLocStart(), IsPattern ? diag::err_pattern_storage_class
+                                           : diag::err_for_range_storage_class)
         << VD << Error;
     D->setInvalidDecl();
   }
@@ -15588,7 +15689,7 @@ void Sema::FinalizeDeclaration(Decl *ThisDecl) {
   }
 
   if (auto *DD = dyn_cast<DecompositionDecl>(ThisDecl)) {
-    for (auto *BD : DD->bindings()) {
+    for (auto *BD : DD->all_source_bindings()) {
       FinalizeDeclaration(BD);
     }
   }
@@ -16984,6 +17085,20 @@ Decl *Sema::ActOnFinishFunctionBody(Decl *dcl, Stmt *Body, bool IsInstantiation,
             Diag(dcl->getLocation(), diag::err_auto_fn_no_return_but_not_auto)
                 << FD->getReturnType();
             FD->setInvalidDecl();
+          } else if (getLangOpts().DivergingExpressions &&
+                     isDivergingStmt(Body, /*InDoExpr=*/false)) {
+            // P3549: no return statement yields a value (any there are
+            // diverge), and the body diverges: the function returns
+            // std::noreturn_t.
+            Diag(dcl->getLocation(), diag::warn_diverging_compat_deduction)
+                << isLambdaCallOperator(FD);
+            OpaqueValueExpr Diverging(dcl->getLocation(), Context.NoReturnTy,
+                                      VK_PRValue);
+            Expr *RetExpr = &Diverging;
+            if (DeduceFunctionTypeFromReturnExpr(
+                    FD, dcl->getLocation(), RetExpr,
+                    FD->getReturnType()->getAs<AutoType>()))
+              FD->setInvalidDecl();
           } else {
             // Falling off the end of the function is the same as 'return;'.
             Expr *Dummy = nullptr;
@@ -16993,6 +17108,13 @@ Decl *Sema::ActOnFinishFunctionBody(Decl *dcl, Stmt *Body, bool IsInstantiation,
               FD->setInvalidDecl();
           }
         }
+        // The diverging return statements took no part in the deduction;
+        // convert their operands to the deduced type now.
+        if (FSI->HasDivergingReturn && !FD->isInvalidDecl() && Body &&
+            !FD->isDependentContext() &&
+            !FD->getReturnType()->isUndeducedType())
+          convertDivergingReturnOperands(Body, FD->getReturnType(),
+                                         /*IsDoReturn=*/false);
       } else if (getLangOpts().CPlusPlus && isLambdaCallOperator(FD)) {
         // In C++11, we don't use 'auto' deduction rules for lambda call
         // operators because we don't support return type deduction.

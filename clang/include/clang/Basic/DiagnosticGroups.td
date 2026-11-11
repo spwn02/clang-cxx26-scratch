@@ -76,6 +76,8 @@ def ObjCBoolConstantConversion : DiagGroup<"objc-bool-constant-conversion">;
 def ConstantConversion : DiagGroup<"constant-conversion",
                                    [BitFieldConstantConversion,
                                     ObjCBoolConstantConversion]>;
+// P2758: user-authored warnings from std::constexpr_warning_str.
+def ConstexprMessages : DiagGroup<"constexpr-messages">;
 def LiteralConversion : DiagGroup<"literal-conversion">;
 def StringConversion : DiagGroup<"string-conversion">;
 def SignConversion : DiagGroup<"sign-conversion">;
@@ -501,6 +503,10 @@ def : DiagGroup<"c++2a-compat-pedantic", [CXX20CompatPedantic]>;
 def CXX23Compat : DiagGroup<"c++23-compat", [CXXPre26Compat]>;
 
 def CXX26Compat : DiagGroup<"c++2c-compat", [DeleteIncomplete]>;
+
+def CXX29Compat : DiagGroup<"c++2d-compat">;
+// Places where P3549 diverging expressions give a different type than before.
+def DivergingCompat : DiagGroup<"diverging-compat">;
 
 def ExitTimeDestructors : DiagGroup<"exit-time-destructors">;
 def FlexibleArrayExtensions : DiagGroup<"flexible-array-extensions">;

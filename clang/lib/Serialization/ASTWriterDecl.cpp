@@ -26,6 +26,18 @@
 using namespace clang;
 using namespace serialization;
 
+// Widths of the Fixed() operands that hold packed bits in the abbreviations
+// below. A record is only written with its abbreviation when the packed value
+// fits (see fitsFixedAbbrevOperand), so adding a flag to a BitsPacker can never
+// again overflow the abbreviation: it just falls back to the unabbreviated
+// record. (Fixed(4) and then Fixed(22) both overflowed silently before.)
+static constexpr unsigned DeclVarAbbrevPackedBits = 23;
+static constexpr unsigned DeclParmVarAbbrevPackedBits = 19;
+
+static bool fitsFixedAbbrevOperand(uint32_t Value, unsigned Width) {
+  return Width >= 32 || Value < (uint32_t(1) << Width);
+}
+
 //===----------------------------------------------------------------------===//
 // Utility functions
 //===----------------------------------------------------------------------===//
@@ -1355,6 +1367,8 @@ void ASTDeclWriter::VisitVarDecl(VarDecl *D) {
 
     VarDeclBits.addBit(D->isObjCForDecl());
     VarDeclBits.addBit(D->isCXXForRangeImplicitVar());
+    VarDeclBits.addBit(D->isDoExprInitCapture());
+    VarDeclBits.addBit(D->isPatternVariable());
   }
 
   Record.push_back(VarDeclBits);
@@ -1391,12 +1405,14 @@ void ASTDeclWriter::VisitVarDecl(VarDecl *D) {
       D->getDeclName().getNameKind() == DeclarationName::Identifier &&
       !D->hasExtInfo() && D->getFirstDecl() == D->getMostRecentDecl() &&
       D->getKind() == Decl::Var && !D->isInline() && !D->isConstexpr() &&
-      !D->isInitCapture() && !D->isPreviousDeclInSameBlockScope() &&
+      !D->isInitCapture() && !D->isDoExprInitCapture() &&
+      !D->isPreviousDeclInSameBlockScope() &&
       !D->hasInitWithSideEffects() && !D->isEscapingByref() &&
       !HasDeducedType && D->getStorageDuration() != SD_Static &&
       !D->getDescribedVarTemplate() && !D->getMemberSpecializationInfo() &&
       !D->isObjCForDecl() && !isa<ImplicitParamDecl>(D) &&
-      !D->isEscapingByref())
+      !D->isEscapingByref() &&
+      fitsFixedAbbrevOperand(VarDeclBits, DeclVarAbbrevPackedBits))
     AbbrevToUse = Writer.getDeclVarAbbrev();
 
   Code = serialization::DECL_VAR;
@@ -1439,7 +1455,8 @@ void ASTDeclWriter::VisitParmVarDecl(ParmVarDecl *D) {
       !D->hasExtInfo() && D->getStorageClass() == 0 && !D->isInvalidDecl() &&
       !D->isTopLevelDeclInObjCContainer() &&
       D->getInitStyle() == VarDecl::CInit && // Can params have anything else?
-      D->getInit() == nullptr)               // No default expr.
+      D->getInit() == nullptr && // No default expr.
+      fitsFixedAbbrevOperand(ParmVarDeclBits, DeclParmVarAbbrevPackedBits))
     AbbrevToUse = Writer.getDeclParmVarAbbrev();
 
   // Check things we know are true of *every* PARM_VAR_DECL, which is more than
@@ -1467,6 +1484,7 @@ void ASTDeclWriter::VisitDecompositionDecl(DecompositionDecl *D) {
 void ASTDeclWriter::VisitBindingDecl(BindingDecl *D) {
   VisitValueDecl(D);
   Record.AddStmt(D->getBinding());
+  Record.AddDeclRef(D->getNestedDecomposition());
   Code = serialization::DECL_BINDING;
 }
 
@@ -2741,7 +2759,7 @@ void ASTWriter::WriteDeclAbbrevs() {
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6)); // ScopeIndex
   Abv->Add(BitCodeAbbrevOp(
       BitCodeAbbrevOp::Fixed,
-      19)); // Packed Parm Var Decl bits: IsObjCMethodParameter, ScopeDepth,
+      DeclParmVarAbbrevPackedBits)); // Packed Parm Var Decl bits: IsObjCMethodParameter, ScopeDepth,
             // ObjCDeclQualifier, KNRPromoted,
             // HasInheritedDefaultArg, HasUninstantiatedDefaultArg
   // Type Source Info
@@ -2801,14 +2819,14 @@ void ASTWriter::WriteDeclAbbrevs() {
   // VarDecl
   Abv->Add(BitCodeAbbrevOp(
       BitCodeAbbrevOp::Fixed,
-      22)); // Packed Var Decl bits:  Linkage, ModulesCodegen,
+      DeclVarAbbrevPackedBits)); // Packed Var Decl bits:  Linkage, ModulesCodegen,
             // SClass, TSCSpec, InitStyle,
             // isARCPseudoStrong, IsThisDeclarationADemotedDefinition,
             // isExceptionVariable, isNRVOVariable, isCXXForRangeDecl,
             // isInline, isInlineSpecified, isConstexpr,
             // isInitCapture, isPrevDeclInSameScope, hasInitWithSideEffects,
             // EscapingByref, HasDeducedType, ImplicitParamKind, isObjCForDecl
-            // IsCXXForRangeImplicitVar
+            // IsCXXForRangeImplicitVar, isDoExprInitCapture, isPatternVariable
   Abv->Add(BitCodeAbbrevOp(0));                         // VarKind (local enum)
   // Type Source Info
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Array));

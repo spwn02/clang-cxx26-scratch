@@ -12,6 +12,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/DeclVisitor.h"
+#include "clang/AST/StmtCXX.h"
 #include "clang/Index/IndexDataConsumer.h"
 #include "clang/Index/IndexSymbol.h"
 
@@ -293,6 +294,12 @@ public:
         handleTemplateArgumentLoc(Arg, D, D->getLexicalDeclContext());
     }
 
+    // The contract specifiers of this declaration: their predicates refer to
+    // the parameters (and members) like a body does.
+    if (const ContractSpecifierDecl *Contracts = D->getContracts())
+      for (const ContractStmt *CS : Contracts->contracts())
+        IndexCtx.indexBody(CS, D, D);
+
     if (D->isThisDeclarationADefinition()) {
       const Stmt *Body = D->getBody();
       if (Body) {
@@ -313,7 +320,8 @@ public:
 
   bool VisitDecompositionDecl(const DecompositionDecl *D) {
     for (const auto *Binding : D->bindings())
-      TRY_DECL(Binding, IndexCtx.handleDecl(Binding));
+      if (!Binding->isNestedDecomposition())
+        TRY_DECL(Binding, IndexCtx.handleDecl(Binding));
     return Base::VisitDecompositionDecl(D);
   }
 
@@ -706,8 +714,9 @@ public:
           handleTemplateArgumentLoc(TTP->getDefaultArgument(), Parent,
                                     TP->getLexicalDeclContext());
         if (auto *C = TTP->getTypeConstraint())
-          IndexCtx.handleReference(C->getNamedConcept(), C->getConceptNameLoc(),
-                                   Parent, TTP->getLexicalDeclContext());
+          IndexCtx.handleReference(getWrittenConceptDecl(C->getNamedConcept()),
+                                   C->getConceptNameLoc(), Parent,
+                                   TTP->getLexicalDeclContext());
       } else if (const auto *NTTP = dyn_cast<NonTypeTemplateParmDecl>(TP)) {
         IndexCtx.indexTypeSourceInfo(NTTP->getTypeSourceInfo(), Parent);
         if (NTTP->hasDefaultArgument())

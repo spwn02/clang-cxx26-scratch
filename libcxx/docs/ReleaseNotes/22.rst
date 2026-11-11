@@ -56,6 +56,14 @@ Implemented Papers
 - P3836R2: Make ``optional<T&>`` trivially copyable (`Github <https://llvm.org/PR171275>`__)
 - P1789R3: Library Support for Expansion Statements (`Github <https://llvm.org/PR167184>`__)
 
+- The C++29 networking and I/O library of the "Network Endeavor" papers (P4100 and companions: P4003 ``<io>``,
+  ``<io_buffer>``, ``<io_stream>``, ``<io_bridge>`` with the P4092/P4093 sender bridges, ``<io_context>``, ``<io_timer>``,
+  ``<io_signal>``, ``<io_file>``, ``<net>`` for TCP, UDP, Unix domain sockets and DNS, and ``<net_tls>``) is implemented
+  for Linux (epoll; a kqueue backend for macOS and FreeBSD is implemented but not yet verified) behind ``-std=c++29 -fexperimental-library``. It is not adopted into the working draft: most of its
+  papers do not exist yet, so the missing parts follow the Networking TS (N4771) and the Boost Capy/Corosio libraries, and
+  every divergence is tracked on GitHub (label ``cxx29``, milestone "C++29: Networking"). Libc++ does not ship the
+  Networking TS and this is a different design. See :ref:`libcxx-networking-library`.
+
 Improvements and New Features
 -----------------------------
 
@@ -125,6 +133,9 @@ Improvements and New Features
   ``rethrow_exception``) are defined inline in ``<exception>`` in every language mode, and they are ``constexpr`` in C++26.
   Before, the library defined them out of line, so that a C++26 program had two definitions of the same symbols, which the
   linker of COFF rejects. The library no longer defines or exports them.
+- The same holds with the MSVC ABI for the overloads of ``to_string`` and ``to_wstring`` for integers and for the members
+  of ``bad_weak_ptr``, ``bad_optional_access``, ``bad_variant_access`` and ``bad_expected_access<void>``: they are inline
+  in every mode and ``libc++.lib`` does not define them. Other platforms are unchanged.
 
 Deprecations and Removals
 -------------------------
@@ -133,6 +144,15 @@ Deprecations and Removals
 
 Potentially breaking changes
 ----------------------------
+
+- The default representation of a floating-point number (``std::to_chars(first, last, value)`` and ``std::format("{}", value)``,
+  ``std::print`` and the other users) follows P3505R4 in every language mode: the fixed notation for
+  ``1e-4 <= abs(value) < 10^k`` and the scientific notation otherwise (``k`` is 7 for ``float``, 16 for ``double``, 19
+  for the x87 ``long double``), with the shortest significand that round-trips. ``100000.0`` is now printed as
+  ``100000`` (was ``1e+05``), ``1234567890123456700000.0`` as ``1.2345678901234568e+21`` (was
+  ``1234567890123456774144``) and ``12345678.0f`` as ``1.2345678e+07`` (was ``12345678``). The lower bound is the
+  smallest value of the type that is at least 1e-4, so ``1e-4f`` is printed as ``1e-04`` and ``1e-4`` as ``0.0001``.
+  Code that compares the output with fixed strings has to be updated.
 
 - ``std::nearbyint``, ``std::rint``, ``std::lrint`` and ``std::llrint`` are no longer ``constexpr``. P0533R9 excludes
   them (they depend on the rounding mode) and [constexpr.functions] forbids an implementation to declare a function

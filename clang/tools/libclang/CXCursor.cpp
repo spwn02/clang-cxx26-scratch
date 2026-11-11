@@ -588,6 +588,44 @@ CXCursor cxcursor::MakeCXCursor(const Stmt *S, const Decl *Parent,
     K = CXCursor_PackIndexingExpr;
     break;
 
+  case Stmt::DoExprClass:
+    K = CXCursor_DoExpr;
+    break;
+
+  case Stmt::CXXTokenSequenceExprClass:
+    K = CXCursor_TokenSequenceExpr;
+    break;
+
+  case Stmt::CXXMacroInvocationExprClass:
+    K = CXCursor_MacroInvocationExpr;
+    break;
+
+  case Stmt::CXXBuiltinInjectExprClass:
+  case Stmt::CXXBuiltinReportTokensExprClass:
+  case Stmt::CXXTokenInterpolationListExprClass:
+  case Stmt::CXXBuiltinIdExprClass:
+  case Stmt::CXXBuiltinStrLiteralExprClass:
+  case Stmt::CXXBuiltinTokenizeExprClass:
+  case Stmt::CXXBuiltinStringizeExprClass:
+    K = CXCursor_TokenInjectionExpr;
+    break;
+
+  case Stmt::MatchSelectExprClass:
+    K = CXCursor_MatchSelectExpr;
+    break;
+
+  case Stmt::MatchTestExprClass:
+    K = CXCursor_MatchTestExpr;
+    break;
+
+  case Stmt::CaseConditionExprClass:
+    K = CXCursor_CaseConditionExpr;
+    break;
+
+  case Stmt::DoReturnStmtClass:
+    K = CXCursor_DoReturnStmt;
+    break;
+
   case Stmt::DeclRefExprClass:
     if (const ImplicitParamDecl *IPD = dyn_cast_or_null<ImplicitParamDecl>(
             cast<DeclRefExpr>(S)->getDecl())) {

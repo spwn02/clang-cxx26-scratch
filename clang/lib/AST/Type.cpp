@@ -2423,6 +2423,8 @@ Type::ScalarTypeKind Type::getScalarTypeKind() const {
       return STK_FixedPoint;
     if (BT->isReflectionType())
       return STK_Reflection;
+    if (BT->isTokenSequenceType() || BT->isMetaTokenType())
+      return STK_TokenSequence;
     llvm_unreachable("unknown scalar builtin type");
   } else if (isa<PointerType>(T)) {
     return STK_CPointer;
@@ -2898,6 +2900,11 @@ static bool isTriviallyCopyableTypeImpl(const QualType &type,
   if (CanonicalType->isMFloat8Type())
     return true;
 
+  // So is std::noreturn_t (P3549): there is never a value to copy, so copying
+  // can only be trivial. (Not that it makes it an implicit-lifetime type.)
+  if (CanonicalType->isNoReturnType())
+    return true;
+
   if (const auto *RD = CanonicalType->getAsRecordDecl()) {
     if (const auto *ClassDecl = dyn_cast<CXXRecordDecl>(RD)) {
       if (IsCopyConstructible)
@@ -3046,6 +3053,9 @@ bool Type::isLiteralType(const ASTContext &Ctx) const {
   //   -- cv void; or
   if (Ctx.getLangOpts().CPlusPlus14 && isVoidType())
     return true;
+  // So is std::noreturn_t (P3549), which a constexpr function may return.
+  if (isNoReturnType())
+    return true;
 
   // C++11 [basic.types]p10:
   //   A type is a literal type if it is:
@@ -3102,7 +3112,25 @@ bool Type::isLiteralType(const ASTContext &Ctx) const {
   return false;
 }
 
+bool Type::isStdMetaTokenSequenceType() const {
+  const CXXRecordDecl *RD = getAsCXXRecordDecl();
+  if (!RD || !RD->getIdentifier() || RD->getName() != "token_sequence")
+    return false;
+  const DeclContext *DC = RD->getDeclContext();
+  while (DC && DC->isInlineNamespace())
+    DC = DC->getParent();
+  const auto *NS = dyn_cast_or_null<NamespaceDecl>(DC);
+  return NS && NS->getIdentifier() && NS->getName() == "meta" &&
+         NS->isInStdNamespace();
+}
+
 bool Type::isStructuralType() const {
+  // A token sequence is a scalar type, but it has no mangling, so two
+  // specializations chosen by distinct token sequences would share a mangled
+  // name and collide at link time. Exclude it before the scalar case; this
+  // also propagates to any class type holding one, via StructuralIfLiteral.
+  if (isTokenSequenceType() || isMetaTokenType())
+    return false;
   // C++20 [temp.param]p6:
   //   A structural type is one of the following:
   //   -- a scalar type; or
@@ -3521,6 +3549,12 @@ StringRef BuiltinType::getName(const PrintingPolicy &Policy) const {
     return Policy.NullptrTypeInNamespace ? "std::nullptr_t" : "nullptr_t";
   case MetaInfo:
     return "meta::info";
+  case TokenSequence:
+    return "meta::__token_array";
+  case MetaToken:
+    return "meta::token";
+  case NoReturn:
+    return "std::noreturn_t";
   case Overload:
     return "<overloaded function type>";
   case BoundMember:
@@ -4247,8 +4281,17 @@ ReflectionSpliceType::ReflectionSpliceType(SourceLocation TypenameKWLoc,
                                            SpliceSpecifier *Splice,
                                            QualType UnderlyingTy)
   : Type(ReflectionSplice,
-         UnderlyingTy->isDependentType() ? QualType()
-                                         : UnderlyingTy.getCanonicalType(),
+         // A splice type is canonically its underlying type, unless that is
+         // dependent: then it is its own canonical type (non-deduced), except
+         // for a splice-specialization-specifier whose template is known and
+         // whose arguments are dependent. That is a template-id like any
+         // other, so its arguments are deducible ([temp.deduct.type]: only
+         // the constant-expression of a splice-specifier is non-deduced).
+         (UnderlyingTy->isDependentType() &&
+          !(Splice->isSpecialization() &&
+            isa<TemplateSpecializationType>(UnderlyingTy.getTypePtr())))
+             ? QualType()
+             : UnderlyingTy.getCanonicalType(),
          ReflectionSpliceType::computeDependence(UnderlyingTy, Splice),
          UnderlyingTy->isConstevalOnly()),
     TypenameKWLoc(TypenameKWLoc), Splice(Splice), UnderlyingTy(UnderlyingTy) {
@@ -4262,8 +4305,9 @@ QualType ReflectionSpliceType::desugar() const {
 }
 
 bool ReflectionSpliceType::isSugared() const {
-  // A reflected type is sugared if it's non-dependent.
-  return !isDependentType();
+  // A reflected type is sugared if it has a canonical type of its own to
+  // desugar to (it does unless it is dependent on the splice operand).
+  return getCanonicalTypeInternal().getTypePtr() != this;
 }
 
 DependentReflectionSpliceType::DependentReflectionSpliceType(
@@ -5263,6 +5307,9 @@ bool Type::canHaveNullability(bool ResultIfUnknown) const {
     case BuiltinType::BuiltinFn:
     case BuiltinType::NullPtr:
     case BuiltinType::MetaInfo:
+    case BuiltinType::TokenSequence:
+    case BuiltinType::MetaToken:
+    case BuiltinType::NoReturn:
     case BuiltinType::IncompleteMatrixIdx:
     case BuiltinType::ArraySection:
     case BuiltinType::OMPArrayShaping:
@@ -5610,15 +5657,20 @@ void clang::FixedPointValueToString(SmallVectorImpl<char> &Str,
 
 AutoType::AutoType(QualType DeducedAsType, AutoTypeKeyword Keyword,
                    TypeDependence ExtraDependence, QualType Canon,
-                   TemplateDecl *TypeConstraintConcept,
+                   TemplateName TypeConstraintConcept,
                    ArrayRef<TemplateArgument> TypeConstraintArgs)
     : DeducedType(Auto, DeducedAsType, ExtraDependence, Canon) {
   AutoTypeBits.Keyword = llvm::to_underlying(Keyword);
   AutoTypeBits.NumArgs = TypeConstraintArgs.size();
   this->TypeConstraintConcept = TypeConstraintConcept;
-  assert(TypeConstraintConcept || AutoTypeBits.NumArgs == 0);
-  if (TypeConstraintConcept) {
-    if (isa<TemplateTemplateParmDecl>(TypeConstraintConcept))
+  assert(!TypeConstraintConcept.isNull() || AutoTypeBits.NumArgs == 0);
+  if (!TypeConstraintConcept.isNull()) {
+    // A concept named through a template template parameter (or a
+    // pack-index-template-name) depends on a template parameter.
+    if (isa_and_nonnull<TemplateTemplateParmDecl>(
+            TypeConstraintConcept.getAsTemplateDecl()) ||
+        (TypeConstraintConcept.getAsPackIndexingTemplate() &&
+         TypeConstraintConcept.isInstantiationDependent()))
       addDependence(TypeDependence::DependentInstantiation);
 
     auto *ArgBuffer =
@@ -5636,12 +5688,12 @@ AutoType::AutoType(QualType DeducedAsType, AutoTypeKeyword Keyword,
 
 void AutoType::Profile(llvm::FoldingSetNodeID &ID, const ASTContext &Context,
                        QualType Deduced, AutoTypeKeyword Keyword,
-                       bool IsDependent, TemplateDecl *CD,
+                       bool IsDependent, TemplateName CD,
                        ArrayRef<TemplateArgument> Arguments) {
   ID.AddPointer(Deduced.getAsOpaquePtr());
   ID.AddInteger((unsigned)Keyword);
   ID.AddBoolean(IsDependent);
-  ID.AddPointer(CD);
+  CD.Profile(ID);
   for (const TemplateArgument &Arg : Arguments)
     Arg.Profile(ID, Context);
 }

@@ -9,11 +9,14 @@
 #include "CheckExprLifetime.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/StmtCXX.h"
 #include "clang/AST/Type.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/LifetimeAnnotations.h"
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Sema/Initialization.h"
+#include "clang/Sema/Scope.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PointerIntPair.h"
 
 namespace clang::sema {
@@ -118,10 +121,22 @@ getEntityLifetime(const InitializedEntity *Entity,
     //      destroyed at the end of the full-expression in the return statement.
     return {nullptr, LK_Return};
 
+  case InitializedEntity::EK_DoExprResult:
+    // A do-expression has return-like lifetime semantics for objects created
+    // inside it. The check separately exempts declarations outside the
+    // do-expression's scope boundary (see checkExprLifetimeImpl).
+    return {nullptr, LK_Return};
+
   case InitializedEntity::EK_StmtExprResult:
     // FIXME: Should we lifetime-extend through the result of a statement
     // expression?
     return {nullptr, LK_StmtExprResult};
+
+  case InitializedEntity::EK_MatchExprResult:
+    // A match arm is not a return-like lifetime boundary. References produced
+    // by an arm remain usable through the containing full-expression, and the
+    // completed MatchSelectExpr is inspected in its enclosing context.
+    return {nullptr, LK_FullExpression};
 
   case InitializedEntity::EK_New:
     //   -- A temporary bound to a reference in a new-initializer persists
@@ -234,8 +249,28 @@ struct RevertToOldSizeRAII {
   ~RevertToOldSizeRAII() { Path.resize(OldSize); }
 };
 
-using LocalVisitor = llvm::function_ref<bool(IndirectLocalPath &Path, Local L,
-                                             ReferenceKind RK)>;
+class LocalVisitor {
+  using Callback =
+      llvm::function_ref<bool(IndirectLocalPath &, Local, ReferenceKind)>;
+
+  Callback Visit;
+  bool VisitBindingDecls = false;
+
+public:
+  LocalVisitor(const LocalVisitor &) = default;
+
+  template <class Callable,
+            std::enable_if_t<
+                !std::is_same_v<std::decay_t<Callable>, LocalVisitor>, int> = 0>
+  LocalVisitor(Callable &&Visit) : Visit(Visit) {}
+
+  bool operator()(IndirectLocalPath &Path, Local L, ReferenceKind RK) const {
+    return Visit(Path, L, RK);
+  }
+
+  bool shouldVisitBindingDecls() const { return VisitBindingDecls; }
+  void enableBindingDecls() { VisitBindingDecls = true; }
+};
 } // namespace
 
 static bool isVarOnPath(const IndirectLocalPath &Path, VarDecl *VD) {
@@ -243,6 +278,46 @@ static bool isVarOnPath(const IndirectLocalPath &Path, VarDecl *VD) {
     if (E.Kind == IndirectLocalPathEntry::VarInit && E.D == VD)
       return true;
   return false;
+}
+
+/// Visit the `do_return` operands belonging to one do-expression, excluding
+/// nested do-expressions, lambdas, and blocks (those constructs manage their
+/// own results).
+static void forEachDoExprResult(const Stmt *S,
+                                llvm::function_ref<void(Expr *)> VisitResult,
+                                bool IsRoot = true) {
+  if (!S)
+    return;
+  if (const auto *DR = dyn_cast<DoReturnStmt>(S)) {
+    if (Expr *Op = DR->getOperand())
+      VisitResult(Op);
+    return;
+  }
+  if (!IsRoot && isa<DoExpr>(S))
+    return;
+  if (isa<LambdaExpr, BlockExpr>(S))
+    return;
+  for (const Stmt *Child : S->children())
+    forEachDoExprResult(Child, VisitResult, /*IsRoot=*/false);
+}
+
+
+static void collectTransparentMatchDeclarations(
+    const MatchPattern *Pattern, const MatchPatternInstantiation *Instantiation,
+    llvm::SmallDenseSet<const Decl *, 8> &Declarations) {
+  if (const auto *Declaration = dyn_cast<DeclarationPattern>(Pattern)) {
+    const VarDecl *Variable = Declaration->getDeclaration();
+    if (Variable->getType()->isReferenceType())
+      Declarations.insert(Variable);
+  }
+  if (const auto *Decomposition = dyn_cast<DecompositionPattern>(Pattern)) {
+    for (const MatchPattern *Child :
+         Instantiation->getDecompositionPatterns(Decomposition))
+      collectTransparentMatchDeclarations(Child, Instantiation, Declarations);
+  } else {
+    for (const MatchPattern *Child : Pattern->children())
+      collectTransparentMatchDeclarations(Child, Instantiation, Declarations);
+  }
 }
 
 static bool pathContainsInit(const IndirectLocalPath &Path) {
@@ -612,6 +687,21 @@ static void visitLocalsRetainedByReferenceBinding(IndirectLocalPath &Path,
     // If we find the name of a local non-reference parameter, we could have a
     // lifetime problem.
     auto *DRE = cast<DeclRefExpr>(Init);
+    if (auto *BD = dyn_cast<BindingDecl>(DRE->getDecl());
+        Visit.shouldVisitBindingDecls() && BD) {
+      auto *Decomposition = dyn_cast<VarDecl>(BD->getDecomposedDecl());
+      if (!Decomposition || !Decomposition->hasLocalStorage())
+        break;
+      if (!Decomposition->getType()->isReferenceType()) {
+        Visit(Path, Local(DRE), RK);
+      } else if (Decomposition->getInit() &&
+                 !isVarOnPath(Path, Decomposition)) {
+        Path.push_back({IndirectLocalPathEntry::VarInit, DRE, Decomposition});
+        visitLocalsRetainedByReferenceBinding(Path, Decomposition->getInit(),
+                                              RK_ReferenceBinding, Visit);
+      }
+      break;
+    }
     auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
     if (VD && VD->hasLocalStorage() &&
         !DRE->refersToEnclosingVariableOrCapture()) {
@@ -656,11 +746,66 @@ static void visitLocalsRetainedByReferenceBinding(IndirectLocalPath &Path,
     break;
   }
 
+  case Stmt::MatchSelectExprClass: {
+    const auto *Match = cast<MatchSelectExpr>(Init);
+    llvm::SmallDenseSet<unsigned, 4> VisitedLocations;
+    llvm::SmallDenseSet<const Decl *, 8> TransparentDeclarations;
+    if (const VarDecl *Holding = Match->getHoldingVar();
+        Holding && Holding->getType()->isReferenceType())
+      TransparentDeclarations.insert(Holding);
+    for (const MatchCaseInstantiation &Case : Match->getCaseInstantiations())
+      collectTransparentMatchDeclarations(
+          Case.Pattern, Case.PatternInstantiation, TransparentDeclarations);
+    auto VisitOnce = [&](IndirectLocalPath &Path, Local L,
+                         ReferenceKind RK) {
+      if (!VisitedLocations.insert(L->getExprLoc().getRawEncoding()).second)
+        return false;
+      llvm::SmallVector<IndirectLocalPathEntry, 8> FilteredPath;
+      for (const IndirectLocalPathEntry &Entry : Path)
+        if (Entry.Kind != IndirectLocalPathEntry::VarInit ||
+            !TransparentDeclarations.contains(Entry.D))
+          FilteredPath.push_back(Entry);
+      return Visit(FilteredPath, L, RK);
+    };
+    LocalVisitor MatchVisit(VisitOnce);
+    MatchVisit.enableBindingDecls();
+    for (const MatchCaseInstantiation &Case : Match->getCaseInstantiations())
+      if (auto *Handler = dyn_cast<Expr>(Case.Handler);
+          Handler && !Case.isNonReturning() &&
+          !Handler->getType()->isVoidType())
+        visitLocalsRetainedByReferenceBinding(Path, Handler, RK, MatchVisit);
+    break;
+  }
+
   case Stmt::CompoundLiteralExprClass: {
     if (auto *CLE = dyn_cast<CompoundLiteralExpr>(Init)) {
       if (!CLE->isFileScope())
         Visit(Path, Local(CLE), RK);
     }
+    break;
+  }
+
+  case Stmt::DoExprClass:
+    // A do-expression yielding a reference (glvalue) returns whatever its
+    // `do_return` operands designate. Walk into each operand so the analysis
+    // can see references into the do-expression's init-captures, whose lifetime
+    // extends to the end of the enclosing full-expression.
+    forEachDoExprResult(Init, [&](Expr *Result) {
+      if (!Result->getType()->isVoidType())
+        visitLocalsRetainedByReferenceBinding(Path, Result, RK, Visit);
+    });
+    break;
+
+  case Stmt::OpaqueValueExprClass: {
+    // A *unique* opaque value -- an expression macro's interpolated argument,
+    // emitted in place -- designates whatever its source expression does.
+    // Without this, `fwd!(x)` would hide `x` from the analysis. (Bound opaque
+    // values, as in a GNU ?:, are deliberately left alone: following them
+    // would also be right, but changes upstream's diagnostics.)
+    auto *OVE = cast<OpaqueValueExpr>(Init);
+    if (OVE->isUnique() && OVE->getSourceExpr())
+      visitLocalsRetainedByReferenceBinding(Path, OVE->getSourceExpr(), RK,
+                                            Visit);
     break;
   }
 
@@ -924,6 +1069,58 @@ static void visitLocalsRetainedByInitializer(IndirectLocalPath &Path,
     break;
   }
 
+  case Stmt::DoExprClass:
+    // A do-expression consumed by value yields whatever its `do_return`
+    // operands produce; walk into each so the analysis can see pointers or
+    // references retained inside an aggregate result (e.g. `do_return
+    // Holder{&local};`).
+    forEachDoExprResult(Init, [&](Expr *Result) {
+      visitLocalsRetainedByInitializer(Path, Result, Visit,
+                                       /*RevisitSubinits=*/true);
+    });
+    break;
+
+  case Stmt::MatchSelectExprClass: {
+    const auto *Match = cast<MatchSelectExpr>(Init);
+    llvm::SmallDenseSet<unsigned, 4> VisitedLocations;
+    llvm::SmallDenseSet<const Decl *, 8> TransparentDeclarations;
+    if (const VarDecl *Holding = Match->getHoldingVar();
+        Holding && Holding->getType()->isReferenceType())
+      TransparentDeclarations.insert(Holding);
+    for (const MatchCaseInstantiation &Case : Match->getCaseInstantiations())
+      collectTransparentMatchDeclarations(
+          Case.Pattern, Case.PatternInstantiation, TransparentDeclarations);
+    auto VisitOnce = [&](IndirectLocalPath &Path, Local L,
+                         ReferenceKind RK) {
+      if (!VisitedLocations.insert(L->getExprLoc().getRawEncoding()).second)
+        return false;
+      llvm::SmallVector<IndirectLocalPathEntry, 8> FilteredPath;
+      for (const IndirectLocalPathEntry &Entry : Path)
+        if (Entry.Kind != IndirectLocalPathEntry::VarInit ||
+            !TransparentDeclarations.contains(Entry.D))
+          FilteredPath.push_back(Entry);
+      return Visit(FilteredPath, L, RK);
+    };
+    LocalVisitor MatchVisit(VisitOnce);
+    MatchVisit.enableBindingDecls();
+    for (const MatchCaseInstantiation &Case : Match->getCaseInstantiations())
+      if (auto *Handler = dyn_cast<Expr>(Case.Handler);
+          Handler && !Case.isNonReturning())
+        visitLocalsRetainedByInitializer(Path, Handler, MatchVisit,
+                                         /*RevisitSubinits=*/true);
+    break;
+  }
+
+  case Stmt::OpaqueValueExprClass: {
+    // As above: an interpolated macro argument produces whatever its source
+    // expression produces.
+    auto *OVE = cast<OpaqueValueExpr>(Init);
+    if (OVE->isUnique() && OVE->getSourceExpr())
+      visitLocalsRetainedByInitializer(Path, OVE->getSourceExpr(), Visit,
+                                       RevisitSubinits);
+    break;
+  }
+
   case Stmt::BlockExprClass:
     if (cast<BlockExpr>(Init)->getBlockDecl()->hasCaptures()) {
       // This is a local block, whose lifetime is that of the function.
@@ -1146,6 +1343,37 @@ checkExprLifetimeImpl(Sema &SemaRef, const InitializedEntity *InitEntity,
   // functions to a dedicated class.
   auto TemporaryVisitor = [&](const IndirectLocalPath &Path, Local L,
                               ReferenceKind RK) -> bool {
+    // P2806: for a do-expression result, declarations OUTSIDE the
+    // do-expression are not "stack memory being returned": they outlive the
+    // do-expression itself, and any dangle through them is diagnosed where
+    // the completed do-expression is consumed (via the DoExprClass cases in
+    // the visitors above). Only body locals and body temporaries get the
+    // return-like diagnostics here.
+    if (InitEntity &&
+        InitEntity->getKind() == InitializedEntity::EK_DoExprResult) {
+      auto IsOutsideDoExpr = [&](const Decl *D) {
+        if (!D)
+          return false;
+        Scope *Outer = InitEntity->getDoExprOuterScope();
+        for (Scope *S = SemaRef.getCurScope(); S && S != Outer;
+             S = S->getParent())
+          if (S->isDeclScope(D))
+            return false;
+        return true;
+      };
+
+      // Returning through an enclosing declaration is safe at the
+      // do-expression boundary. Its lifetime is checked when the completed
+      // do-expression is used by the enclosing context.
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(L);
+          DRE && IsOutsideDoExpr(DRE->getDecl()))
+        return false;
+      for (const IndirectLocalPathEntry &Entry : Path)
+        if (Entry.Kind == IndirectLocalPathEntry::VarInit &&
+            IsOutsideDoExpr(Entry.D))
+          return false;
+    }
+
     SourceRange DiagRange = nextPathEntryRange(Path, 0, L);
     SourceLocation DiagLoc = DiagRange.getBegin();
 
@@ -1169,7 +1397,25 @@ checkExprLifetimeImpl(Sema &SemaRef, const InitializedEntity *InitEntity,
       llvm_unreachable("already handled this");
 
     case LK_Extended: {
-      if (!MTE) {
+      // A do-expression init-capture lives only until the end of the enclosing
+      // full-expression, so binding its referent to an entity that outlives the
+      // full-expression dangles. The do-expression boundary blocks lifetime
+      // extension (like a function return), so treat such a path as NoExtend.
+      bool IsDoExprCapture = false;
+      if (auto *DRE = dyn_cast<DeclRefExpr>(L))
+        if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+          IsDoExprCapture = VD->isDoExprInitCapture();
+
+      // Two init-captures of a do-expression are co-extensive (both live until
+      // the end of the enclosing full-expression), so binding one to another
+      // never dangles. Only treat the referent as short-lived when the entity
+      // it is bound to actually outlives the full-expression.
+      if (IsDoExprCapture && ExtendingEntity)
+        if (auto *EVD = dyn_cast_or_null<VarDecl>(ExtendingEntity->getDecl()))
+          if (EVD->isDoExprInitCapture())
+            IsDoExprCapture = false;
+
+      if (!MTE && !IsDoExprCapture) {
         // The initialized entity has lifetime beyond the full-expression,
         // and the local entity does too, so don't warn.
         //
@@ -1178,7 +1424,8 @@ checkExprLifetimeImpl(Sema &SemaRef, const InitializedEntity *InitEntity,
         return false;
       }
 
-      switch (shouldLifetimeExtendThroughPath(Path)) {
+      switch (IsDoExprCapture ? PathLifetimeKind::NoExtend
+                              : shouldLifetimeExtendThroughPath(Path)) {
       case PathLifetimeKind::Extend:
         // Update the storage duration of the materialized temporary.
         // FIXME: Rebuild the expression instead of mutating it.
@@ -1342,6 +1589,15 @@ checkExprLifetimeImpl(Sema &SemaRef, const InitializedEntity *InitEntity,
         // expression.
         if (LK == LK_StmtExprResult)
           return false;
+        // A do-expression init-capture lives until the end of the enclosing
+        // full-expression, so a `do_return` of a reference into it does not by
+        // itself dangle the way returning a function-local does. Whether it
+        // dangles depends on how the do-expression's result is consumed, which
+        // is checked at the binding site (see the DoExprClass handling in
+        // visitLocalsRetainedByReferenceBinding). Defer to that here.
+        if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+          if (VD->isDoExprInitCapture())
+            return false;
         SemaRef.Diag(DiagLoc, diag::warn_ret_stack_addr_ref)
             << InitEntity->getType()->isReferenceType() << DRE->getDecl()
             << isa<ParmVarDecl>(DRE->getDecl()) << (LK == LK_MustTail)

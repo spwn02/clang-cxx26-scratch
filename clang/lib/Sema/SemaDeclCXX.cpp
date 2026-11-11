@@ -52,6 +52,7 @@
 #include "clang/Sema/TemplateDeduction.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -756,7 +757,8 @@ void Sema::DiagPlaceholderVariableDefinition(SourceLocation Loc) {
 
 NamedDecl *
 Sema::ActOnDecompositionDeclarator(Scope *S, Declarator &D,
-                                   MultiTemplateParamsArg TemplateParamLists) {
+                                   MultiTemplateParamsArg TemplateParamLists,
+                                   bool IsPatternDecl) {
   assert(D.isDecompositionDeclarator());
   const DecompositionDeclarator &Decomp = D.getDecompositionDeclarator();
 
@@ -893,75 +895,100 @@ Sema::ActOnDecompositionDeclarator(Scope *S, Declarator &D,
         << TemplRange << FixItHint::CreateRemoval(TemplRange);
   }
 
-  // Build the BindingDecls.
-  SmallVector<BindingDecl*, 8> Bindings;
-
-  // Build the BindingDecls.
-  for (auto &B : D.getDecompositionDeclarator().bindings()) {
-    // Check for name conflicts.
-    DeclarationNameInfo NameInfo(B.Name, B.NameLoc);
+  auto BuildBinding =
+      [&](auto &&Self,
+          const DecompositionDeclarator::Binding &B) -> BindingDecl * {
     IdentifierInfo *VarName = B.Name;
-    assert(VarName && "Cannot have an unnamed binding declaration");
-
-    LookupResult Previous(*this, NameInfo, LookupOrdinaryName,
-                          RedeclarationKind::ForVisibleRedeclaration);
-    LookupName(Previous, S,
-               /*CreateBuiltins*/DC->getRedeclContext()->isTranslationUnit());
-
-    // It's not permitted to shadow a template parameter name.
-    if (Previous.isSingleResult() &&
-        Previous.getFoundDecl()->isTemplateParameter()) {
-      DiagnoseTemplateParameterShadow(B.NameLoc, Previous.getFoundDecl());
-      Previous.clear();
-    }
 
     QualType QT;
     if (B.EllipsisLoc.isValid()) {
-      if (!cast<Decl>(DC)->isTemplated())
+      if (VarName && !cast<Decl>(DC)->isTemplated() && !IsPatternDecl)
         Diag(B.EllipsisLoc, diag::err_pack_outside_template);
       QT = Context.getPackExpansionType(Context.DependentTy, std::nullopt,
                                         /*ExpectsPackInType=*/false);
     }
 
     auto *BD = BindingDecl::Create(Context, DC, B.NameLoc, B.Name, QT);
+    if (B.Nested)
+      BD->setImplicit();
 
-    ProcessDeclAttributeList(S, BD, *B.Attrs);
+    if (B.Attrs)
+      ProcessDeclAttributeList(S, BD, *B.Attrs);
 
-    // Find the shadowed declaration before filtering for scope.
-    NamedDecl *ShadowedDecl = D.getCXXScopeSpec().isEmpty()
-                                  ? getShadowedDeclaration(BD, Previous)
-                                  : nullptr;
+    if (!VarName) {
+      CurContext->addHiddenDecl(BD);
+      ParsingInitForAutoVars.insert(BD);
+    } else {
+      // Check for name conflicts.
+      DeclarationNameInfo NameInfo(B.Name, B.NameLoc);
+      LookupResult Previous(*this, NameInfo, LookupOrdinaryName,
+                            RedeclarationKind::ForVisibleRedeclaration);
+      LookupName(
+          Previous, S,
+          /*CreateBuiltins*/ DC->getRedeclContext()->isTranslationUnit());
 
-    bool ConsiderLinkage = DC->isFunctionOrMethod() &&
-                           DS.getStorageClassSpec() == DeclSpec::SCS_extern;
-    FilterLookupForScope(Previous, DC, S, ConsiderLinkage,
-                         /*AllowInlineNamespace*/false);
-
-    bool IsPlaceholder = DS.getStorageClassSpec() != DeclSpec::SCS_static &&
-                         DC->isFunctionOrMethod() && VarName->isPlaceholder();
-    if (!Previous.empty()) {
-      if (IsPlaceholder) {
-        bool sameDC = (Previous.end() - 1)
-                          ->getDeclContext()
-                          ->getRedeclContext()
-                          ->Equals(DC->getRedeclContext());
-        if (sameDC &&
-            isDeclInScope(*(Previous.end() - 1), CurContext, S, false)) {
-          Previous.clear();
-          DiagPlaceholderVariableDefinition(B.NameLoc);
-        }
-      } else {
-        auto *Old = Previous.getRepresentativeDecl();
-        Diag(B.NameLoc, diag::err_redefinition) << B.Name;
-        Diag(Old->getLocation(), diag::note_previous_definition);
+      // It's not permitted to shadow a template parameter name.
+      if (Previous.isSingleResult() &&
+          Previous.getFoundDecl()->isTemplateParameter()) {
+        DiagnoseTemplateParameterShadow(B.NameLoc, Previous.getFoundDecl());
+        Previous.clear();
       }
-    } else if (ShadowedDecl && !D.isRedeclaration()) {
-      CheckShadow(BD, ShadowedDecl, Previous);
+
+      // Find the shadowed declaration before filtering for scope.
+      NamedDecl *ShadowedDecl = D.getCXXScopeSpec().isEmpty()
+                                    ? getShadowedDeclaration(BD, Previous)
+                                    : nullptr;
+
+      bool ConsiderLinkage = DC->isFunctionOrMethod() &&
+                             DS.getStorageClassSpec() == DeclSpec::SCS_extern;
+      FilterLookupForScope(Previous, DC, S, ConsiderLinkage,
+                           /*AllowInlineNamespace*/ false);
+
+      bool IsPlaceholder = DS.getStorageClassSpec() != DeclSpec::SCS_static &&
+                           DC->isFunctionOrMethod() && VarName->isPlaceholder();
+      if (!Previous.empty()) {
+        if (IsPlaceholder) {
+          bool sameDC = (Previous.end() - 1)
+                            ->getDeclContext()
+                            ->getRedeclContext()
+                            ->Equals(DC->getRedeclContext());
+          if (sameDC &&
+              isDeclInScope(*(Previous.end() - 1), CurContext, S, false)) {
+            Previous.clear();
+            DiagPlaceholderVariableDefinition(B.NameLoc);
+          }
+        } else {
+          auto *Old = Previous.getRepresentativeDecl();
+          Diag(B.NameLoc, diag::err_redefinition) << B.Name;
+          Diag(Old->getLocation(), diag::note_previous_definition);
+        }
+      } else if (ShadowedDecl && !D.isRedeclaration()) {
+        CheckShadow(BD, ShadowedDecl, Previous);
+      }
+      PushOnScopeChains(BD, S, true);
+      ParsingInitForAutoVars.insert(BD);
     }
-    PushOnScopeChains(BD, S, true);
-    Bindings.push_back(BD);
-    ParsingInitForAutoVars.insert(BD);
-  }
+
+    if (B.Nested) {
+      SmallVector<BindingDecl *, 8> NestedBindings;
+      for (const auto &NestedBinding : B.Nested->bindings())
+        NestedBindings.push_back(Self(Self, NestedBinding));
+      auto *NestedDD = DecompositionDecl::Create(
+          Context, DC, B.Nested->getLSquareLoc(), B.Nested->getLSquareLoc(),
+          Context.DependentTy, /*TInfo=*/nullptr,
+          SC_None, NestedBindings);
+      NestedDD->setImplicit();
+      NestedDD->setLexicalDeclContext(DC);
+      BD->setNestedDecomposition(NestedDD);
+    }
+
+    return BD;
+  };
+
+  // Build the BindingDecls.
+  SmallVector<BindingDecl *, 8> Bindings;
+  for (const auto &B : D.getDecompositionDeclarator().bindings())
+    Bindings.push_back(BuildBinding(BuildBinding, B));
 
   // There are no prior lookup results for the variable itself, because it
   // is unnamed.
@@ -1029,18 +1056,21 @@ static bool CheckBindingsCount(Sema &S, DecompositionDecl *DD,
   if (IsValid)
     return false;
 
+  unsigned NumNames = Bindings.size();
+  if (HasPack && !(*BindingWithPackItr)->getIdentifier())
+    --NumNames;
   S.Diag(DD->getLocation(), diag::err_decomp_decl_wrong_number_bindings)
-      << DecompType << (unsigned)Bindings.size() << MemberCount << MemberCount
+      << DecompType << NumNames << MemberCount << MemberCount
       << (MemberCount < Bindings.size());
   return true;
 }
 
 static bool checkSimpleDecomposition(
-    Sema &S, ArrayRef<BindingDecl *> Bindings, ValueDecl *Src,
-    QualType DecompType, const llvm::APSInt &NumElemsAPS, QualType ElemType,
+    Sema &S, DecompositionDecl *DD, ArrayRef<BindingDecl *> Bindings,
+    ValueDecl *Src, QualType DecompType, const llvm::APSInt &NumElemsAPS,
+    QualType ElemType,
     llvm::function_ref<ExprResult(SourceLocation, Expr *, unsigned)> GetInit) {
   unsigned NumElems = (unsigned)NumElemsAPS.getLimitedValue(UINT_MAX);
-  auto *DD = cast<DecompositionDecl>(Src);
 
   if (CheckBindingsCount(S, DD, DecompType, Bindings, NumElems))
     return true;
@@ -1051,6 +1081,10 @@ static bool checkSimpleDecomposition(
     ExprResult E = S.BuildDeclRefExpr(Src, DecompType, VK_LValue, Loc);
     if (E.isInvalid())
       return true;
+    if (Src != DD && !DD->getType()->isLValueReferenceType())
+      E = ImplicitCastExpr::Create(S.Context, E.get()->getType(), CK_NoOp,
+                                   E.get(), nullptr, VK_XValue,
+                                   FPOptionsOverride());
     E = GetInit(Loc, E.get(), I++);
     if (E.isInvalid())
       return true;
@@ -1060,13 +1094,13 @@ static bool checkSimpleDecomposition(
   return false;
 }
 
-static bool checkArrayLikeDecomposition(Sema &S,
+static bool checkArrayLikeDecomposition(Sema &S, DecompositionDecl *DD,
                                         ArrayRef<BindingDecl *> Bindings,
                                         ValueDecl *Src, QualType DecompType,
                                         const llvm::APSInt &NumElems,
                                         QualType ElemType) {
   return checkSimpleDecomposition(
-      S, Bindings, Src, DecompType, NumElems, ElemType,
+      S, DD, Bindings, Src, DecompType, NumElems, ElemType,
       [&](SourceLocation Loc, Expr *Base, unsigned I) -> ExprResult {
         ExprResult E = S.ActOnIntegerConstant(Loc, I);
         if (E.isInvalid())
@@ -1075,29 +1109,31 @@ static bool checkArrayLikeDecomposition(Sema &S,
       });
 }
 
-static bool checkArrayDecomposition(Sema &S, ArrayRef<BindingDecl*> Bindings,
+static bool checkArrayDecomposition(Sema &S, DecompositionDecl *DD,
+                                    ArrayRef<BindingDecl *> Bindings,
                                     ValueDecl *Src, QualType DecompType,
                                     const ConstantArrayType *CAT) {
-  return checkArrayLikeDecomposition(S, Bindings, Src, DecompType,
+  return checkArrayLikeDecomposition(S, DD, Bindings, Src, DecompType,
                                      llvm::APSInt(CAT->getSize()),
                                      CAT->getElementType());
 }
 
-static bool checkVectorDecomposition(Sema &S, ArrayRef<BindingDecl*> Bindings,
+static bool checkVectorDecomposition(Sema &S, DecompositionDecl *DD,
+                                     ArrayRef<BindingDecl *> Bindings,
                                      ValueDecl *Src, QualType DecompType,
                                      const VectorType *VT) {
   return checkArrayLikeDecomposition(
-      S, Bindings, Src, DecompType, llvm::APSInt::get(VT->getNumElements()),
+      S, DD, Bindings, Src, DecompType, llvm::APSInt::get(VT->getNumElements()),
       S.Context.getQualifiedType(VT->getElementType(),
                                  DecompType.getQualifiers()));
 }
 
-static bool checkComplexDecomposition(Sema &S,
+static bool checkComplexDecomposition(Sema &S, DecompositionDecl *DD,
                                       ArrayRef<BindingDecl *> Bindings,
                                       ValueDecl *Src, QualType DecompType,
                                       const ComplexType *CT) {
   return checkSimpleDecomposition(
-      S, Bindings, Src, DecompType, llvm::APSInt::get(2),
+      S, DD, Bindings, Src, DecompType, llvm::APSInt::get(2),
       S.Context.getQualifiedType(CT->getElementType(),
                                  DecompType.getQualifiers()),
       [&](SourceLocation Loc, Expr *Base, unsigned I) -> ExprResult {
@@ -1312,11 +1348,11 @@ struct InitializingBinding {
 };
 }
 
-static bool checkTupleLikeDecomposition(Sema &S,
+static bool checkTupleLikeDecomposition(Sema &S, DecompositionDecl *DD,
                                         ArrayRef<BindingDecl *> Bindings,
-                                        VarDecl *Src, QualType DecompType,
+                                        ValueDecl *Src, DecompositionDecl *Root,
+                                        QualType DecompType,
                                         unsigned NumElems) {
-  auto *DD = cast<DecompositionDecl>(Src);
   if (CheckBindingsCount(S, DD, DecompType, Bindings, NumElems))
     return true;
 
@@ -1362,7 +1398,7 @@ static bool checkTupleLikeDecomposition(Sema &S,
 
     //   e is an lvalue if the type of the entity is an lvalue reference and
     //   an xvalue otherwise
-    if (!Src->getType()->isLValueReferenceType())
+    if (!DD->getType()->isLValueReferenceType())
       E = ImplicitCastExpr::Create(S.Context, E.get()->getType(), CK_NoOp,
                                    E.get(), nullptr, VK_XValue,
                                    FPOptionsOverride());
@@ -1412,14 +1448,27 @@ static bool checkTupleLikeDecomposition(Sema &S,
 
     // Don't give this VarDecl a TypeSourceInfo, since this is a synthesized
     // entity and this type was never written in source code.
-    auto *RefVD =
-        VarDecl::Create(S.Context, Src->getDeclContext(), Loc, Loc,
-                        B->getDeclName().getAsIdentifierInfo(), RefType,
-                        /*TInfo=*/nullptr, Src->getStorageClass());
-    RefVD->setLexicalDeclContext(Src->getLexicalDeclContext());
-    RefVD->setTSCSpec(Src->getTSCSpec());
+    IdentifierInfo *BindingName = B->getIdentifier();
+    if (!BindingName) {
+      llvm::SmallString<48> Name("__nested_structured_binding");
+      Name += '_';
+      unsigned Offset = Root->isFileVarDecl()
+                            ? B->getLocation().getRawEncoding()
+                            : S.SourceMgr.getFileOffset(
+                                  S.SourceMgr.getExpansionLoc(B->getLocation()));
+      Name += llvm::utostr(Offset);
+      BindingName = S.PP.getIdentifierInfo(Name);
+    }
+    StorageClass BindingStorage = Root->getStorageClass();
+    if (!B->getIdentifier() && Root->isFileVarDecl())
+      BindingStorage = SC_Static;
+    auto *RefVD = VarDecl::Create(S.Context, Root->getDeclContext(), Loc, Loc,
+                                  BindingName, RefType,
+                                  /*TInfo=*/nullptr, BindingStorage);
+    RefVD->setLexicalDeclContext(Root->getLexicalDeclContext());
+    RefVD->setTSCSpec(Root->getTSCSpec());
     RefVD->setImplicit();
-    if (Src->isInlineSpecified())
+    if (Root->isInlineSpecified())
       RefVD->setInlineSpecified();
     RefVD->getLexicalDeclContext()->addHiddenDecl(RefVD);
 
@@ -1564,7 +1613,8 @@ static bool CheckMemberDecompositionFields(Sema &S, SourceLocation Loc,
   return false;
 }
 
-static bool checkMemberDecomposition(Sema &S, ArrayRef<BindingDecl*> Bindings,
+static bool checkMemberDecomposition(Sema &S, DecompositionDecl *DD,
+                                     ArrayRef<BindingDecl *> Bindings,
                                      ValueDecl *Src, QualType DecompType,
                                      const CXXRecordDecl *OrigRD) {
   if (S.RequireCompleteType(Src->getLocation(), DecompType,
@@ -1580,7 +1630,6 @@ static bool checkMemberDecomposition(Sema &S, ArrayRef<BindingDecl*> Bindings,
   QualType BaseType = S.Context.getQualifiedType(
       S.Context.getCanonicalTagType(RD), DecompType.getQualifiers());
 
-  auto *DD = cast<DecompositionDecl>(Src);
   unsigned NumFields = llvm::count_if(
       RD->fields(), [](FieldDecl *FD) { return !FD->isUnnamedBitField(); });
   if (CheckBindingsCount(S, DD, DecompType, Bindings, NumFields))
@@ -1610,8 +1659,12 @@ static bool checkMemberDecomposition(Sema &S, ArrayRef<BindingDecl*> Bindings,
     ExprResult E = S.BuildDeclRefExpr(Src, DecompType, VK_LValue, Loc);
     if (E.isInvalid())
       return true;
+    if (Src != DD && !DD->getType()->isLValueReferenceType())
+      E = ImplicitCastExpr::Create(S.Context, E.get()->getType(), CK_NoOp,
+                                   E.get(), nullptr, VK_XValue,
+                                   FPOptionsOverride());
     E = S.ImpCastExprToType(E.get(), BaseType, CK_UncheckedDerivedToBase,
-                            VK_LValue, &BasePath);
+                            E.get()->getValueKind(), &BasePath);
     if (E.isInvalid())
       return true;
     E = S.BuildFieldReferenceExpr(E.get(), /*IsArrow*/ false, Loc,
@@ -1635,7 +1688,44 @@ static bool checkMemberDecomposition(Sema &S, ArrayRef<BindingDecl*> Bindings,
   return false;
 }
 
-void Sema::CheckCompleteDecompositionDeclaration(DecompositionDecl *DD) {
+static ExprValueKind
+getNestedDecompositionValueKind(const BindingDecl *Binding) {
+  if (const VarDecl *HoldingVar = Binding->getHoldingVar())
+    return HoldingVar->getType()->isLValueReferenceType() ? VK_LValue
+                                                          : VK_XValue;
+
+  if (const auto *Member =
+          dyn_cast<MemberExpr>(Binding->getBinding()->IgnoreParenImpCasts()))
+    if (const auto *Field = dyn_cast<FieldDecl>(Member->getMemberDecl());
+        Field && Field->getType()->isReferenceType())
+      return VK_LValue;
+
+  return Binding->getDecomposedDecl()->getType()->isLValueReferenceType()
+             ? VK_LValue
+             : VK_XValue;
+}
+
+static bool CheckCompleteDecompositionDeclarationImpl(Sema &S,
+                                                      DecompositionDecl *DD,
+                                                      ValueDecl *Src,
+                                                      DecompositionDecl *Root);
+
+static bool CheckNestedDecompositionDeclarations(Sema &S, DecompositionDecl *DD,
+                                                 DecompositionDecl *Root) {
+  for (BindingDecl *Binding : DD->flat_bindings()) {
+    DecompositionDecl *Nested = Binding->getNestedDecomposition();
+    if (!Nested)
+      continue;
+    if (S.CheckCompleteNestedDecompositionDeclaration(Nested, Binding, Root))
+      return true;
+  }
+  return false;
+}
+
+static bool CheckCompleteDecompositionDeclarationImpl(Sema &S,
+                                                      DecompositionDecl *DD,
+                                                      ValueDecl *Src,
+                                                      DecompositionDecl *Root) {
   QualType DecompType = DD->getType();
 
   // If the type of the decomposition is dependent, then so is the type of
@@ -1645,9 +1735,13 @@ void Sema::CheckCompleteDecompositionDeclaration(DecompositionDecl *DD) {
     for (auto *B : DD->bindings()) {
       // Do not overwrite any pack type.
       if (B->getType().isNull())
-        B->setType(Context.DependentTy);
+        B->setType(S.Context.DependentTy);
+      if (DecompositionDecl *Nested = B->getNestedDecomposition()) {
+        Nested->setType(S.Context.DependentTy);
+        CheckCompleteDecompositionDeclarationImpl(S, Nested, B, Root);
+      }
     }
-    return;
+    return false;
   }
 
   DecompType = DecompType.getNonReferenceType();
@@ -1657,35 +1751,35 @@ void Sema::CheckCompleteDecompositionDeclaration(DecompositionDecl *DD) {
   //   If E is an array type [...]
   // As an extension, we also support decomposition of built-in complex and
   // vector types.
-  if (auto *CAT = Context.getAsConstantArrayType(DecompType)) {
-    if (checkArrayDecomposition(*this, Bindings, DD, DecompType, CAT))
-      DD->setInvalidDecl();
-    return;
+  if (auto *CAT = S.Context.getAsConstantArrayType(DecompType)) {
+    if (checkArrayDecomposition(S, DD, Bindings, Src, DecompType, CAT))
+      return true;
+    return CheckNestedDecompositionDeclarations(S, DD, Root);
   }
   if (auto *VT = DecompType->getAs<VectorType>()) {
-    if (checkVectorDecomposition(*this, Bindings, DD, DecompType, VT))
-      DD->setInvalidDecl();
-    return;
+    if (checkVectorDecomposition(S, DD, Bindings, Src, DecompType, VT))
+      return true;
+    return CheckNestedDecompositionDeclarations(S, DD, Root);
   }
   if (auto *CT = DecompType->getAs<ComplexType>()) {
-    if (checkComplexDecomposition(*this, Bindings, DD, DecompType, CT))
-      DD->setInvalidDecl();
-    return;
+    if (checkComplexDecomposition(S, DD, Bindings, Src, DecompType, CT))
+      return true;
+    return CheckNestedDecompositionDeclarations(S, DD, Root);
   }
 
   // C++1z [dcl.decomp]/3:
   //   if the expression std::tuple_size<E>::value is a well-formed integral
   //   constant expression, [...]
   unsigned TupleSize;
-  switch (isTupleLike(*this, DD->getLocation(), DecompType, TupleSize)) {
+  switch (isTupleLike(S, DD->getLocation(), DecompType, TupleSize)) {
   case IsTupleLike::Error:
-    DD->setInvalidDecl();
-    return;
+    return true;
 
   case IsTupleLike::TupleLike:
-    if (checkTupleLikeDecomposition(*this, Bindings, DD, DecompType, TupleSize))
-      DD->setInvalidDecl();
-    return;
+    if (checkTupleLikeDecomposition(S, DD, Bindings, Src, Root, DecompType,
+                                    TupleSize))
+      return true;
+    return CheckNestedDecompositionDeclarations(S, DD, Root);
 
   case IsTupleLike::NotTupleLike:
     break;
@@ -1695,17 +1789,40 @@ void Sema::CheckCompleteDecompositionDeclaration(DecompositionDecl *DD) {
   //   [E shall be of array or non-union class type]
   CXXRecordDecl *RD = DecompType->getAsCXXRecordDecl();
   if (!RD || RD->isUnion()) {
-    Diag(DD->getLocation(), diag::err_decomp_decl_unbindable_type)
+    S.Diag(DD->getLocation(), diag::err_decomp_decl_unbindable_type)
         << DD << !RD << DecompType;
-    DD->setInvalidDecl();
-    return;
+    return true;
   }
 
   // C++1z [dcl.decomp]/4:
   //   all of E's non-static data members shall be [...] direct members of
   //   E or of the same unambiguous public base class of E, ...
-  if (checkMemberDecomposition(*this, Bindings, DD, DecompType, RD))
+  if (checkMemberDecomposition(S, DD, Bindings, Src, DecompType, RD))
+    return true;
+  return CheckNestedDecompositionDeclarations(S, DD, Root);
+}
+
+void Sema::CheckCompleteDecompositionDeclaration(DecompositionDecl *DD) {
+  if (CheckCompleteDecompositionDeclarationImpl(*this, DD, DD, DD))
     DD->setInvalidDecl();
+}
+
+bool Sema::CheckCompleteNestedDecompositionDeclaration(
+    DecompositionDecl *DD, BindingDecl *Source, DecompositionDecl *Root) {
+  ExprValueKind ValueKind = getNestedDecompositionValueKind(Source);
+  QualType NestedType = BuildReferenceType(
+      Source->getBinding()->getType(), ValueKind == VK_LValue,
+      Source->getLocation(), DeclarationName());
+  if (NestedType.isNull()) {
+    DD->setInvalidDecl();
+    return true;
+  }
+  DD->setType(NestedType);
+  if (CheckCompleteDecompositionDeclarationImpl(*this, DD, Source, Root)) {
+    DD->setInvalidDecl();
+    return true;
+  }
+  return false;
 }
 
 UnsignedOrNone Sema::GetDecompositionElementCount(QualType T,
@@ -4601,6 +4718,21 @@ Sema::BuildMemInitializer(Decl *ConstructorD,
         }
       }
 
+      // Nothing by this name, but the class may receive members per
+      // specialization: initialize it, if it is one, when instantiated.
+      if (R.empty() && BaseType.isNull() && SS.isEmpty() &&
+          CurrentMemInitPosition != ~0u && Constructor->isDependentContext() &&
+          mayHaveInjectedMembers(ClassDecl)) {
+        DeferredMemInit D;
+        D.Position = CurrentMemInitPosition;
+        D.Name = MemberOrBase;
+        D.NameLoc = IdLoc;
+        D.Init = Init;
+        D.EllipsisLoc = EllipsisLoc;
+        DeferredMemInitMacros[Constructor->getCanonicalDecl()].push_back(D);
+        return MemInitResult();
+      }
+
       // If no results were found, try to correct typos.
       TypoCorrection Corr;
       MemInitializerValidatorCCC CCC(ClassDecl);
@@ -4685,6 +4817,29 @@ Sema::BuildMemInitializer(Decl *ConstructorD,
     TInfo = Context.getTrivialTypeSourceInfo(BaseType, IdLoc);
 
   return BuildBaseInitializer(BaseType, TInfo, Init, ClassDecl, EllipsisLoc);
+}
+
+MemInitResult Sema::BuildDeferredNamedMemInitializer(
+    CXXConstructorDecl *New, const DeferredMemInit &D,
+    const MultiLevelTemplateArgumentList &Args) {
+  ExprResult Init = SubstInitializer(D.Init, Args, /*CXXDirectInit=*/true);
+  if (Init.isInvalid())
+    return true;
+  CXXScopeSpec SS;
+  ValueDecl *Member = tryLookupCtorInitMemberDecl(
+      New->getParent(), SS, /*TemplateTypeTy=*/nullptr, D.Name);
+  if (!Member) {
+    Diag(D.NameLoc, diag::err_mem_init_not_member_or_class)
+        << D.Name
+        << SourceRange(D.NameLoc, D.Init->getSourceRange().getEnd());
+    return true;
+  }
+  if (D.EllipsisLoc.isValid()) {
+    Diag(D.EllipsisLoc, diag::err_pack_expansion_member_init)
+        << D.Name << SourceRange(D.NameLoc, D.Init->getSourceRange().getEnd());
+    return true;
+  }
+  return BuildMemberInitializer(Member, Init.get(), D.NameLoc);
 }
 
 MemInitResult
@@ -6885,6 +7040,22 @@ Sema::getDefaultedFunctionKind(const FunctionDecl *FD) {
       break;
     return DefaultedComparisonKind::Relational;
 
+  case OO_PlusPlus:
+  case OO_MinusMinus: {
+    // [over.inc.default] (C++26): a postfix increment or decrement operator
+    // function, i.e. one with an additional int parameter.
+    if (!getLangOpts().CPlusPlus29)
+      break;
+    auto *MD = dyn_cast<CXXMethodDecl>(FD);
+    unsigned PostfixParams =
+        MD && MD->isImplicitObjectMemberFunction() ? 1 : 2;
+    if (FD->getNumParams() != PostfixParams)
+      break;
+    return FD->getDeclName().getCXXOverloadedOperator() == OO_PlusPlus
+               ? DefaultedPostfixKind::Increment
+               : DefaultedPostfixKind::Decrement;
+  }
+
   default:
     break;
   }
@@ -6898,6 +7069,9 @@ static void DefineDefaultedFunction(Sema &S, FunctionDecl *FD,
   Sema::DefaultedFunctionKind DFK = S.getDefaultedFunctionKind(FD);
   if (DFK.isComparison())
     return S.DefineDefaultedComparison(DefaultLoc, FD, DFK.asComparison());
+  if (DFK.isPostfixIncDec())
+    return S.DefineDefaultedPostfixIncDec(DefaultLoc, FD,
+                                          DFK.asPostfixIncDec());
 
   switch (DFK.asSpecialMember()) {
   case CXXSpecialMemberKind::DefaultConstructor:
@@ -7845,6 +8019,12 @@ void Sema::CheckExplicitlyDefaultedFunction(Scope *S, FunctionDecl *FD) {
     }
   }
 
+  if (DefKind.isPostfixIncDec()) {
+    if (CheckExplicitlyDefaultedPostfixIncDec(FD, DefKind.asPostfixIncDec()))
+      FD->setInvalidDecl();
+    return;
+  }
+
   if (DefKind.isSpecialMember()
           ? CheckExplicitlyDefaultedSpecialMember(cast<CXXMethodDecl>(FD),
                                                   DefKind.asSpecialMember(),
@@ -7881,7 +8061,19 @@ bool Sema::CheckExplicitlyDefaultedSpecialMember(CXXMethodDecl *MD,
   // C++2a changes the second bullet to instead delete the function if it's
   // defaulted on its first declaration, unless it's "an assignment operator,
   // and its return type differs or its parameter type is not a reference".
-  bool DeleteOnTypeMismatch = getLangOpts().CPlusPlus20 && First;
+  //
+  // C++29 (P2953R5) makes the mismatches that are not about a reference to
+  // non-const / const copy parameter ill-formed again; only a copy operation
+  // whose parameter is "reference to const C" while the implicit one has
+  // "reference to C" is still deleted (on its first declaration).
+  bool DeleteOnTypeMismatch =
+      getLangOpts().CPlusPlus20 && !getLangOpts().CPlusPlus29 && First;
+  bool DeleteOnConstParamMismatch =
+      getLangOpts().CPlusPlus20 &&
+      (!getLangOpts().CPlusPlus29 ||
+       CSM == CXXSpecialMemberKind::CopyConstructor ||
+       CSM == CXXSpecialMemberKind::CopyAssignment) &&
+      First;
   bool ShouldDeleteForTypeMismatch = false;
   unsigned ExpectedParams = 1;
   if (CSM == CXXSpecialMemberKind::DefaultConstructor ||
@@ -7930,6 +8122,15 @@ bool Sema::CheckExplicitlyDefaultedSpecialMember(CXXMethodDecl *MD,
       Diag(MD->getLocation(), diag::err_defaulted_special_member_return_type)
           << (CSM == CXXSpecialMemberKind::MoveAssignment)
           << ExpectedReturnType;
+      HadError = true;
+    }
+
+    // C++29 [dcl.fct.def.default]p2 (P2953R5): an explicitly defaulted
+    // assignment operator may only have the '&' ref-qualifier.
+    if (getLangOpts().CPlusPlus29 && MD->getRefQualifier() == RQ_RValue) {
+      Diag(MD->getLocation(), diag::err_defaulted_special_member_rvalue_ref_qual)
+          << (CSM == CXXSpecialMemberKind::MoveAssignment)
+          << MD->getSourceRange();
       HadError = true;
     }
 
@@ -7992,7 +8193,7 @@ bool Sema::CheckExplicitlyDefaultedSpecialMember(CXXMethodDecl *MD,
     }
 
     if (HasConstParam && !CanHaveConstParam) {
-      if (DeleteOnTypeMismatch)
+      if (DeleteOnConstParamMismatch)
         ShouldDeleteForTypeMismatch = true;
       else if (CSM == CXXSpecialMemberKind::CopyConstructor ||
                CSM == CXXSpecialMemberKind::CopyAssignment) {
@@ -9431,6 +9632,308 @@ void Sema::DefineDefaultedComparison(SourceLocation UseLoc, FunctionDecl *FD,
     L->CompletedImplicitDefinition(FD);
 }
 
+namespace {
+/// The reasons a defaulted postfix increment or decrement operator function is
+/// defined as deleted ([over.inc.default]).
+enum class PostfixDeletedReason { None, CopyUnusable, DestructorUnusable, PrefixUnusable };
+
+/// The shape of a defaulted postfix increment or decrement operator function:
+/// the type C it operates on and whether the object parameter is volatile.
+struct DefaultedPostfixShape {
+  QualType C;
+  QualType FirstParamType;
+  bool IsVolatile = false;
+  bool Valid = false;
+};
+} // namespace
+
+static DefaultedPostfixShape getDefaultedPostfixShape(Sema &S,
+                                                      FunctionDecl *FD) {
+  DefaultedPostfixShape Shape;
+  if (auto *MD = dyn_cast<CXXMethodDecl>(FD);
+      MD && MD->isImplicitObjectMemberFunction()) {
+    Shape.C = S.Context.getCanonicalTagType(MD->getParent());
+    Shape.IsVolatile = MD->isVolatile();
+    Shape.FirstParamType = MD->getFunctionObjectParameterType();
+    Shape.Valid = !MD->isConst();
+    return Shape;
+  }
+
+  Shape.FirstParamType = FD->getParamDecl(0)->getType();
+  const auto *Ref = Shape.FirstParamType->getAs<ReferenceType>();
+  if (!Ref)
+    return Shape;
+  QualType Pointee = Ref->getPointeeType();
+  if (Pointee.isConstQualified())
+    return Shape;
+  Shape.IsVolatile = Pointee.isVolatileQualified();
+  Shape.C = Pointee.getUnqualifiedType();
+  Shape.Valid = true;
+  return Shape;
+}
+
+/// Determine whether the implicit definition of a defaulted postfix increment
+/// or decrement operator function would be ill-formed, i.e. whether it is
+/// defined as deleted, and why.
+static PostfixDeletedReason
+analyzeDefaultedPostfixIncDec(Sema &S, FunctionDecl *FD,
+                              Sema::DefaultedPostfixKind Kind,
+                              const DefaultedPostfixShape &Shape,
+                              bool *ConstexprSuitable = nullptr) {
+  if (ConstexprSuitable)
+    *ConstexprSuitable = false;
+  // [dcl.fct.def.default]: the function is constexpr-suitable if the type is a
+  // literal type and the copy and the prefix operator it calls are constexpr.
+  bool Suitable = Shape.C->isLiteralType(S.Context);
+  SourceLocation Loc = FD->getLocation();
+  // Name lookup and access checks are performed from the function body.
+  Sema::ContextRAII SavedContext(S, FD);
+  Sema::SFINAETrap Trap(S, /*ForValidityCheck=*/true);
+
+  QualType LvalueType = Shape.C;
+  if (Shape.IsVolatile)
+    LvalueType.addVolatile();
+  OpaqueValueExpr Operand(Loc, LvalueType, VK_LValue);
+  Expr *Arg = &Operand;
+
+  if (CXXRecordDecl *RD = Shape.C->getAsCXXRecordDecl()) {
+    // The destructor is neither deleted nor inaccessible.
+    CXXDestructorDecl *Dtor = S.LookupDestructor(RD);
+    if (!Dtor || Dtor->isDeleted() ||
+        S.CheckDestructorAccess(
+            Loc, Dtor, S.PDiag(diag::err_access_dtor_temp) << Shape.C) !=
+            Sema::AR_accessible ||
+        Trap.hasErrorOccurred())
+      return PostfixDeletedReason::DestructorUnusable;
+
+    // 'C tmp(c)' has a usable candidate.
+    InitializedEntity Entity = InitializedEntity::InitializeTemporary(Shape.C);
+    InitializationKind InitKind = InitializationKind::CreateDirect(Loc, Loc, Loc);
+    InitializationSequence Seq(S, Entity, InitKind, Arg);
+    if (Seq.Failed() || Trap.hasErrorOccurred())
+      return PostfixDeletedReason::CopyUnusable;
+    ExprResult Copy = Seq.Perform(S, Entity, InitKind, Arg);
+    if (Copy.isInvalid() || Trap.hasErrorOccurred())
+      return PostfixDeletedReason::CopyUnusable;
+    if (auto *Construct =
+            dyn_cast<CXXConstructExpr>(Copy.get()->IgnoreImplicit());
+        Construct && !Construct->getConstructor()->isConstexpr())
+      Suitable = false;
+  }
+
+  // '++c' / '--c' has a usable candidate.
+  ExprResult Prefix = S.BuildUnaryOp(
+      nullptr, Loc,
+      Kind == Sema::DefaultedPostfixKind::Increment ? UO_PreInc : UO_PreDec,
+      Arg);
+  if (Prefix.isInvalid() || Trap.hasErrorOccurred())
+    return PostfixDeletedReason::PrefixUnusable;
+  if (auto *Call = dyn_cast<CXXOperatorCallExpr>(Prefix.get()->IgnoreImplicit())) {
+    if (const auto *Callee = dyn_cast_or_null<FunctionDecl>(Call->getCalleeDecl());
+        Callee && !Callee->isConstexpr())
+      Suitable = false;
+  }
+  if (ConstexprSuitable)
+    *ConstexprSuitable = Suitable;
+  return PostfixDeletedReason::None;
+}
+
+static void ExplainDeletedPostfixIncDec(Sema &S, FunctionDecl *FD,
+                                        Sema::DefaultedPostfixKind Kind) {
+  DefaultedPostfixShape Shape = getDefaultedPostfixShape(S, FD);
+  if (!Shape.Valid)
+    return;
+  bool IsDecrement = Kind == Sema::DefaultedPostfixKind::Decrement;
+  switch (analyzeDefaultedPostfixIncDec(S, FD, Kind, Shape)) {
+  case PostfixDeletedReason::None:
+    break;
+  case PostfixDeletedReason::CopyUnusable:
+    S.Diag(FD->getLocation(), diag::note_defaulted_postfix_incdec_deleted_copy)
+        << IsDecrement << Shape.C;
+    break;
+  case PostfixDeletedReason::DestructorUnusable:
+    S.Diag(FD->getLocation(), diag::note_defaulted_postfix_incdec_deleted_dtor)
+        << IsDecrement << Shape.C;
+    break;
+  case PostfixDeletedReason::PrefixUnusable:
+    S.Diag(FD->getLocation(),
+           diag::note_defaulted_postfix_incdec_deleted_prefix)
+        << IsDecrement << Shape.C;
+    break;
+  }
+}
+
+bool Sema::CheckExplicitlyDefaultedPostfixIncDec(FunctionDecl *FD,
+                                                 DefaultedPostfixKind Kind) {
+  assert(FD->isExplicitlyDefaulted() && "not an explicitly-defaulted function");
+  bool IsDecrement = Kind == DefaultedPostfixKind::Decrement;
+
+  // Defer all checking for functions of a dependent type.
+  if (FD->isDependentContext())
+    return false;
+
+  DefaultedPostfixShape Shape = getDefaultedPostfixShape(*this, FD);
+  if (!Shape.Valid) {
+    QualType Expected = Shape.C.isNull() && !FD->getParamDecl(0)->getType().isNull()
+                            ? FD->getParamDecl(0)->getType().getNonReferenceType()
+                            : Shape.C;
+    Diag(FD->getLocation(), diag::err_defaulted_postfix_incdec_param)
+        << IsDecrement << Shape.FirstParamType << Expected.getUnqualifiedType();
+    return true;
+  }
+
+  // The operator returns C.
+  if (!Context.hasSameType(FD->getReturnType(), Shape.C)) {
+    Diag(FD->getLocation(), diag::err_defaulted_postfix_incdec_return)
+        << IsDecrement << Shape.C;
+    return true;
+  }
+
+  // No default arguments.
+  if (FD->getParamDecl(FD->getNumParams() - 1)->hasDefaultArg()) {
+    Diag(FD->getLocation(), diag::err_defaulted_postfix_incdec_default_arg)
+        << IsDecrement;
+    return true;
+  }
+
+  // The operator is defaulted in C or in a context where C is complete.
+  if (!isa<CXXMethodDecl>(FD) ||
+      !cast<CXXMethodDecl>(FD)->isImplicitObjectMemberFunction()) {
+    bool InsideClass = FD->getLexicalDeclContext()->isRecord();
+    if (!InsideClass &&
+        RequireCompleteType(FD->getLocation(), Shape.C,
+                            diag::err_incomplete_type))
+      return true;
+  }
+
+  // A definition as defaulted that appears in a class is the first declaration.
+  if (FD->getLexicalDeclContext()->isRecord() && FD->getPreviousDecl()) {
+    Diag(FD->getLocation(), diag::err_defaulted_postfix_incdec_not_first)
+        << IsDecrement;
+    return true;
+  }
+
+  bool ConstexprSuitable = false;
+  bool IsFirstDeclaration = !FD->getPreviousDecl();
+  if (analyzeDefaultedPostfixIncDec(*this, FD, Kind, Shape,
+                                    &ConstexprSuitable) !=
+      PostfixDeletedReason::None) {
+    // A function explicitly defaulted after its first declaration is
+    // user-provided: it is defined where it is defaulted and the program is
+    // ill-formed if that definition would be deleted.
+    if (!IsFirstDeclaration) {
+      Diag(FD->getLocation(), diag::err_defaulted_postfix_incdec_would_delete)
+          << IsDecrement;
+      ExplainDeletedPostfixIncDec(*this, FD, Kind);
+      return true;
+    }
+    if (!FD->isDeleted())
+      SetDeclDeleted(FD, FD->getLocation());
+    return false;
+  }
+
+  // [dcl.fct.def.default]: a function explicitly defaulted on its first
+  // declaration is implicitly inline, and implicitly constexpr if it is
+  // constexpr-suitable.
+  if (IsFirstDeclaration) {
+    FD->setImplicitlyInline();
+    if (ConstexprSuitable && !FD->isConstexpr())
+      FD->setConstexprKind(ConstexprSpecKind::Constexpr);
+  }
+  return false;
+}
+
+void Sema::DefineDefaultedPostfixIncDec(SourceLocation UseLoc, FunctionDecl *FD,
+                                        DefaultedPostfixKind Kind) {
+  assert(FD->isDefaulted() && !FD->isDeleted() &&
+         !FD->doesThisDeclarationHaveABody());
+  if (FD->willHaveBody() || FD->isInvalidDecl())
+    return;
+
+  DefaultedPostfixShape Shape = getDefaultedPostfixShape(*this, FD);
+  if (!Shape.Valid)
+    return;
+
+  SynthesizedFunctionScope Scope(*this, FD);
+  Scope.addContextNote(UseLoc);
+
+  SourceLocation BodyLoc =
+      FD->getEndLoc().isValid() ? FD->getEndLoc() : FD->getLocation();
+  CompoundScopeRAII CompoundScope(*this);
+
+  // c: an lvalue that denotes *this, or the first parameter.
+  auto BuildOperand = [&]() -> ExprResult {
+    if (auto *MD = dyn_cast<CXXMethodDecl>(FD);
+        MD && MD->isImplicitObjectMemberFunction()) {
+      ExprResult This = ActOnCXXThis(BodyLoc);
+      if (This.isInvalid())
+        return ExprError();
+      return CreateBuiltinUnaryOp(BodyLoc, UO_Deref, This.get());
+    }
+    ParmVarDecl *Param = FD->getParamDecl(0);
+    return BuildDeclRefExpr(Param, Param->getType().getNonReferenceType(),
+                            VK_LValue, BodyLoc);
+  };
+
+  // C tmp(c);
+  ExprResult Source = BuildOperand();
+  if (Source.isInvalid()) {
+    FD->setInvalidDecl();
+    return;
+  }
+  VarDecl *Tmp = VarDecl::Create(
+      Context, FD, BodyLoc, BodyLoc, &Context.Idents.get("__tmp"), Shape.C,
+      Context.getTrivialTypeSourceInfo(Shape.C, BodyLoc), SC_None);
+  Tmp->setImplicit();
+  AddInitializerToDecl(Tmp, Source.get(), /*DirectInit=*/true);
+  if (Tmp->isInvalidDecl()) {
+    FD->setInvalidDecl();
+    return;
+  }
+  StmtResult TmpStmt = ActOnDeclStmt(
+      DeclGroupPtrTy::make(DeclGroupRef(Tmp)), BodyLoc, BodyLoc);
+
+  // ++c; or --c;
+  ExprResult Operand = BuildOperand();
+  if (Operand.isInvalid()) {
+    FD->setInvalidDecl();
+    return;
+  }
+  ExprResult Prefix = BuildUnaryOp(
+      nullptr, BodyLoc,
+      Kind == DefaultedPostfixKind::Increment ? UO_PreInc : UO_PreDec,
+      Operand.get());
+  StmtResult PrefixStmt = Prefix.isInvalid()
+                              ? StmtError()
+                              : ActOnExprStmt(Prefix, /*DiscardedValue=*/true);
+
+  // return tmp;
+  ExprResult TmpRef = BuildDeclRefExpr(Tmp, Shape.C, VK_LValue, BodyLoc);
+  StmtResult ReturnStmt =
+      TmpRef.isInvalid() ? StmtError() : BuildReturnStmt(BodyLoc, TmpRef.get());
+
+  if (TmpStmt.isInvalid() || PrefixStmt.isInvalid() || ReturnStmt.isInvalid()) {
+    FD->setInvalidDecl();
+    return;
+  }
+  Stmt *Statements[] = {TmpStmt.get(), PrefixStmt.get(), ReturnStmt.get()};
+  StmtResult Body = ActOnCompoundStmt(BodyLoc, BodyLoc, Statements,
+                                      /*isStmtExpr=*/false);
+  if (Body.isInvalid()) {
+    FD->setInvalidDecl();
+    return;
+  }
+  FD->setBody(Body.get());
+  FD->markUsed(Context);
+
+  if (FD->isConstexpr() &&
+      !CheckConstexprFunctionDefinition(FD, CheckConstexprKind::Diagnose))
+    FD->setInvalidDecl();
+
+  if (ASTMutationListener *L = getASTMutationListener())
+    L->CompletedImplicitDefinition(FD);
+}
+
 static Sema::ImplicitExceptionSpecification
 ComputeDefaultedComparisonExceptionSpec(Sema &S, SourceLocation Loc,
                                         FunctionDecl *FD,
@@ -9494,6 +9997,21 @@ void Sema::CheckDelayedMemberExceptionSpecs() {
   // special members.
   for (auto &Check : Equivalent)
     CheckEquivalentExceptionSpec(Check.second, Check.first);
+
+  // P3424R2: a deallocation function shall not have a potentially throwing
+  // exception specification.
+  decltype(DelayedDeallocationExceptionSpecChecks) Deallocation;
+  std::swap(Deallocation, DelayedDeallocationExceptionSpecChecks);
+  for (FunctionDecl *FD : Deallocation) {
+    const auto *Proto = FD->getType()->getAs<FunctionProtoType>();
+    if (Proto && !isUnresolvedExceptionSpec(Proto->getExceptionSpecType()) &&
+        Proto->canThrow() == CT_Can) {
+      Diag(FD->getLocation(),
+           diag::err_deallocation_function_potentially_throwing)
+          << FD << FD->getExceptionSpecSourceRange();
+      FD->setInvalidDecl();
+    }
+  }
 }
 
 namespace {
@@ -10196,7 +10714,9 @@ void Sema::DiagnoseDeletedDefaultedFunction(FunctionDecl *FD) {
   assert(DFK && "not a defaultable function");
   assert(FD->isDefaulted() && FD->isDeleted() && "not defaulted and deleted");
 
-  if (DFK.isSpecialMember()) {
+  if (DFK.isPostfixIncDec()) {
+    ExplainDeletedPostfixIncDec(*this, FD, DFK.asPostfixIncDec());
+  } else if (DFK.isSpecialMember()) {
     ShouldDeleteSpecialMember(cast<CXXMethodDecl>(FD), DFK.asSpecialMember(),
                               nullptr, /*Diagnose=*/true);
   } else {
@@ -10906,6 +11426,12 @@ void Sema::ActOnFinishCXXMemberSpecification(
     AL.setInvalid();
     Diag(AL.getLoc(), diag::warn_attribute_after_definition_ignored) << AL;
   }
+
+  if (auto *RD = dyn_cast<CXXRecordDecl>(TagDecl);
+      RD && Context.getCanonicalTagType(RD)
+                .getTypePtr()
+                ->isStdMetaTokenSequenceType())
+    AddTokenSequenceStorage(RD);
 
   ActOnFields(S, RLoc, TagDecl,
               llvm::ArrayRef(
@@ -12062,9 +12588,12 @@ bool Sema::CheckDeductionGuideDeclarator(Declarator &D, QualType &R,
 
       const QualifiedTemplateName *Qualifiers =
           SpecifiedName.getAsQualifiedTemplateName();
-      assert(Qualifiers && "expected QualifiedTemplate");
-      bool SimplyWritten =
-          !Qualifiers->hasTemplateKeyword() && !Qualifiers->getQualifier();
+      // A pack-index-template-name (P3670R4) is not a qualified template name,
+      // and is never simply the name of the guided template.
+      assert((Qualifiers || SpecifiedName.getAsPackIndexingTemplate()) &&
+             "expected QualifiedTemplate");
+      bool SimplyWritten = Qualifiers && !Qualifiers->hasTemplateKeyword() &&
+                           !Qualifiers->getQualifier();
       if (SimplyWritten && TemplateMatches)
         AcceptableReturnType = true;
       else {
@@ -13000,6 +13529,12 @@ Decl *Sema::ActOnUsingDeclaration(Scope *S, AccessSpecifier AS,
   DeclarationNameInfo TargetNameInfo = GetNameFromUnqualifiedId(Name);
   DeclarationName TargetName = TargetNameInfo.getName();
   if (!TargetName)
+    return nullptr;
+
+  // The nested-name-specifier may have been invalidated while the name was
+  // parsed (the component names of a conversion-function-id are looked up in
+  // the class it names, which has to be complete): there is nothing to build.
+  if (SS.isInvalid())
     return nullptr;
 
   // Warn about access declarations.
@@ -17181,6 +17716,24 @@ CheckOperatorDeleteDeclaration(Sema &SemaRef, FunctionDecl *FnDecl) {
   if (CheckOperatorNewDeleteDeclarationScope(SemaRef, FnDecl))
     return true;
 
+  // C++29 [basic.stc.dynamic.deallocation]p1 (P3424R2): a deallocation
+  // function shall not have a potentially throwing exception specification.
+  // (A deallocation function without an exception specification is
+  // implicitly noexcept(true).)
+  if (SemaRef.getLangOpts().CPlusPlus29) {
+    if (const auto *Proto = FnDecl->getType()->getAs<FunctionProtoType>()) {
+      if (Proto->getExceptionSpecType() == EST_Unparsed)
+        SemaRef.DelayedDeallocationExceptionSpecChecks.push_back(FnDecl);
+      else if (!isUnresolvedExceptionSpec(Proto->getExceptionSpecType()) &&
+               Proto->canThrow() == CT_Can) {
+        SemaRef.Diag(FnDecl->getLocation(),
+                     diag::err_deallocation_function_potentially_throwing)
+            << FnDecl << FnDecl->getExceptionSpecSourceRange();
+        return true;
+      }
+    }
+  }
+
   auto *MD = dyn_cast<CXXMethodDecl>(FnDecl);
   auto ConstructDestroyingDeleteAddressType = [&]() {
     assert(MD);
@@ -19087,6 +19640,13 @@ void Sema::SetDeclDeleted(Decl *Dcl, SourceLocation DelLoc,
   if (Fn->hasContracts()) {
     Diag(DelLoc, diag::err_contract_on_deleted_or_defaulted_function) << 0;
     Fn->setInvalidDecl();
+    return;
+  }
+
+  if (IsExpressionMacro(Fn)) {
+    Diag(DelLoc, diag::err_macro_defaulted_deleted) << /*deleted*/ 1;
+    Fn->setInvalidDecl();
+    return;
   }
 
   // Deleted function does not have a body.
@@ -19143,10 +19703,24 @@ void Sema::SetDeclDefaulted(Decl *Dcl, SourceLocation DefaultLoc) {
         Diag(DefaultLoc, diag::err_defaulted_comparison_template);
         return;
       }
+      if (DefaultedFunctionKind PostfixKind =
+              getDefaultedFunctionKind(FTD->getTemplatedDecl());
+          PostfixKind.isPostfixIncDec()) {
+        Diag(DefaultLoc, diag::err_defaulted_postfix_incdec_template)
+            << (PostfixKind.asPostfixIncDec() ==
+                DefaultedPostfixKind::Decrement);
+        return;
+      }
     }
 
     Diag(DefaultLoc, diag::err_default_special_members)
-        << getLangOpts().CPlusPlus20;
+        << (getLangOpts().CPlusPlus29 ? 2 : getLangOpts().CPlusPlus20);
+    return;
+  }
+
+  if (IsExpressionMacro(FD)) {
+    Diag(DefaultLoc, diag::err_macro_defaulted_deleted) << /*defaulted*/ 0;
+    FD->setInvalidDecl();
     return;
   }
 
@@ -19160,7 +19734,7 @@ void Sema::SetDeclDefaulted(Decl *Dcl, SourceLocation DefaultLoc) {
        (!isa<CXXConstructorDecl>(FD) &&
         FD->getDeclName().getCXXOverloadedOperator() != OO_Equal))) {
     Diag(DefaultLoc, diag::err_default_special_members)
-        << getLangOpts().CPlusPlus20;
+        << (getLangOpts().CPlusPlus29 ? 2 : getLangOpts().CPlusPlus20);
     return;
   }
 
@@ -19192,8 +19766,8 @@ void Sema::SetDeclDefaulted(Decl *Dcl, SourceLocation DefaultLoc) {
   // that we've marked it as defaulted.
   FD->setWillHaveBody(false);
 
-  if (DefKind.isComparison()) {
-    // If this comparison's defaulting occurs within the definition of its
+  if (DefKind.isComparison() || DefKind.isPostfixIncDec()) {
+    // If this function's defaulting occurs within the definition of its
     // lexical class context, we have to do the checking when complete.
     if (auto const *RD = dyn_cast<CXXRecordDecl>(FD->getLexicalDeclContext()))
       if (!RD->isCompleteDefinition())
@@ -19218,6 +19792,11 @@ void Sema::SetDeclDefaulted(Decl *Dcl, SourceLocation DefaultLoc) {
       FD->setInvalidDecl();
     else
       DefineDefaultedComparison(DefaultLoc, FD, DefKind.asComparison());
+  } else if (DefKind.isPostfixIncDec()) {
+    if (CheckExplicitlyDefaultedPostfixIncDec(FD, DefKind.asPostfixIncDec()))
+      FD->setInvalidDecl();
+    else if (!FD->isDeleted())
+      DefineDefaultedPostfixIncDec(DefaultLoc, FD, DefKind.asPostfixIncDec());
   } else {
     auto *MD = cast<CXXMethodDecl>(FD);
 
@@ -19540,6 +20119,12 @@ void Sema::ActOnCXXEnterDeclInitializer(Scope *S, Decl *D) {
       Ctx, D, ExpressionEvaluationContextRecord::EK_VariableInit);
   if (Ctx == ExpressionEvaluationContext::ImmediateFunctionContext)
     ExprEvalContexts.back().IsSynthesizedConstexprVarInitContext = true;
+
+  // Propagate the lifetime extending context flag from the parent so that
+  // temporaries created in the initializer of a variable inside a
+  // do-expression init statement can be lifetime extended.
+  currentEvaluationContext().InLifetimeExtendingContext =
+      parentEvaluationContext().InLifetimeExtendingContext;
 }
 
 void Sema::ActOnCXXExitDeclInitializer(Scope *S, Decl *D) {

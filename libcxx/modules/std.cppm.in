@@ -75,6 +75,14 @@ module;
 #include <hive>
 #include <initializer_list>
 #include <inplace_vector>
+#include <io>
+#include <io_bridge>
+#include <io_buffer>
+#include <io_context>
+#include <io_file>
+#include <io_signal>
+#include <io_stream>
+#include <io_timer>
 #include <iomanip>
 #include <ios>
 #include <iosfwd>
@@ -92,6 +100,8 @@ module;
 #include <memory_resource>
 #include <meta>
 #include <mutex>
+#include <net>
+#include <net_tls>
 #include <new>
 #include <numbers>
 #include <numeric>

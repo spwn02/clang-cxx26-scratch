@@ -121,6 +121,9 @@ public:
   VisitSubstNonTypeTemplateParmExpr(SubstNonTypeTemplateParmExpr *PE) {
     return Visit(PE->getReplacement());
   }
+  ComplexPairTy VisitCXXMacroInvocationExpr(CXXMacroInvocationExpr *E) {
+    return Visit(E->getExpansion());
+  }
   ComplexPairTy VisitCoawaitExpr(CoawaitExpr *S) {
     return CGF.EmitCoawaitExpr(*S).getComplexVal();
   }
@@ -194,6 +197,8 @@ public:
   }
   ComplexPairTy VisitCallExpr(const CallExpr *E);
   ComplexPairTy VisitStmtExpr(const StmtExpr *E);
+  ComplexPairTy VisitDoExpr(const DoExpr *E);
+  ComplexPairTy VisitMatchSelectExpr(const MatchSelectExpr *E);
 
   // Operators.
   ComplexPairTy VisitPrePostIncDec(const UnaryOperator *E,
@@ -509,6 +514,25 @@ ComplexPairTy ComplexExprEmitter::VisitStmtExpr(const StmtExpr *E) {
                           E->getExprLoc());
 }
 
+ComplexPairTy ComplexExprEmitter::VisitDoExpr(const DoExpr *E) {
+  CodeGenFunction::StmtExprEvaluation eval(CGF);
+  // A glvalue do-expression yields a reference: EmitDoExpr returns a slot
+  // holding a `T*`, so go through the lvalue path to load the referent.
+  if (E->isGLValue())
+    return EmitLoadOfLValue(CGF.EmitDoExprLValue(E), E->getExprLoc());
+  Address Slot = CGF.EmitDoExpr(*E, AggValueSlot::ignored());
+  assert(Slot.isValid() && "Expected complex result");
+  return EmitLoadOfLValue(CGF.MakeAddrLValue(Slot, E->getType()),
+                          E->getExprLoc());
+}
+
+ComplexPairTy ComplexExprEmitter::VisitMatchSelectExpr(
+    const MatchSelectExpr *E) {
+  if (E->isGLValue())
+    return EmitLoadOfLValue(CGF.EmitMatchSelectExprLValue(E), E->getExprLoc());
+  return CGF.EmitMatchSelectExpr(*E).getComplexVal();
+}
+
 /// Emit a cast from complex value Val to DestType.
 ComplexPairTy ComplexExprEmitter::EmitComplexToComplexCast(ComplexPairTy Val,
                                                            QualType SrcType,
@@ -569,6 +593,14 @@ ComplexPairTy ComplexExprEmitter::EmitCast(CastKind CK, Expr *Op,
     return EmitLoadOfLValue(DestLV, Op->getExprLoc());
   }
 
+  case CK_NoReturnToAny: {
+    CGF.EmitDivergingExpr(Op);
+    llvm::Type *EltTy =
+        CGF.ConvertType(DestTy->castAs<ComplexType>()->getElementType());
+    return ComplexPairTy(llvm::PoisonValue::get(EltTy),
+                         llvm::PoisonValue::get(EltTy));
+  }
+
   case CK_BitCast:
   case CK_BaseToDerived:
   case CK_DerivedToBase:
@@ -625,6 +657,8 @@ ComplexPairTy ComplexExprEmitter::EmitCast(CastKind CK, Expr *Op,
   case CK_HLSLArrayRValue:
   case CK_HLSLElementwiseCast:
   case CK_HLSLAggregateSplatCast:
+  case CK_TokenArrayToSequence:
+  case CK_SequenceToTokenArray:
     llvm_unreachable("invalid cast kind for complex value");
 
   case CK_FloatingRealToComplex:

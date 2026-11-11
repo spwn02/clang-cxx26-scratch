@@ -43,6 +43,7 @@
 #include "clang/AST/NestedNameSpecifier.h"
 #include "clang/AST/ParentMapContext.h"
 #include "clang/AST/RawCommentList.h"
+#include "clang/AST/Reflection.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/TemplateBase.h"
@@ -862,7 +863,8 @@ ASTContext::ASTContext(LangOptions &LOpts, SourceManager &SM,
       DependentTypeOfExprTypes(this_()), DependentDecltypeTypes(this_()),
       DependentPackIndexingTypes(this_()), TemplateSpecializationTypes(this_()),
       DependentBitIntTypes(this_()), SubstTemplateTemplateParmPacks(this_()),
-      DeducedTemplates(this_()), ArrayParameterTypes(this_()),
+      DeducedTemplates(this_()), PackIndexingTemplates(this_()),
+      ArrayParameterTypes(this_()),
       CanonTemplateTemplateParms(this_()), SourceMgr(SM), LangOpts(LOpts),
       NoSanitizeL(new NoSanitizeList(LangOpts.NoSanitizeFiles, SM)),
       XRayFilter(new XRayFunctionFilter(LangOpts.XRayAlwaysInstrumentFiles,
@@ -921,6 +923,17 @@ void ASTContext::cleanup() {
 }
 
 ASTContext::~ASTContext() { cleanup(); }
+
+void ASTContext::TokenSequenceStorageDeleter::operator()(
+    TokenSequenceStorageState *P) const {
+  delete P;
+}
+
+TokenSequenceStorageState &ASTContext::getTokenSequenceStorage() {
+  if (!TokenSequenceStorage)
+    TokenSequenceStorage.reset(new TokenSequenceStorageState);
+  return *TokenSequenceStorage;
+}
 
 void ASTContext::setTraversalScope(const std::vector<Decl *> &TopLevelDecls) {
   TraversalScope = TopLevelDecls;
@@ -1432,6 +1445,13 @@ void ASTContext::InitBuiltinTypes(const TargetInfo &Target,
 
   // meta::info type (C++2c CXX26)
   InitBuiltinType(MetaInfoTy, BuiltinType::MetaInfo);
+
+  // meta::token_sequence type (C++2c token sequences)
+  InitBuiltinType(TokenSequenceTy, BuiltinType::TokenSequence);
+  InitBuiltinType(MetaTokenTy, BuiltinType::MetaToken);
+
+  // std::noreturn_t (P3549)
+  InitBuiltinType(NoReturnTy, BuiltinType::NoReturn);
 
   // half type (OpenCL 6.1.1.1) / ARM NEON __fp16
   InitBuiltinType(HalfTy, BuiltinType::Half);
@@ -2269,8 +2289,16 @@ TypeInfo ASTContext::getTypeInfoImpl(const Type *T) const {
       Align = Target->getPointerAlign(LangAS::Default);
       break;
     case BuiltinType::MetaInfo:
+    case BuiltinType::TokenSequence:
+    case BuiltinType::MetaToken:
       Width = Target->getMetaInfoWidth();
       Align = Target->getMetaInfoAlign();
+      break;
+    case BuiltinType::NoReturn:
+      // An object type with no values; it occupies one byte, like an empty
+      // class.
+      Width = Target->getCharWidth();
+      Align = Target->getCharAlign();
       break;
     case BuiltinType::ObjCId:
     case BuiltinType::ObjCClass:
@@ -3460,6 +3488,18 @@ static void encodeTypeForFunctionPointerAuth(const ASTContext &Ctx,
 
     case BuiltinType::MetaInfo:
       OS << "m";
+      return;
+
+    case BuiltinType::TokenSequence:
+      OS << "t";
+      return;
+
+    case BuiltinType::MetaToken:
+      OS << "k";
+      return;
+
+    case BuiltinType::NoReturn:
+      OS << "Dz";
       return;
 
     case BuiltinType::ObjCId:
@@ -6778,16 +6818,20 @@ ASTContext::getUnaryTransformType(QualType BaseType, QualType UnderlyingType,
 
 QualType ASTContext::getAutoTypeInternal(
     QualType DeducedType, AutoTypeKeyword Keyword, bool IsDependent,
-    bool IsPack, TemplateDecl *TypeConstraintConcept,
+    bool IsPack, TemplateName TypeConstraintConcept,
     ArrayRef<TemplateArgument> TypeConstraintArgs, bool IsCanon) const {
   if (DeducedType.isNull() && Keyword == AutoTypeKeyword::Auto &&
-      !TypeConstraintConcept && !IsDependent)
+      TypeConstraintConcept.isNull() && !IsDependent)
     return getAutoDeductType();
 
   // Look in the folding set for an existing type.
   llvm::FoldingSetNodeID ID;
   bool IsDeducedDependent =
-      isa_and_nonnull<TemplateTemplateParmDecl>(TypeConstraintConcept) ||
+      (!TypeConstraintConcept.isNull() &&
+       ((TypeConstraintConcept.getAsPackIndexingTemplate() &&
+         TypeConstraintConcept.isInstantiationDependent()) ||
+        isa_and_nonnull<TemplateTemplateParmDecl>(
+            TypeConstraintConcept.getAsTemplateDecl()))) ||
       (!DeducedType.isNull() && DeducedType->isDependentType());
   AutoType::Profile(ID, *this, DeducedType, Keyword,
                     IsDependent || IsDeducedDependent, TypeConstraintConcept,
@@ -6799,10 +6843,10 @@ QualType ASTContext::getAutoTypeInternal(
   if (!IsCanon) {
     if (!DeducedType.isNull()) {
       Canon = DeducedType.getCanonicalType();
-    } else if (TypeConstraintConcept) {
+    } else if (!TypeConstraintConcept.isNull()) {
       bool AnyNonCanonArgs = false;
-      auto *CanonicalConcept =
-          cast<TemplateDecl>(TypeConstraintConcept->getCanonicalDecl());
+      TemplateName CanonicalConcept =
+          getCanonicalTemplateName(TypeConstraintConcept);
       auto CanonicalConceptArgs = ::getCanonicalTemplateArguments(
           *this, TypeConstraintArgs, AnyNonCanonArgs);
       if (CanonicalConcept != TypeConstraintConcept || AnyNonCanonArgs) {
@@ -6838,7 +6882,7 @@ QualType ASTContext::getAutoTypeInternal(
 QualType
 ASTContext::getAutoType(QualType DeducedType, AutoTypeKeyword Keyword,
                         bool IsDependent, bool IsPack,
-                        TemplateDecl *TypeConstraintConcept,
+                        TemplateName TypeConstraintConcept,
                         ArrayRef<TemplateArgument> TypeConstraintArgs) const {
   assert((!IsPack || IsDependent) && "only use IsPack for a dependent pack");
   assert((!IsDependent || DeducedType.isNull()) &&
@@ -6948,7 +6992,7 @@ QualType ASTContext::getAutoDeductType() const {
     AutoDeductTy = QualType(new (*this, alignof(AutoType))
                                 AutoType(QualType(), AutoTypeKeyword::Auto,
                                          TypeDependence::None, QualType(),
-                                         /*concept*/ nullptr, /*args*/ {}),
+                                         /*concept*/ TemplateName(), /*args*/ {}),
                             0);
   return AutoDeductTy;
 }
@@ -7294,6 +7338,10 @@ ASTContext::getNameForTemplate(TemplateName Name,
     DeducedTemplateStorage *DTS = Name.getAsDeducedTemplateName();
     return getNameForTemplate(DTS->getUnderlying(), NameLoc);
   }
+  case TemplateName::PackIndexingTemplate: {
+    PackIndexingTemplateStorage *PI = Name.getAsPackIndexingTemplate();
+    return getNameForTemplate(PI->getPattern(), NameLoc);
+  }
   }
 
   llvm_unreachable("bad template name kind!");
@@ -7360,6 +7408,22 @@ TemplateName ASTContext::getCanonicalTemplateName(TemplateName Name,
     return getSubstTemplateTemplateParmPack(
         canonArgPack, subst->getAssociatedDecl()->getCanonicalDecl(),
         subst->getIndex(), subst->getFinal());
+  }
+
+  case TemplateName::PackIndexingTemplate: {
+    PackIndexingTemplateStorage *PI = Name.getAsPackIndexingTemplate();
+    // Once the element is selected the name is that element (as for a
+    // PackIndexingType), whatever the pattern was substituted with.
+    if (UnsignedOrNone Selected = PI->getSelectedIndex();
+        Selected && *Selected < PI->getExpansions().size())
+      return getCanonicalTemplateName(PI->getExpansions()[*Selected],
+                                      IgnoreDeduced);
+    SmallVector<TemplateName, 4> CanonExpansions;
+    for (TemplateName T : PI->getExpansions())
+      CanonExpansions.push_back(getCanonicalTemplateName(T, IgnoreDeduced));
+    return getPackIndexingTemplateName(
+        getCanonicalTemplateName(PI->getPattern(), IgnoreDeduced),
+        PI->getIndexExpr(), PI->isFullySubstituted(), CanonExpansions);
   }
   case TemplateName::DeducedTemplate: {
     assert(IgnoreDeduced == false);
@@ -7445,9 +7509,13 @@ bool ASTContext::isSameTypeConstraint(const TypeConstraint *XTC,
   if (!XTC)
     return true;
 
-  auto *NCX = XTC->getNamedConcept();
-  auto *NCY = YTC->getNamedConcept();
-  if (!NCX || !NCY || !isSameEntity(NCX, NCY))
+  TemplateDecl *NCX = XTC->getNamedConcept().getAsTemplateDecl();
+  TemplateDecl *NCY = YTC->getNamedConcept().getAsTemplateDecl();
+  if (!NCX && !NCY) {
+    // Pack-index-template-names (P3670R4): same pack and equivalent index.
+    if (!hasSameTemplateName(XTC->getNamedConcept(), YTC->getNamedConcept()))
+      return false;
+  } else if (!NCX || !NCY || !isSameEntity(NCX, NCY))
     return false;
   if (XTC->getConceptReference()->hasExplicitTemplateArgs() !=
       YTC->getConceptReference()->hasExplicitTemplateArgs())
@@ -9395,6 +9463,9 @@ static char getObjCEncodingForPrimitiveType(const ASTContext *C,
     case BuiltinType::SatUFract:
     case BuiltinType::SatULongFract:
     case BuiltinType::MetaInfo:
+    case BuiltinType::TokenSequence:
+    case BuiltinType::MetaToken:
+    case BuiltinType::NoReturn:
       // FIXME: potentially need @encodes for these!
       return ' ';
 
@@ -10972,6 +11043,29 @@ ASTContext::getDeducedTemplateName(TemplateName Underlying,
     DeducedTemplates.InsertNode(DTS, InsertPos);
   }
   return TemplateName(DTS);
+}
+
+TemplateName ASTContext::getPackIndexingTemplateName(
+    TemplateName Pattern, Expr *IndexExpr, bool FullySubstituted,
+    ArrayRef<TemplateName> Expansions) const {
+  auto &Self = const_cast<ASTContext &>(*this);
+  llvm::FoldingSetNodeID ID;
+  PackIndexingTemplateStorage::Profile(ID, Self, Pattern, IndexExpr,
+                                       FullySubstituted, Expansions);
+
+  void *InsertPos = nullptr;
+  PackIndexingTemplateStorage *PI =
+      PackIndexingTemplates.FindNodeOrInsertPos(ID, InsertPos);
+  if (!PI) {
+    void *Mem =
+        Allocate(PackIndexingTemplateStorage::totalSizeToAlloc<TemplateName>(
+                     Expansions.size()),
+                 alignof(PackIndexingTemplateStorage));
+    PI = new (Mem) PackIndexingTemplateStorage(Pattern, IndexExpr,
+                                               FullySubstituted, Expansions);
+    PackIndexingTemplates.InsertNode(PI, InsertPos);
+  }
+  return TemplateName(PI);
 }
 
 /// getFromTargetType - Given one of the integer types provided by
@@ -13549,6 +13643,12 @@ bool ASTContext::DeclMustBeEmitted(const Decl *D) {
     if (VD->getDescribedVarTemplate() ||
         isa<VarTemplatePartialSpecializationDecl>(VD))
       return false;
+    // A nested structured binding is an implicit declaration that is part of
+    // the declaration of the binding that introduces it; it is emitted with
+    // that declaration, never by itself (it is not a declaration of the
+    // translation unit, but a reader that loads it must not make it one).
+    if (isa<DecompositionDecl>(VD) && VD->isImplicit())
+      return false;
   } else if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
     // We never need to emit an uninstantiated function template.
     if (FD->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate)
@@ -13656,7 +13756,7 @@ bool ASTContext::DeclMustBeEmitted(const Decl *D) {
   // Likewise, variables with tuple-like bindings are required if their
   // bindings have side-effects.
   if (const auto *DD = dyn_cast<DecompositionDecl>(VD)) {
-    for (const auto *BD : DD->flat_bindings())
+    for (const auto *BD : DD->all_bindings())
       if (const auto *BindingVD = BD->getHoldingVar())
         if (DeclMustBeEmitted(BindingVD))
           return true;
@@ -14173,6 +14273,12 @@ ASTContext::getUnnamedGlobalConstantDecl(QualType Ty,
       UnnamedGlobalConstantDecl::Create(*this, Ty, APVal);
   UnnamedGlobalConstantDecls.InsertNode(New, InsertPos);
   return New;
+}
+
+UnnamedGlobalConstantDecl *
+ASTContext::createUniqueUnnamedGlobalConstantDecl(QualType Ty,
+                                                  const APValue &Value) const {
+  return UnnamedGlobalConstantDecl::Create(*this, Ty, Value);
 }
 
 TemplateParamObjectDecl *
@@ -14694,8 +14800,9 @@ static QualType getCommonNonSugarTypeNode(const ASTContext &Ctx, const Type *X,
     return Ctx.getAutoType(QualType(), AX->getKeyword(),
                            AX->isInstantiationDependentType(),
                            AX->containsUnexpandedParameterPack(),
-                           getCommonDeclChecked(AX->getTypeConstraintConcept(),
-                                                AY->getTypeConstraintConcept()),
+                           TemplateName(getCommonDeclChecked(
+                               AX->getTypeConstraintConcept().getAsTemplateDecl(),
+                               AY->getTypeConstraintConcept().getAsTemplateDecl())),
                            As);
   }
   case Type::IncompleteArray: {
@@ -15065,8 +15172,9 @@ static QualType getCommonSugarTypeNode(const ASTContext &Ctx, const Type *X,
     if (KW != AY->getKeyword())
       return QualType();
 
-    TemplateDecl *CD = ::getCommonDecl(AX->getTypeConstraintConcept(),
-                                       AY->getTypeConstraintConcept());
+    TemplateDecl *CD =
+        ::getCommonDecl(AX->getTypeConstraintConcept().getAsTemplateDecl(),
+                        AY->getTypeConstraintConcept().getAsTemplateDecl());
     SmallVector<TemplateArgument, 8> As;
     if (CD &&
         getCommonTemplateArguments(Ctx, As, AX->getTypeConstraintArguments(),
@@ -15078,7 +15186,7 @@ static QualType getCommonSugarTypeNode(const ASTContext &Ctx, const Type *X,
     // Both auto types can't be dependent, otherwise they wouldn't have been
     // sugar. This implies they can't contain unexpanded packs either.
     return Ctx.getAutoType(Ctx.getQualifiedType(Underlying), AX->getKeyword(),
-                           /*IsDependent=*/false, /*IsPack=*/false, CD, As);
+                           /*IsDependent=*/false, /*IsPack=*/false, TemplateName(CD), As);
   }
   case Type::PackIndexing:
   case Type::Decltype:

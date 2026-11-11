@@ -99,6 +99,58 @@ TEST(StdlibTest, Experimental) {
             "std::experimental::filesystem::system_complete");
 }
 
+// Names newer than the cppreference book of StdSymbolMap.inc come from
+// StdCxx26SymbolMap.inc (generated from libc++'s module interface files).
+TEST(StdlibTest, Cxx26Facilities) {
+  struct {
+    const char *Scope, *Name, *Header;
+  } Cases[] = {
+      {"std::meta::", "info", "<meta>"},
+      {"std::meta::", "members_of", "<meta>"},
+      {"std::execution::", "sender", "<execution>"},
+      {"std::execution::", "task", "<execution>"},
+      {"std::simd::", "vec", "<simd>"},
+      {"std::linalg::", "matrix_product", "<linalg>"},
+      {"std::", "hazard_pointer", "<hazard_pointer>"},
+      {"std::", "bit_reverse", "<bit>"},
+      {"std::simd::", "iota", "<simd>"},
+      {"std::io::", "task", "<io>"},
+      {"std::io::", "const_buffer", "<io_buffer>"},
+      {"std::io::", "any_stream", "<io_stream>"},
+      {"std::io::", "await_sender", "<io_bridge>"},
+      {"std::io::", "io_context", "<io_context>"},
+      {"std::io::", "timer", "<io_timer>"},
+      {"std::io::", "signal_set", "<io_signal>"},
+      {"std::io::", "random_access_file", "<io_file>"},
+      {"std::io::", "tcp_socket", "<net>"},
+      {"std::io::", "tls_stream", "<net_tls>"},
+      {"std::", "noreturn_t", "<cstddef>"},
+      {"std::", "is_noreturn", "<type_traits>"},
+      {"std::", "alternative_traits", "<type_traits>"},
+      {"std::", "constant_wrapper", "<utility>"},
+      {"std::", "shl", "<bit>"},
+      {"std::", "apply_result", "<type_traits>"},
+      {"std::", "make_hazard_pointer_batch", "<hazard_pointer>"},
+      {"std::simd::", "bit_reverse", "<simd>"},
+      {"std::", "pointer_tag_pair", "<memory>"},
+      {"std::", "pointer_bits_available", "<memory>"},
+      {"std::meta::", "token_sequence", "<meta>"},
+      {"std::meta::", "token", "<meta>"},
+      {"std::meta::", "queue_injection", "<meta>"},
+      {"std::meta::", "list_builder", "<meta>"},
+      {"std::", "constexpr_print_str", "<debugging>"},
+  };
+  for (const auto &C : Cases) {
+    auto Symbol = stdlib::Symbol::named(C.Scope, C.Name);
+    ASSERT_TRUE(Symbol) << C.Scope << C.Name;
+    EXPECT_EQ(Symbol->header(), stdlib::Header::named(C.Header))
+        << C.Scope << C.Name;
+  }
+  // A name the cppreference map already has keeps its entries.
+  EXPECT_EQ(stdlib::Symbol::named("std::", "vector")->header(),
+            stdlib::Header::named("<vector>"));
+}
+
 TEST(StdlibTest, CCompat) {
   EXPECT_THAT(
       stdlib::Symbol::named("", "int16_t", stdlib::Lang::CXX)->headers(),

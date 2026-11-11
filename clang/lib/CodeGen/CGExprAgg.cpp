@@ -132,6 +132,9 @@ public:
   void VisitSubstNonTypeTemplateParmExpr(SubstNonTypeTemplateParmExpr *E) {
     return Visit(E->getReplacement());
   }
+  void VisitCXXMacroInvocationExpr(CXXMacroInvocationExpr *E) {
+    Visit(E->getExpansion());
+  }
 
   void VisitConstantExpr(ConstantExpr *E) {
     EnsureDest(E->getType());
@@ -165,6 +168,7 @@ public:
   void VisitCastExpr(CastExpr *E);
   void VisitCallExpr(const CallExpr *E);
   void VisitStmtExpr(const StmtExpr *E);
+  void VisitDoExpr(const DoExpr *E);
   void VisitBinaryOperator(const BinaryOperator *BO);
   void VisitPointerToDataMemberBinaryOperator(const BinaryOperator *BO);
   void VisitBinAssign(const BinaryOperator *E);
@@ -200,6 +204,11 @@ public:
   }
   void VisitCXXBindTemporaryExpr(CXXBindTemporaryExpr *E);
   void VisitCXXConstructExpr(const CXXConstructExpr *E);
+  // A token literal (P4380): token sequences carry no state at runtime.
+  void VisitCXXTokenSequenceExpr(CXXTokenSequenceExpr *E) {
+    if (!Dest.isIgnored())
+      CGF.EmitNullInitialization(Dest.getAddress(), E->getType());
+  }
   void VisitCXXInheritedCtorInitExpr(const CXXInheritedCtorInitExpr *E);
   void VisitLambdaExpr(LambdaExpr *E);
   void VisitCXXStdInitializerListExpr(CXXStdInitializerListExpr *E);
@@ -243,9 +252,17 @@ public:
   void VisitPackIndexingExpr(PackIndexingExpr *E) {
     Visit(E->getSelectedExpr());
   }
-
   void VisitCXXSpliceExpr(CXXSpliceExpr *E) {
     Visit(E->getModel());
+  }
+
+  void VisitMatchSelectExpr(MatchSelectExpr *IE) {
+    if (IE->isGLValue()) {
+      LValue LV = CGF.EmitMatchSelectExprLValue(IE);
+      EmitFinalDestCopy(IE->getType(), LV);
+      return;
+    }
+    CGF.EmitMatchSelectExpr(*IE, Dest);
   }
 };
 }  // end anonymous namespace.
@@ -992,6 +1009,18 @@ void AggExprEmitter::VisitCastExpr(CastExpr *E) {
     Visit(E->getSubExpr());
     break;
 
+  case CK_TokenArrayToSequence:
+    // Token sequences carry no state at runtime (P4380): the empty value.
+    CGF.EmitIgnoredExpr(E->getSubExpr());
+    if (!Dest.isIgnored())
+      CGF.EmitNullInitialization(Dest.getAddress(), E->getType());
+    break;
+
+  case CK_NoReturnToAny:
+    // The operand diverges; there is never a value to put in the slot.
+    CGF.EmitDivergingExpr(E->getSubExpr());
+    break;
+
   case CK_LValueBitCast:
     llvm_unreachable("should not be emitting lvalue bitcast as rvalue");
 
@@ -1048,6 +1077,7 @@ void AggExprEmitter::VisitCastExpr(CastExpr *E) {
   case CK_FixedPointToBoolean:
   case CK_FixedPointToIntegral:
   case CK_IntegralToFixedPoint:
+  case CK_SequenceToTokenArray:
     llvm_unreachable("cast kind invalid for aggregate types");
   }
 }
@@ -1077,6 +1107,19 @@ void AggExprEmitter::VisitBinComma(const BinaryOperator *E) {
 void AggExprEmitter::VisitStmtExpr(const StmtExpr *E) {
   CodeGenFunction::StmtExprEvaluation eval(CGF);
   CGF.EmitCompoundStmt(*E->getSubStmt(), true, Dest);
+}
+
+void AggExprEmitter::VisitDoExpr(const DoExpr *E) {
+  CodeGenFunction::StmtExprEvaluation eval(CGF);
+  // A glvalue do-expression yields a reference: EmitDoExpr returns a slot
+  // holding a `T*`, so go through the lvalue path and copy the referent into
+  // the destination slot.
+  if (E->isGLValue()) {
+    LValue LV = CGF.EmitDoExprLValue(E);
+    EmitFinalDestCopy(E->getType(), LV);
+    return;
+  }
+  CGF.EmitDoExpr(*E, Dest);
 }
 
 enum CompareKind {
@@ -1574,6 +1617,12 @@ static bool castPreservesZero(const CastExpr *CE) {
   case CK_IntToOCLSampler:
   case CK_ZeroToOCLOpaqueType:
     // FIXME: Check these.
+    return false;
+
+  case CK_TokenArrayToSequence:
+  case CK_SequenceToTokenArray:
+  case CK_NoReturnToAny:
+    // There is no value at all.
     return false;
 
   case CK_FixedPointCast:

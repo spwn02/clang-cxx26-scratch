@@ -185,6 +185,7 @@ class DumpVisitor : public RecursiveASTVisitor<DumpVisitor> {
       TEMPLATE_KIND(SubstTemplateTemplateParmPack);
       TEMPLATE_KIND(UsingTemplate);
       TEMPLATE_KIND(DeducedTemplate);
+      TEMPLATE_KIND(PackIndexingTemplate);
 #undef TEMPLATE_KIND
     }
     llvm_unreachable("Unhandled NameKind enum");
@@ -303,7 +304,14 @@ class DumpVisitor : public RecursiveASTVisitor<DumpVisitor> {
     return CBS.isVirtual() ? "virtual" : "";
   }
   std::string getDetail(const ConceptReference *CR) {
-    return CR->getNamedConcept()->getNameAsString();
+    TemplateName Concept = CR->getNamedConcept();
+    if (Concept.getAsPackIndexingTemplate()) { // P3670R4: 'CC...[N]'
+      std::string Spelling;
+      llvm::raw_string_ostream OS(Spelling);
+      Concept.print(OS, PrintingPolicy(LangOptions()));
+      return Spelling;
+    }
+    return getWrittenConceptDecl(Concept)->getNameAsString();
   }
 
   /// Arcana is produced by TextNodeDumper, for the types it supports.
@@ -346,9 +354,11 @@ public:
       Base::TraverseTypeLoc(TL, TraverseQualifier);
     });
   }
-  bool TraverseTemplateName(const TemplateName &TN) {
-    return traverseNode("template name", TN,
-                        [&] { Base::TraverseTemplateName(TN); });
+  bool TraverseTemplateName(const TemplateName &TN,
+                            bool TraverseQualifier = true) {
+    return traverseNode("template name", TN, [&] {
+      Base::TraverseTemplateName(TN, TraverseQualifier);
+    });
   }
   bool TraverseTemplateArgumentLoc(const TemplateArgumentLoc &TAL) {
     return traverseNode("template argument", TAL,

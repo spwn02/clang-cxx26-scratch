@@ -902,6 +902,13 @@ ExprResult Sema::BuildCXXThrow(SourceLocation OpLoc, Expr *Ex,
     Diag(OpLoc, diag::err_acc_branch_in_out_compute_construct)
         << /*throw*/ 2 << /*out of*/ 0;
 
+  // P3549: the operand of 'throw (std::terminate(), 0)' diverges before any
+  // exception object could be created. The whole expression is just the
+  // operand (which already has type std::noreturn_t).
+  if (getLangOpts().DivergingExpressions && Ex && !Ex->isTypeDependent() &&
+      Ex->getType()->isNoReturnType())
+    return Ex;
+
   if (Ex && !Ex->isTypeDependent()) {
     // Initialize the exception result.  This implicitly weeds out
     // abstract types or types with inaccessible copy constructors.
@@ -956,8 +963,10 @@ ExprResult Sema::BuildCXXThrow(SourceLocation OpLoc, Expr *Ex,
   if (Ex && Context.getTargetInfo().getTriple().isPPC64())
     PPC().CheckPPCMMAType(Ex->getType(), Ex->getBeginLoc());
 
-  return new (Context)
-      CXXThrowExpr(Ex, Context.VoidTy, OpLoc, IsThrownVarInScope);
+  // P3549: a throw-expression has type std::noreturn_t.
+  QualType ThrowTy =
+      getLangOpts().DivergingExpressions ? Context.NoReturnTy : Context.VoidTy;
+  return new (Context) CXXThrowExpr(Ex, ThrowTy, OpLoc, IsThrownVarInScope);
 }
 
 static void
@@ -4529,6 +4538,24 @@ void Sema::CheckVirtualDtorCall(CXXDestructorDecl *dtor, SourceLocation Loc,
   }
 }
 
+static ExprResult buildConditionVariableExpr(Sema &S, VarDecl *ConditionVar) {
+  if (ConditionVar->isInvalidDecl())
+    return ExprError();
+
+  QualType T = ConditionVar->getType();
+  if (T->isFunctionType())
+    return ExprError(S.Diag(ConditionVar->getLocation(),
+                            diag::err_invalid_use_of_function_type)
+                     << ConditionVar->getSourceRange());
+  if (T->isArrayType())
+    return ExprError(
+        S.Diag(ConditionVar->getLocation(), diag::err_invalid_use_of_array_type)
+        << ConditionVar->getSourceRange());
+
+  return S.BuildDeclRefExpr(ConditionVar, T.getNonReferenceType(), VK_LValue,
+                            ConditionVar->getLocation());
+}
+
 Sema::ConditionResult Sema::ActOnConditionVariable(Decl *ConditionVar,
                                                    SourceLocation StmtLoc,
                                                    ConditionKind CK) {
@@ -4544,25 +4571,9 @@ Sema::ConditionResult Sema::ActOnConditionVariable(Decl *ConditionVar,
 ExprResult Sema::CheckConditionVariable(VarDecl *ConditionVar,
                                         SourceLocation StmtLoc,
                                         ConditionKind CK) {
-  if (ConditionVar->isInvalidDecl())
+  ExprResult Condition = buildConditionVariableExpr(*this, ConditionVar);
+  if (Condition.isInvalid())
     return ExprError();
-
-  QualType T = ConditionVar->getType();
-
-  // C++ [stmt.select]p2:
-  //   The declarator shall not specify a function or an array.
-  if (T->isFunctionType())
-    return ExprError(Diag(ConditionVar->getLocation(),
-                          diag::err_invalid_use_of_function_type)
-                       << ConditionVar->getSourceRange());
-  else if (T->isArrayType())
-    return ExprError(Diag(ConditionVar->getLocation(),
-                          diag::err_invalid_use_of_array_type)
-                     << ConditionVar->getSourceRange());
-
-  ExprResult Condition = BuildDeclRefExpr(
-      ConditionVar, ConditionVar->getType().getNonReferenceType(), VK_LValue,
-      ConditionVar->getLocation());
 
   switch (CK) {
   case ConditionKind::Boolean:
@@ -4842,6 +4853,14 @@ Sema::PerformImplicitConversion(Expr *From, QualType ToType,
   // information that is computed when we try the implicit conversion initially,
   // so that we don't need to recompute anything here.
   QualType FromType = From->getType();
+
+  // P3549: the operand diverges, so there is nothing to convert.
+  if (SCS.Second == ICK_NoReturn_Conversion) {
+    if (ToType->isVoidType())
+      return ImpCastExprToType(From, ToType, CK_ToVoid);
+    return ImpCastExprToType(From, ToType.getNonReferenceType(),
+                             CK_NoReturnToAny);
+  }
 
   if (SCS.CopyConstructor) {
     // FIXME: When can ToType be a reference type?
@@ -5400,6 +5419,7 @@ Sema::PerformImplicitConversion(Expr *From, QualType ToType,
   case ICK_HLSL_Matrix_Truncation:
   case ICK_HLSL_Vector_Splat:
   case ICK_HLSL_Matrix_Splat:
+  case ICK_NoReturn_Conversion:
     llvm_unreachable("Improper second standard conversion");
   }
 
@@ -6074,6 +6094,45 @@ QualType Sema::CXXCheckConditionalOperands(ExprResult &Cond, ExprResult &LHS,
   // Either of the arguments dependent?
   if (LHS.get()->isTypeDependent() || RHS.get()->isTypeDependent())
     return Context.DependentTy;
+
+  // P3549: if either the second or the third operand diverges (it has type
+  // std::noreturn_t, like a throw-expression, or calls a [[noreturn]]
+  // function), the result is the other operand, with its type, value category
+  // and bit-field-ness; if both do, the result is a prvalue of type
+  // std::noreturn_t. The diverging operand is converted to match, which never
+  // produces a value.
+  if (getLangOpts().DivergingExpressions && !IsVectorConditional) {
+    bool LDiverges = LHS.get()->isDiverging();
+    bool RDiverges = RHS.get()->isDiverging();
+    auto ConvertDiverging = [&](ExprResult &Op, QualType T, ExprValueKind K) {
+      if (Context.hasSameType(Op.get()->getType(), T) &&
+          Op.get()->getValueKind() == K)
+        return;
+      Op = T->isVoidType() ? ImpCastExprToType(Op.get(), T, CK_ToVoid).get()
+                           : BuildNoReturnConversion(Op.get(), T, K);
+    };
+    if (LDiverges && RDiverges) {
+      // Before P3549 this was void when both operands were (a throw-expression
+      // or a [[noreturn]] call with type void).
+      auto WasVoid = [](Expr *E) {
+        return E->getType()->isVoidType() ||
+               isa<CXXThrowExpr>(E->IgnoreParenImpCasts());
+      };
+      if (WasVoid(LHS.get()) && WasVoid(RHS.get()))
+        Diag(QuestionLoc, diag::warn_diverging_compat_conditional);
+      ConvertDiverging(LHS, Context.NoReturnTy, VK_PRValue);
+      ConvertDiverging(RHS, Context.NoReturnTy, VK_PRValue);
+      return Context.NoReturnTy;
+    }
+    if (LDiverges || RDiverges) {
+      ExprResult &Diverging = LDiverges ? LHS : RHS;
+      Expr *Other = LDiverges ? RHS.get() : LHS.get();
+      VK = Other->getValueKind();
+      OK = Other->getObjectKind();
+      ConvertDiverging(Diverging, Other->getType(), VK);
+      return Other->getType();
+    }
+  }
 
   // C++11 [expr.cond]p2
   //   If either the second or the third operand has type (cv) void, ...
@@ -7268,8 +7327,9 @@ canRecoverDotPseudoDestructorCallsOnPointerObjects(Sema &SemaRef,
   }
 
   // Otherwise, check if it's a type for which it's valid to use a pseudo-dtor.
+  // std::noreturn_t (P3549) is a trivially destructible object type.
   return DestructedType->isDependentType() || DestructedType->isScalarType() ||
-         DestructedType->isVectorType();
+         DestructedType->isVectorType() || DestructedType->isNoReturnType();
 }
 
 ExprResult Sema::BuildPseudoDestructorExpr(Expr *Base,
@@ -7287,7 +7347,8 @@ ExprResult Sema::BuildPseudoDestructorExpr(Expr *Base,
     return ExprError();
 
   if (!ObjectType->isDependentType() && !ObjectType->isScalarType() &&
-      !ObjectType->isVectorType() && !ObjectType->isMatrixType()) {
+      !ObjectType->isVectorType() && !ObjectType->isMatrixType() &&
+      !ObjectType->isNoReturnType()) {
     if (getLangOpts().MSVCCompat && ObjectType->isVoidType())
       Diag(OpLoc, diag::ext_pseudo_dtor_on_void) << Base->getSourceRange();
     else {
@@ -8087,6 +8148,7 @@ IfExistsResult Sema::CheckMicrosoftIfExistsSymbol(Scope *S,
 concepts::Requirement *Sema::ActOnSimpleRequirement(Expr *E) {
   return BuildExprRequirement(E, /*IsSimple=*/true,
                               /*NoexceptLoc=*/SourceLocation(),
+                              /*NoexceptCond=*/nullptr,
                               /*ReturnTypeRequirement=*/{});
 }
 
@@ -8130,15 +8192,32 @@ concepts::Requirement *Sema::ActOnTypeRequirement(
 }
 
 concepts::Requirement *
-Sema::ActOnCompoundRequirement(Expr *E, SourceLocation NoexceptLoc) {
-  return BuildExprRequirement(E, /*IsSimple=*/false, NoexceptLoc,
+Sema::ActOnCompoundRequirement(Expr *E, SourceLocation NoexceptLoc,
+                               Expr *NoexceptCond) {
+  if (NoexceptCond) {
+    // P3822R2: the condition is a contextually converted constant expression
+    // of type bool, as for the noexcept-specifier of a function.
+    ExceptionSpecificationType EST;
+    ExprResult Cond = ActOnNoexceptSpec(NoexceptCond, EST);
+    if (Cond.isInvalid())
+      return nullptr;
+    NoexceptCond = Cond.get();
+  }
+  return BuildExprRequirement(E, /*IsSimple=*/false, NoexceptLoc, NoexceptCond,
                               /*ReturnTypeRequirement=*/{});
 }
 
 concepts::Requirement *
 Sema::ActOnCompoundRequirement(
-    Expr *E, SourceLocation NoexceptLoc, CXXScopeSpec &SS,
+    Expr *E, SourceLocation NoexceptLoc, Expr *NoexceptCond, CXXScopeSpec &SS,
     TemplateIdAnnotation *TypeConstraint, unsigned Depth) {
+  if (NoexceptCond) {
+    ExceptionSpecificationType EST;
+    ExprResult Cond = ActOnNoexceptSpec(NoexceptCond, EST);
+    if (Cond.isInvalid())
+      return nullptr;
+    NoexceptCond = Cond.get();
+  }
   // C++2a [expr.prim.req.compound] p1.3.3
   //   [..] the expression is deduced against an invented function template
   //   F [...] F is a void function template with a single type template
@@ -8163,7 +8242,8 @@ Sema::ActOnCompoundRequirement(
                           /*EllipsisLoc=*/SourceLocation(),
                           /*AllowUnexpandedPack=*/true))
     // Just produce a requirement with no type requirements.
-    return BuildExprRequirement(E, /*IsSimple=*/false, NoexceptLoc, {});
+    return BuildExprRequirement(E, /*IsSimple=*/false, NoexceptLoc,
+                                NoexceptCond, {});
 
   auto *TPL = TemplateParameterList::Create(Context, SourceLocation(),
                                             SourceLocation(),
@@ -8171,20 +8251,28 @@ Sema::ActOnCompoundRequirement(
                                             SourceLocation(),
                                             /*RequiresClause=*/nullptr);
   return BuildExprRequirement(
-      E, /*IsSimple=*/false, NoexceptLoc,
+      E, /*IsSimple=*/false, NoexceptLoc, NoexceptCond,
       concepts::ExprRequirement::ReturnTypeRequirement(TPL));
 }
 
 concepts::ExprRequirement *
 Sema::BuildExprRequirement(
-    Expr *E, bool IsSimple, SourceLocation NoexceptLoc,
+    Expr *E, bool IsSimple, SourceLocation NoexceptLoc, Expr *NoexceptCond,
     concepts::ExprRequirement::ReturnTypeRequirement ReturnTypeRequirement) {
   auto Status = concepts::ExprRequirement::SS_Satisfied;
   ConceptSpecializationExpr *SubstitutedConstraintExpr = nullptr;
+  // P3822R2: 'noexcept(false)' imposes no requirement.
+  bool NoexceptRequired = NoexceptLoc.isValid();
+  if (NoexceptCond && !NoexceptCond->isValueDependent()) {
+    bool CondValue = false;
+    if (NoexceptCond->EvaluateAsBooleanCondition(CondValue, Context))
+      NoexceptRequired = CondValue;
+  }
   if (E->isInstantiationDependent() || E->getType()->isPlaceholderType() ||
+      (NoexceptCond && NoexceptCond->isInstantiationDependent()) ||
       ReturnTypeRequirement.isDependent())
     Status = concepts::ExprRequirement::SS_Dependent;
-  else if (NoexceptLoc.isValid() && canThrow(E) == CanThrowResult::CT_Can)
+  else if (NoexceptRequired && canThrow(E) == CanThrowResult::CT_Can)
     Status = concepts::ExprRequirement::SS_NoexceptNotMet;
   else if (ReturnTypeRequirement.isSubstitutionFailure())
     Status = concepts::ExprRequirement::SS_TypeRequirementSubstitutionFailure;
@@ -8221,23 +8309,24 @@ Sema::BuildExprRequirement(
                               IDC->printPretty(OS, /*Helper=*/nullptr,
                                                getPrintingPolicy());
                             }),
-          IsSimple, NoexceptLoc, ReturnTypeRequirement);
+          IsSimple, NoexceptLoc, NoexceptCond, ReturnTypeRequirement);
     }
     if (!SubstitutedConstraintExpr->isSatisfied())
       Status = concepts::ExprRequirement::SS_ConstraintsNotSatisfied;
   }
-  return new (Context) concepts::ExprRequirement(E, IsSimple, NoexceptLoc,
-                                                 ReturnTypeRequirement, Status,
-                                                 SubstitutedConstraintExpr);
+  return new (Context) concepts::ExprRequirement(
+      E, IsSimple, NoexceptLoc, NoexceptCond, ReturnTypeRequirement, Status,
+      SubstitutedConstraintExpr);
 }
 
 concepts::ExprRequirement *
 Sema::BuildExprRequirement(
     concepts::Requirement::SubstitutionDiagnostic *ExprSubstitutionDiagnostic,
-    bool IsSimple, SourceLocation NoexceptLoc,
+    bool IsSimple, SourceLocation NoexceptLoc, Expr *NoexceptCond,
     concepts::ExprRequirement::ReturnTypeRequirement ReturnTypeRequirement) {
   return new (Context) concepts::ExprRequirement(ExprSubstitutionDiagnostic,
                                                  IsSimple, NoexceptLoc,
+                                                 NoexceptCond,
                                                  ReturnTypeRequirement);
 }
 

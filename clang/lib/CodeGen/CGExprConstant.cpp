@@ -1303,6 +1303,9 @@ public:
     // evaluate them in the cases where they can be folded.
     case CK_BitCast:
     case CK_ToVoid:
+    case CK_TokenArrayToSequence:
+    case CK_SequenceToTokenArray:
+    case CK_NoReturnToAny:
     case CK_Dynamic:
     case CK_LValueBitCast:
     case CK_LValueToRValueBitCast:
@@ -2121,13 +2124,15 @@ private:
   emitPointerAuthDiscriminator(const Expr *E);
 
   bool hasNonZeroOffset() const {
-    return !Value.getLValueOffset().isZero();
+    // The tag of a tagged pointer (P3125R6) is a part of the offset at run time.
+    return !Value.getLValueOffset().isZero() || Value.getLValueTag() != 0;
   }
 
   /// Return the value offset.
   llvm::Constant *getOffset() {
-    return llvm::ConstantInt::get(CGM.Int64Ty,
-                                  Value.getLValueOffset().getQuantity());
+    // A tagged pointer (P3125R6) is the pointer plus the tag as a byte offset.
+    return llvm::ConstantInt::get(
+        CGM.Int64Ty, Value.getLValueOffset().getQuantity() + Value.getLValueTag());
   }
 
   /// Apply the value offset to the given constant.
@@ -2484,6 +2489,7 @@ ConstantEmitter::tryEmitPrivate(const APValue &Value, QualType DestType,
         llvm::StructType::get(Complex[0]->getType(), Complex[1]->getType());
     return llvm::ConstantStruct::get(STy, Complex);
   }
+  case APValue::TokenSequence:
   case APValue::Reflection: {
     // Null reflections have a runtime representation. Use the same zero
     // representation as value-initialization, including in aggregates.

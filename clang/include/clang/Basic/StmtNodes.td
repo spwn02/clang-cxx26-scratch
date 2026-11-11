@@ -59,6 +59,9 @@ def CXXForRangeStmt : StmtNode<Stmt>;
 def CoroutineBodyStmt : StmtNode<Stmt>;
 def CoreturnStmt : StmtNode<Stmt>;
 
+// do-expressions (block-expression with explicit do_return)
+def DoReturnStmt : StmtNode<Stmt>;
+
 // C++ expansion statements (P1306)
 def CXXExpansionStmt : StmtNode<Stmt, 1>;
 def CXXIndeterminateExpansionStmt : StmtNode<CXXExpansionStmt>;
@@ -126,6 +129,7 @@ def AtomicExpr : StmtNode<Expr>;
 // GNU Extensions.
 def AddrLabelExpr : StmtNode<Expr>;
 def StmtExpr : StmtNode<Expr>;
+def DoExpr : StmtNode<Expr>;
 def ChooseExpr : StmtNode<Expr>;
 def GNUNullExpr : StmtNode<Expr>;
 
@@ -193,8 +197,17 @@ def RequiresExpr : StmtNode<Expr>;
 
 // C++2c Reflection expressions
 def CXXReflectExpr : StmtNode<Expr>;
+def CXXTokenSequenceExpr : StmtNode<Expr>;
 def CXXMetafunctionExpr : StmtNode<Expr>;
 def CXXSpliceExpr : StmtNode<Expr>;
+def CXXBuiltinInjectExpr : StmtNode<Expr>;
+def CXXBuiltinReportTokensExpr : StmtNode<Expr>;
+def CXXTokenInterpolationListExpr : StmtNode<Expr>;
+def CXXBuiltinIdExpr : StmtNode<Expr>;
+def CXXBuiltinStrLiteralExpr : StmtNode<Expr>;
+def CXXBuiltinTokenizeExpr : StmtNode<Expr>;
+def CXXBuiltinStringizeExpr : StmtNode<Expr>;
+def CXXMacroInvocationExpr : StmtNode<Expr>;
 def StackLocationExpr : StmtNode<Expr>;
 def ExtractLValueExpr : StmtNode<Expr>;
 def ExplDependentCallExpr : StmtNode<Expr>;
@@ -205,6 +218,11 @@ def CXXExpansionInitListSelectExpr : StmtNode<Expr>;
 def CXXDestructurableExpansionSelectExpr : StmtNode<Expr>;
 def CXXIterableExpansionSelectExpr : StmtNode<Expr>;
 def CXXIndeterminateExpansionSelectExpr : StmtNode<Expr>;
+
+// Pattern matching expression
+def MatchTestExpr : StmtNode<Expr>;
+def CaseConditionExpr : StmtNode<MatchTestExpr>;
+def MatchSelectExpr : StmtNode<Expr>;
 
 // Obj-C Expressions.
 def ObjCStringLiteral : StmtNode<Expr>;

@@ -632,6 +632,7 @@ defvar cpp17 = LangOpts<"CPlusPlus17">;
 defvar cpp20 = LangOpts<"CPlusPlus20">;
 defvar cpp23 = LangOpts<"CPlusPlus23">;
 defvar cpp26 = LangOpts<"CPlusPlus26">;
+defvar cpp29 = LangOpts<"CPlusPlus29">;
 defvar c99 = LangOpts<"C99">;
 defvar c23 = LangOpts<"C23">;
 defvar lang_std = LangOpts<"LangStd">;
@@ -1696,16 +1697,38 @@ defm coroutines : BoolFOption<"coroutines",
           "Enable support for the C++ Coroutines">,
   NegFlag<SetFalse>>;
 
+// P2806 do expressions. On by default in C++2d and available as an extension
+// before it, the way -fcoroutines makes co_await/co_return usable in C++17.
+// Turning it on makes 'do_return' a keyword, which -Wc++2d-compat has been
+// warning about in earlier modes all along.
+defm do_expressions : BoolFOption<"do-expressions",
+  LangOpts<"DoExpressions">, Default<cpp29.KeyPath>,
+  PosFlag<SetTrue, [], [ClangOption], "Enable">,
+  NegFlag<SetFalse, [], [ClangOption], "Disable">,
+  BothFlags<[], [ClangOption, CC1Option], " support for P2806 do expressions">>,
+  ShouldParseIf<cplusplus.KeyPath>;
+
 defm coro_aligned_allocation : BoolFOption<"coro-aligned-allocation",
   LangOpts<"CoroAlignedAllocation">, DefaultFalse,
   PosFlag<SetTrue, [], [ClangOption, CC1Option],
           "Prefer aligned allocation for C++ Coroutines">,
   NegFlag<SetFalse>>;
 
+def fdynamic_cast_first : Flag<["-"], "fdynamic-cast-first">,
+  Visibility<[CC1Option]>,
+  HelpText<"The C++ runtime provides __dynamic_cast_first, which performs the casts of a pattern matching selection in one call; the driver passes it for libc++ on ELF targets">,
+  MarshallingInfoFlag<CodeGenOpts<"DynamicCastFirstAvailable">>;
 def fstdcpp_float_macros : Flag<["-"], "fstdcpp-float-macros">,
   Visibility<[CC1Option]>,
   HelpText<"Predefine __STDCPP_FLOAT<N>_T__ and __STDCPP_BFLOAT16_T__ ([cpp.predefined]); the driver passes it for libc++">,
   MarshallingInfoFlag<LangOpts<"StdCppFloatMacros">>;
+
+defm experimental_library : BoolFOption<"experimental-library",
+  LangOpts<"ExperimentalLibrary">, DefaultFalse,
+  PosFlag<SetTrue, [], [ClangOption, CC1Option, CLOption],
+          "Enable the library facilities that are not stable yet: the C++29 networking and I/O library "
+          "(P4100) until its design is complete. Neither API nor ABI stability are guaranteed for them">,
+  NegFlag<SetFalse>>;
 
 def fembed_offload_object_EQ : Joined<["-"], "fembed-offload-object=">,
   Group<f_Group>, Flags<[NoXarchOption]>,
@@ -2082,6 +2105,10 @@ def fconstexpr_depth_EQ : Joined<["-"], "fconstexpr-depth=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   HelpText<"Set the maximum depth of recursive constexpr function calls">,
   MarshallingInfoInt<LangOpts<"ConstexprCallDepth">, "512">;
+def fmacro_expansion_depth_EQ : Joined<["-"], "fmacro-expansion-depth=">,
+  Group<f_Group>, Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Set the maximum depth of nested expression macro expansions">,
+  MarshallingInfoInt<LangOpts<"MacroExpansionDepth">, "256">;
 def fconstexpr_steps_EQ : Joined<["-"], "fconstexpr-steps=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   HelpText<"Set the maximum number of steps in constexpr function evaluation (0 = no limit)">,

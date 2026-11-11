@@ -1569,6 +1569,110 @@ class Foo final {})cpp";
   }
 }
 
+// P4380 token sequences: hover on an interpolation and on a macro name at its
+// call site (#392).
+TEST(Hover, TokenSequences) {
+  const char *Pre = R"cpp(
+namespace std::meta {
+template <class... Ts> consteval auto id(Ts const &...) -> int;
+using token = decltype(id("x"));
+class token_sequence {
+public:
+  constexpr token_sequence() noexcept = default;
+  friend consteval auto operator+=(token_sequence &, const token_sequence &)
+      -> token_sequence &;
+  friend consteval auto operator+(token_sequence, const token_sequence &)
+      -> token_sequence;
+};
+} // namespace std::meta
+using std::meta::token_sequence;
+)cpp";
+  struct {
+    const char *const Code;
+    const char *Name;
+  } Cases[] = {
+      {R"cpp(consteval token_sequence f(int count) { return @@{ x = \(co$p^unt) }; })cpp",
+       "count"},
+      {R"cpp(__macro inc(int x) { return @@{ (\(x) + 1) }; }
+             int use() { return i$p^nc!(1); })cpp",
+       "inc"},
+  };
+  for (const auto &C : Cases) {
+    Annotations T(std::string(Pre) + C.Code);
+    TestTU TU = TestTU::withCode(withReflectionOperator(T.code()));
+    TU.ExtraArgs.push_back("-std=c++2d");
+    auto AST = TU.build();
+    auto H = getHover(AST, T.point("p"), format::getLLVMStyle(), nullptr);
+    ASSERT_TRUE(H) << C.Code;
+    EXPECT_EQ(H->Name, C.Name) << C.Code;
+  }
+}
+
+TEST(Hover, DoExpressions) {
+  struct {
+    const char *const Code;
+    const char *Name;
+    const char *Type;
+  } Cases[] = {
+      // A variable declared in the do-expression body.
+      {R"cpp(int f() { return do { int lo^cal = 1; do_return local; }; })cpp",
+       "local", "int"},
+      // An init-capture of the do expression.
+      {R"cpp(int f() { return do [ca^p = 4] { do_return cap; }; })cpp",
+       "cap", "int"},
+      // A use of the init-capture in the body.
+      {R"cpp(int f() { return do [cap = 4] { do_return ca^p; }; })cpp",
+       "cap", "int"},
+      // A variable initialized from a do expression.
+      {R"cpp(void f() { auto va^lue = do { do_return 1.5; }; })cpp",
+       "value", "double"},
+  };
+  for (const auto &C : Cases) {
+    Annotations T(C.Code);
+    TestTU TU = TestTU::withCode(T.code());
+    TU.ExtraArgs.push_back("-std=c++29");
+    auto AST = TU.build();
+    auto H = getHover(AST, T.point(), format::getLLVMStyle(), nullptr);
+    ASSERT_TRUE(H) << C.Code;
+    EXPECT_EQ(H->Name, C.Name) << C.Code;
+    ASSERT_TRUE(H->Type) << C.Code;
+    EXPECT_EQ(H->Type->Type, C.Type) << C.Code;
+  }
+}
+
+TEST(Hover, PatternMatching) {
+  struct {
+    const char *const Code;
+    const char *Name;
+    const char *Type;
+  } Cases[] = {
+      // The variable a declaration pattern declares.
+      {R"cpp(int f(int x) { return match (x) { case auto y^y => yy; }; })cpp",
+       "yy", "int"},
+      // A use of it.
+      {R"cpp(int f(int x) { return match (x) { case auto yy => y^y; }; })cpp",
+       "yy", "int"},
+      // A binding of a decomposition pattern.
+      {R"cpp(struct P { int a; double b; };
+             double f(P p) { if (case [0, auto b^b] = p) return bb; return 0; })cpp",
+       "bb", "double"},
+      // A reference declaration pattern.
+      {R"cpp(int f(int x) { return match (x) { case const auto &r^r => rr; }; })cpp",
+       "rr", "const int &"},
+  };
+  for (const auto &C : Cases) {
+    Annotations T(C.Code);
+    TestTU TU = TestTU::withCode(T.code());
+    TU.ExtraArgs.push_back("-std=c++2d");
+    auto AST = TU.build();
+    auto H = getHover(AST, T.point(), format::getLLVMStyle(), nullptr);
+    ASSERT_TRUE(H) << C.Code;
+    EXPECT_EQ(H->Name, C.Name) << C.Code;
+    ASSERT_TRUE(H->Type) << C.Code;
+    EXPECT_EQ(H->Type->Type, C.Type) << C.Code;
+  }
+}
+
 TEST(Hover, DefinitionLanuage) {
   struct {
     const char *const Code;

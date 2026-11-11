@@ -1748,6 +1748,178 @@ For example, compiling code with ``-fmodules`` enables the use of Modules.
 
 More information can be found `here <https://clang.llvm.org/docs/Modules.html>`_.
 
+.. _token_sequence_injection:
+
+Token Sequence Injection (P4380)
+================================
+
+Available with ``-std=c++29`` (``-std=c++2d``). The paper (P4380R1) is exploratory and has no standard wording: the
+behaviour described here is that of the prototype it is taken from (brevzin/llvm-project, branch
+``token-vector-model``) as ported to this tree, not normative text.
+
+``^^{ ... }`` is a *token sequence literal*: its tokens are lexed, not parsed (only ``{}`` have to balance), and the
+value is a ``std::meta::token_sequence``: a consteval-only class in ``<meta>`` that holds the tokens in a member only the
+compiler can name. It is a random-access range of ``std::meta::token`` (a consteval-only scalar, one token) with
+``size()``, ``empty()``, ``data()``, ``begin()``/``end()``, ``operator[]``, ``front()``/``back()`` and ``subseq()``, and ``+=``, ``+`` and ``==``
+work on sequences and tokens. Copying one is cheap and ``+=`` appends in amortized constant time per token. ``\(e)`` inside a literal
+interpolates ``e``: a token sequence is spliced in, a reflection becomes one token naming the entity, a
+``std::meta::operators`` or ``punctuator`` value becomes its token, and any other value a token for that value.
+``\(a, b, ...)`` interpolates a list, ``\(pack...)`` and ``\(pack...; sep)`` expand a pack with a separator, and
+``$name`` / ``${...}`` are the shorter forms. ``std::meta::queue_injection(ts)`` (and the overload taking a namespace)
+parses a token sequence at the point it is injected; ``on_complete``, ``on_template_defined`` and ``inject_members``
+annotation callbacks queue injections for classes, templates and enumerations. ``members_of`` and ``bases_of`` may be
+called on a class that is being defined (C++29 only).
+
+``__macro`` declares an *expression macro*, a consteval function returning ``std::meta::token_sequence`` that is invoked
+as ``name!(args)`` (also ``name![...]`` and ``name!{...}``, qualified, with explicit template arguments, as member
+functions with an explicit object parameter, as operators, at declaration, statement and mem-initializer position). An
+argument is passed as a reflection of its expression, or as the raw tokens for a ``token_sequence`` parameter. The
+queries ``source_text_of``, ``is_binary_operation``, ``operands_of``, ``operator_of``, ``macro_expansion_context``,
+``is_constant_expression``, ``as_lvalue``, the token helpers (``id``, ``str_lit``, ``tokenize``, ``stringize``,
+``token_kind_of``, ``punctuator_of``, ``identifier_of(token)``), ``declaration_of`` and its companions are in
+``<meta>``; ``std::constexpr_print_str`` / ``constexpr_warning_str`` / ``constexpr_error_str`` (P2758) are in
+``<debugging>``.
+
+Name lookup for injected declarations is deliberately plain, because the paper leaves it open (its ``vtable_for``
+example: should code be able to refer to a declaration that a *later* injection introduces, as a variable template or a
+forward declaration?). Here an injected declaration is found from the point where the injection has happened, as if
+it had been written there; naming it earlier is an ordinary "undeclared identifier", and a hand-written forward
+declaration is not completed by a later injected definition (the two are distinct entities, so naming it is
+ambiguous). ``clang/test/SemaCXX/cxx29-token-seq-forward-reference.cpp`` pins this; it will be revisited when the
+authors settle the question (tracked in #358).
+
+Known limitations of this port: a token sequence keeps its tokens through a PCH or a module, including the
+interpolated types, template names, expressions and namespace splices; only a declaration description
+(``declaration_of``) inside a sequence is lost (``-Wtoken-sequence-serialization``). The class
+``std::meta::token_sequence`` must be visible where a literal is written (``import std;`` or ``#include <meta>``).
+``macro`` is a provisional alias of ``__macro`` in ``-std=c++29`` (the draft's spelling is a placeholder): it is a keyword only
+where an expression-macro declaration starts, that is ``macro name (`` or ``macro operator <op> (``, and an ordinary identifier
+everywhere else (``int macro = 1;``). A type named ``macro`` used as the return type of a function declared ``macro f(int);`` is
+read as the keyword in that mode; write ``::macro`` for the type. Both spellings declare the same macro and print as the
+function they are.
+
+Outside ``-std=c++29`` ``__macro`` is an ordinary identifier, and a ``^^{ ... }`` literal is diagnosed; the ``cxx26``
+release line has none of this code. The ASTImporter imports literals, values, the helper builtins and expression macro
+invocations, and reflections (of types, declarations, namespaces, parameters and templates) inside literals; other kinds
+of reflection values are refused with an import error. clang-format keeps a literal ``^^{ ... }`` exactly as written,
+because its whitespace is part of its value.
+
+A resolved macro invocation stays in the AST as a ``CXXMacroInvocationExpr`` around its expansion, so tools see the
+macro that was invoked (clangd completion, hover, go-to-definition, references and semantic tokens work on the name at
+the call site). This holds for ``m!(..)``, ``obj.m!(..)``, and for statement- and declaration-position invocations,
+which are kept as an invocation with an empty expansion ahead of the statements or declarations they expand to (in
+declaration position inside a consteval block that does nothing). The control flow graph (and so the static analyzer) evaluates an
+argument where the expansion uses it, as the generated code does: the right operand of an operator macro ``or`` is not
+evaluated when the left one decides. In the experimental syntax-tree library (``clang-check -syntax-tree-dump``) a
+literal and an invocation are one leaf; what was injected or expanded from a literal, or made by ``tokenize``,
+``str_lit`` or ``id``, is left out, because its tokens are not where it is used.
+The raw identifiers of a literal are not names until the sequence is injected; clangd shows them as unresolved (dependent)
+names, and the interpolated expressions as the expressions they are. There is no ``std::formatter`` for ``token_sequence``:
+P4380 defines none, and a token sequence exists only in constant evaluation.
+
+.. _do_expressions:
+
+Do Expressions (P2806)
+======================
+
+A do expression runs a block of statements and yields a value:
+
+.. code-block:: c++
+
+  int f(bool b, int *p) {
+    return do [q = p] -> int {   // init-captures and the result type are optional
+      if (!q || b)
+        do_return 0;
+      do_return *q;              // do_return; for a void result
+    };
+  }
+
+* The body is not a function scope. ``return``, ``break``, ``continue`` and
+  ``goto`` in it refer to the enclosing function and loops; ``do_return`` ends
+  the body and gives the value of the expression.
+* The result type is deduced by the ``auto`` rules from the ``do_return``
+  operands, or is the type written after ``->``. A do expression is always a
+  prvalue.
+* In statement position ``do`` is still a do-while statement; a do expression
+  is a ``do`` where an operand is expected.
+
+Enable it with ``-std=c++29`` (``-std=c++2d``); there is no flag that enables it
+in an earlier mode. In any other mode a ``do`` expression is an error that names
+the option.
+``__cpp_do_expressions`` is defined as ``1`` and ``__has_feature(do_expressions)``
+reports it.
+
+The rest of the toolchain understands do expressions: code completion
+(``do``, ``[``/``->``/``{`` after it, ``do_return`` only inside the body), the
+static analyzer, AST import and JSON dump, AST matchers (``doExpr``,
+``doReturnStmt``), libclang (``CXCursor_DoExpr``, ``CXCursor_DoReturnStmt``),
+clang-tidy (including ``modernize-use-do-expr``), clang-format and clangd
+(highlights, hover, references, semantic tokens, folding). The syntax-tree
+library keeps them as unknown expressions and statements.
+
+
+.. _pattern_matching:
+
+Pattern Matching (P2688)
+========================
+
+.. code-block:: c++
+
+  int classify(int x, std::optional<int> o) {
+    if (case {auto n} = o)               // a pattern condition
+      return n;
+    return match (x) {                   // a match selection
+      case 0 => 10;
+      case 1 || 2 => 20;                 // an or-pattern
+      case auto y if (y > 5) => y;       // a declaration pattern and a guard
+      case _ => -1;                      // the wildcard
+    };
+  }
+
+  bool two(int x) { return match(x, case 1 || 2); }   // a match test
+
+The patterns are the wildcard ``_``, value patterns (an expression), declaration
+patterns (``auto y``, ``const T &r``, ``T``), type patterns, ``||`` (or ``or``)
+combinations, parenthesized patterns, decomposition patterns ``[p, q, ...]``
+(also nested; empty and unnamed-pack bindings are part of the feature) and
+alternative patterns ``{p}``, ``{T: p}``, ``{.name: p}``, ``{.index<I>: p}``.
+A selection is checked for exhaustiveness and for redundant cases; ``match
+constexpr`` selects at compile time. ``std::alternative_traits`` describes the
+alternatives of a library type (``optional``, ``expected``, ``variant``, ``any``,
+``exception_ptr``, the smart pointers, ``chrono::month`` and ``weekday``, the
+comparison categories). ``match`` is an ordinary identifier except where a
+selection begins, and ``=>`` is a token in this mode only.
+
+Enable it with ``-std=c++29`` (``-std=c++2d``); there is no flag that enables it
+in an earlier mode, and the nested, empty and unnamed-pack forms of structured
+bindings are not recognized before C++29 either. ``__has_feature(pattern_matching)``
+reports it. The paper defines no feature-test macro.
+
+For a type pattern over a polymorphic class the compiler tries the casts of a
+selection in one call to ``__dynamic_cast_first`` when the driver says the C++
+runtime provides it (libc++ on ELF targets, ``-fdynamic-cast-first``, a cc1
+option); every other runtime gets the sequential ``__dynamic_cast`` calls, with
+the same result. Code compiled with ``-stdlib=libc++`` on Linux therefore needs
+this toolchain's libc++abi or later.
+
+The rest of the toolchain understands pattern matching: ``-ast-print``,
+``-ast-dump`` and JSON dumps, PCH and modules, the CFG and the static analyzer
+(every case may be taken), ``ASTImporter``, AST matchers (``matchSelectExpr``,
+``matchTestExpr``, ``caseConditionExpr``, ``hasMatchSubject``,
+``hasCaseHandler``, ``isPatternVariable``), libclang
+(``CXCursor_MatchSelectExpr``, ``CXCursor_MatchTestExpr``,
+``CXCursor_CaseConditionExpr``) and its Python bindings, clangd (references,
+go-to-definition and semantic tokens for the variables a pattern declares, the
+``match`` code completion pattern), clang-format, clang-tidy
+(``readability-function-size`` and ``readability-function-cognitive-complexity``
+count a selection like a ``switch``). The syntax-tree library has nodes for
+selections (``MatchSelectionExpression``, ``MatchSelectionStatement``), cases
+and guards (``MatchCase``, ``MatchGuard``), tests and conditions
+(``MatchTestExpression``, ``PatternCondition``) and every kind of pattern
+(``WildcardPattern``, ``ExpressionPattern``, ``DeclarationPattern``,
+``TypePattern``, ``ParenPattern``, ``OrPattern``, ``DecompositionPattern``,
+``AlternativePattern``).
+
 Language Extensions Back-ported to Previous Standards
 =====================================================
 
@@ -5234,6 +5406,54 @@ used, but the operation must be performed on the pointer cast to ``uintptr_t``.
 If Clang can determine that the alignment is not a power of two at compile time,
 it will result in a compilation failure. If the alignment argument is not a
 power of two at run time, the behavior of these builtins is undefined.
+
+.. _langext-pointer-tag:
+
+Builtins for pointer tagging
+----------------------------
+
+``__builtin_pointer_tag_insert``, ``__builtin_pointer_tag_get`` and
+``__builtin_pointer_tag_strip`` store a small tag in the low bits of a pointer
+that are zero because of the alignment of the object it points into, and read
+and remove it again. They are the compiler support behind C++29
+``std::pointer_tag_pair`` (P3125R6); the library is the intended user.
+
+**Syntax**:
+
+.. code-block:: c++
+
+  void *__builtin_pointer_tag_insert(const volatile void *ptr, size_t tag, size_t bits);
+  size_t __builtin_pointer_tag_get(const volatile void *ptr, size_t bits);
+  void *__builtin_pointer_tag_strip(const volatile void *ptr, size_t bits);
+
+**Description**:
+
+``bits`` is the number of tag bits (at most 16), ``tag`` must be less than
+``1 << bits`` and ``ptr`` must be aligned to ``1 << bits`` bytes and must not
+point past the end of an object. The result of ``__builtin_pointer_tag_insert``
+is ``ptr`` plus ``tag`` bytes, with the provenance of ``ptr`` (it lowers to a
+plain ``getelementptr``); ``__builtin_pointer_tag_get`` returns the low ``bits``
+bits of the address and ``__builtin_pointer_tag_strip`` clears them
+(``llvm.ptrmask``). A tagged pointer must not be dereferenced.
+
+All three builtins can be used in constant expressions. The constant evaluator
+does not observe an address. A tagged pointer keeps the object, the offset and
+the subobject of the untagged pointer and, beside them, the tag, so
+``__builtin_pointer_tag_strip`` gives back exactly the pointer that was tagged.
+The object the pointer points into has to be aligned to at least ``1 << bits``
+bytes, otherwise the use is not a constant expression. Tagging a null pointer
+gives a pointer that is not null and ``__builtin_pointer_tag_strip`` on it gives
+a null pointer again. These builtins are not supported by the experimental
+constant interpreter.
+
+A tagged pointer is an invalid pointer value ([basic.compound]). In a constant
+expression it can be copied, compared for equality, converted to another cv
+``void*`` type and passed to the three builtins; any other use is diagnosed:
+indirection, member access, array subscript, pointer arithmetic, relational and
+pointer difference operators, conversion to a pointer to an object type,
+``delete`` and use as a template argument. It can be a part of a constant (a
+``constexpr`` variable, a member of a ``constexpr`` object), where it is emitted
+as the object address plus the tag, as at run time.
 
 Non-standard C++11 Attributes
 =============================

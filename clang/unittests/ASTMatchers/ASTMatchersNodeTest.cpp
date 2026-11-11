@@ -455,6 +455,106 @@ TEST_P(ASTMatchersTest, FlowControl) {
   EXPECT_TRUE(matches("void f() { return; }", returnStmt()));
 }
 
+TEST(ASTMatchersTestTokenSequence, NodeMatchers) {
+  const std::vector<std::string> Args = {"-std=c++2d", "-Wno-undefined-inline"};
+  // A minimal std::meta::token_sequence: the compiler gives the class its
+  // storage and does these operations itself.
+  const std::string Prelude = R"cpp(
+    namespace std::meta {
+    template <class... Ts> consteval auto id(Ts const &...) -> int;
+    using token = decltype(id("x"));
+    class token_sequence {
+    public:
+      constexpr token_sequence() noexcept = default;
+      friend consteval token_sequence operator+(token_sequence,
+                                                const token_sequence &);
+    };
+    consteval auto stringize(token_sequence) -> const char *;
+    consteval auto queue_injection(decltype(^^::), token_sequence) -> void;
+    }
+  )cpp";
+  EXPECT_TRUE(matchesConditionally(
+      Prelude + "constexpr std::meta::token_sequence g = ^^{ a + b };",
+      tokenSequenceExpr(), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Prelude + "constexpr std::meta::token_sequence g = ^^{ a + \\(1) };",
+      varDecl(hasInitializer(hasDescendant(tokenSequenceExpr()))), true,
+      Args));
+  EXPECT_TRUE(matchesConditionally(
+      Prelude + "consteval auto s() { return std::meta::id(\"x\"); }",
+      builtinIdExpr(), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Prelude + "consteval auto s() { return std::meta::stringize(^^{ a }); }",
+      builtinStringizeExpr(), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Prelude + "consteval void s() { std::meta::queue_injection(^^::, ^^{}); }",
+      queueInjectionExpr(), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      // (A non-dependent invocation is replaced by its expansion; the node
+      // remains in a template.)
+      Prelude + "__macro one(int x) { return ^^{ \\(x) }; }\n"
+                "template <class T> int f(T t) { return one!(t); }",
+      macroInvocationExpr(), true, Args));
+}
+
+TEST(ASTMatchersTestDoExpr, DoExprAndDoReturn) {
+  const std::vector<std::string> Args = {"-std=c++29"};
+  const char *Code = "int f(int a, int b) { return do { do_return a + b; }; }";
+  EXPECT_TRUE(matchesConditionally(Code, doExpr(), true, Args));
+  EXPECT_TRUE(matchesConditionally(Code, doReturnStmt(), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Code, doExpr(has(compoundStmt(has(doReturnStmt())))), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Code, doReturnStmt(hasDoReturnValue(binaryOperator())), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Code, doReturnStmt(hasDoReturnValue(integerLiteral())), false, Args));
+  EXPECT_TRUE(matchesConditionally(Code, returnStmt(hasReturnValue(doExpr())),
+                                   true, Args));
+  EXPECT_TRUE(matchesConditionally(Code, doStmt(), false, Args));
+  EXPECT_TRUE(
+      matchesConditionally(Code, doExpr(hasExplicitResultType()), false, Args));
+  EXPECT_TRUE(matchesConditionally(
+      "int f() { return do -> int { do_return 1; }; }",
+      doExpr(hasExplicitResultType()), true, Args));
+  // A real do-while is not a do expression.
+  EXPECT_TRUE(matchesConditionally("void f() { do {} while (false); }",
+                                   doExpr(), false, Args));
+}
+
+TEST(ASTMatchersTestPatternMatching, MatchNodes) {
+  const std::vector<std::string> Args = {"-std=c++2d"};
+  const char *Code = "int f(int a) { return match (a + 1) { case auto y if (y > "
+                     "2) => y * 2; case _ => 0; }; }\n"
+                     "bool g(int a) { return match(a, case 1 || 2); }\n"
+                     "int h(int a) { if (case auto z = a) return z; return 0; }";
+  EXPECT_TRUE(matchesConditionally(Code, matchSelectExpr(), true, Args));
+  EXPECT_TRUE(matchesConditionally(Code, matchTestExpr(), true, Args));
+  EXPECT_TRUE(matchesConditionally(Code, caseConditionExpr(), true, Args));
+  // A pattern condition is a match test; a match test is not a condition.
+  EXPECT_TRUE(matchesConditionally(
+      Code, matchTestExpr(unless(caseConditionExpr())), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Code, matchSelectExpr(hasMatchSubject(binaryOperator())), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Code, matchSelectExpr(hasMatchSubject(integerLiteral())), false, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Code, matchSelectExpr(hasCaseHandler(binaryOperator())), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Code, matchSelectExpr(hasCaseHandler(callExpr())), false, Args));
+  EXPECT_TRUE(
+      matchesConditionally(Code, matchSelectExpr(isConstexpr()), false, Args));
+  EXPECT_TRUE(matchesConditionally(
+      "int f(int a) { return match constexpr (1) { case _ => 0; }; }",
+      matchSelectExpr(isConstexpr()), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Code, varDecl(hasName("y"), isPatternVariable()), true, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Code, varDecl(hasName("a"), isPatternVariable()), false, Args));
+  EXPECT_TRUE(matchesConditionally(
+      Code, declRefExpr(to(varDecl(hasName("y"), isPatternVariable()))), true,
+      Args));
+}
+
 TEST_P(ASTMatchersTest, CXXOperatorCallExpr) {
   if (!GetParam().isCXX()) {
     return;

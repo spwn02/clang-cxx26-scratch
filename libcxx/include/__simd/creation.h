@@ -17,13 +17,20 @@
 #include <__simd/basic_vec.h>
 #include <__simd/concepts.h>
 #include <__simd/traits.h>
+#include <__simd/vectorizable.h>
 #include <__tuple/tuple_like.h>
+#include <__type_traits/is_arithmetic.h>
+#include <__type_traits/is_same.h>
 #include <array>
+#include <limits>
 #include <tuple>
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header
 #endif
+
+_LIBCPP_PUSH_MACROS
+#include <__undef_macros>
 
 _LIBCPP_BEGIN_NAMESPACE_STD
 
@@ -122,10 +129,39 @@ _LIBCPP_HIDE_FROM_ABI constexpr auto cat(const basic_mask<_Bytes, _FirstAbi>& __
   return _Result([&](auto __i) -> bool { return __elements[__i]; });
 }
 
+#  if _LIBCPP_STD_VER >= 29
+
+// [simd.creation] (P3319R6): iota<T> is T() for a vectorizable arithmetic type, and the vector whose element i is i for
+// an enabled basic_vec of an arithmetic type that can represent size() - 1.
+template <class _Tp>
+_LIBCPP_HIDE_FROM_ABI constexpr _Tp __iota() {
+  if constexpr (is_arithmetic_v<_Tp>) {
+    static_assert(__vectorizable<_Tp>, "simd::iota<T>: an arithmetic T must be a vectorizable type");
+    return _Tp();
+  } else if constexpr (__simd_vec_type<_Tp>) {
+    static_assert(is_arithmetic_v<typename _Tp::value_type>,
+                  "simd::iota<T>: the value_type of a basic_vec T must be arithmetic");
+    static_assert(static_cast<long double>(_Tp::size() - 1) <=
+                      static_cast<long double>(numeric_limits<typename _Tp::value_type>::max()),
+                  "simd::iota<T>: the value_type of T cannot represent size() - 1");
+    return _Tp([](typename _Tp::value_type __i) { return __i; });
+  } else {
+    static_assert(!is_same_v<_Tp, _Tp>,
+                  "simd::iota<T>: T must be a vectorizable arithmetic type or an enabled specialization of basic_vec");
+  }
+}
+
+template <class _Tp>
+inline constexpr _Tp iota = std::simd::__iota<_Tp>();
+
+#  endif // _LIBCPP_STD_VER >= 29
+
 } // namespace simd
 
 #endif // _LIBCPP_STD_VER >= 26
 
 _LIBCPP_END_NAMESPACE_STD
+
+_LIBCPP_POP_MACROS
 
 #endif // _LIBCPP___SIMD_CREATION_H

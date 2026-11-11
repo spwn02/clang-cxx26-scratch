@@ -84,6 +84,8 @@ private:
                              unsigned &ParentScope);
   void BuildScopeInformation(CompoundLiteralExpr *CLE, unsigned &ParentScope);
   void BuildScopeInformation(Stmt *S, unsigned &origParentScope);
+  void BuildPatternConditionHandlers(Expr *Condition, Stmt *FallbackHandler,
+                                     unsigned ParentScope);
 
   void VerifyJumps();
   void VerifyIndirectJumps();
@@ -230,6 +232,21 @@ static ScopePair GetDiagForGotoScopeDecl(Sema &S, const Decl *D) {
   return ScopePair(0U, 0U);
 }
 
+/// Does \p S contain a do-expression, not counting one nested in a lambda or
+/// block body (which is a separate function for jump purposes)?
+static bool containsDoExpr(const Stmt *S) {
+  if (!S)
+    return false;
+  if (isa<DoExpr>(S))
+    return true;
+  if (isa<LambdaExpr>(S) || isa<BlockExpr>(S))
+    return false;
+  for (const Stmt *Sub : S->children())
+    if (containsDoExpr(Sub))
+      return true;
+  return false;
+}
+
 /// Build scope information for a declaration that is part of a DeclStmt.
 void JumpScopeChecker::BuildScopeInformation(Decl *D, unsigned &ParentScope) {
   if (auto *ESD = dyn_cast<ExpansionStmtDecl>(D)) {
@@ -246,6 +263,37 @@ void JumpScopeChecker::BuildScopeInformation(Decl *D, unsigned &ParentScope) {
         BuildScopeInformation(Body, ExpansionScope);
     return;
   }
+  VarDecl *VD = dyn_cast<VarDecl>(D);
+  Expr *Init = VD ? VD->getInit() : nullptr;
+
+  // An initializer containing a do-expression is walked BEFORE the variable's
+  // own scope is pushed. While the initializer runs the variable is not yet
+  // initialized, so a jump out of it to a label that is in the variable's
+  // scope bypasses that initialization and has to be rejected. Pushing the
+  // variable's scope first makes such a jump look like it is already inside
+  // that scope, so it crosses nothing and is accepted in silence -- leaving
+  // the variable uninitialized while in scope, and still running its
+  // destructor at the end of the block.
+  //
+  // P2806 requires this, and names the wording hook:
+  //
+  //   "referring to any label that is in scope of the variable we're
+  //    initializing needs to be disallowed -- since we wouldn't have actually
+  //    initialized the variable. We need to ensure that the [stmt.dcl] rule is
+  //    extended to cover this case."
+  //
+  // A GNU statement-expression initializer can jump out in exactly the same
+  // way, and clang has always accepted that. Changing it is not this patch's
+  // business, so the reordering is limited to initializers that contain a
+  // do-expression.
+  //
+  // Any scope the initializer itself pushes -- a lifetime-extended temporary
+  // with a non-trivial destructor, say -- still becomes the enclosing scope
+  // for whatever follows the declaration, because ParentScope is by reference.
+  // That is what keeps an indirect goto past such a temporary diagnosed.
+  const bool InitCanJumpOut = Init && containsDoExpr(Init);
+  if (InitCanJumpOut)
+    BuildScopeInformation(Init, ParentScope);
 
   // If this decl causes a new scope, push and switch to it.
   std::pair<unsigned,unsigned> Diags = GetDiagForGotoScopeDecl(S, D);
@@ -255,11 +303,10 @@ void JumpScopeChecker::BuildScopeInformation(Decl *D, unsigned &ParentScope) {
     ParentScope = Scopes.size()-1;
   }
 
-  // If the decl has an initializer, walk it with the potentially new
-  // scope we just installed.
-  if (VarDecl *VD = dyn_cast<VarDecl>(D))
-    if (Expr *Init = VD->getInit())
-      BuildScopeInformation(Init, ParentScope);
+  // Any other initializer is walked with the potentially new scope we just
+  // installed, as before.
+  if (Init && !InitCanJumpOut)
+    BuildScopeInformation(Init, ParentScope);
 }
 
 /// Build scope information for a captured block literal variables.
@@ -313,6 +360,47 @@ void JumpScopeChecker::BuildScopeInformation(CompoundLiteralExpr *CLE,
   ParentScope = Scopes.size() - 1;
 }
 
+static void collectPatternConditionHandlers(Expr *Condition,
+                                            SmallVectorImpl<Stmt *> &Handlers) {
+  if (!Condition)
+    return;
+  Condition = Condition->IgnoreParens();
+  if (auto *Constant = dyn_cast<ConstantExpr>(Condition))
+    Condition = Constant->getSubExpr()->IgnoreParens();
+  if (auto *And = dyn_cast<BinaryOperator>(Condition);
+      And && And->getOpcode() == BO_LAnd) {
+    collectPatternConditionHandlers(And->getLHS(), Handlers);
+    collectPatternConditionHandlers(And->getRHS(), Handlers);
+    return;
+  }
+  auto *Match = dyn_cast<CaseConditionExpr>(Condition);
+  if (!Match)
+    return;
+  for (const MatchTestInstantiation &Instantiation :
+       Match->getInstantiations()) {
+    collectPatternConditionHandlers(Instantiation.Condition, Handlers);
+    if (Instantiation.Handler &&
+        !llvm::is_contained(Handlers, Instantiation.Handler))
+      Handlers.push_back(Instantiation.Handler);
+  }
+}
+
+void JumpScopeChecker::BuildPatternConditionHandlers(Expr *Condition,
+                                                     Stmt *FallbackHandler,
+                                                     unsigned ParentScope) {
+  SmallVector<Stmt *, 4> Handlers;
+  collectPatternConditionHandlers(Condition, Handlers);
+  if (Handlers.empty())
+    Handlers.push_back(FallbackHandler);
+  for (Stmt *Handler : Handlers) {
+    unsigned HandlerScope = Scopes.size();
+    Scopes.emplace_back(ParentScope,
+                        diag::note_enters_pattern_condition_handler,
+                        /*OutDiag=*/0, Handler->getBeginLoc());
+    BuildScopeInformation(Handler, HandlerScope);
+  }
+}
+
 /// BuildScopeInformation - The statements from CI to CE are known to form a
 /// coherent VLA scope with a specified parent node.  Walk through the
 /// statements, adding any labels or gotos to LabelAndGotoScopes and recursively
@@ -323,8 +411,9 @@ void JumpScopeChecker::BuildScopeInformation(Stmt *S,
   // propagate out into the enclosing scope.  Otherwise we have to worry
   // about block literals, which have the lifetime of their enclosing statement.
   unsigned independentParentScope = origParentScope;
-  unsigned &ParentScope = ((isa<Expr>(S) && !isa<StmtExpr>(S))
-                            ? origParentScope : independentParentScope);
+  unsigned &ParentScope =
+      ((isa<Expr>(S) && !isa<StmtExpr>(S)) ? origParentScope
+                                           : independentParentScope);
 
   unsigned StmtsToSkip = 0u;
 
@@ -384,9 +473,23 @@ void JumpScopeChecker::BuildScopeInformation(Stmt *S,
 
   case Stmt::IfStmtClass: {
     IfStmt *IS = cast<IfStmt>(S);
+    bool PatternCondition = MatchTestExpr::containsCaseCondition(IS->getCond());
     if (!(IS->isConstexpr() || IS->isConsteval() ||
-          IS->isObjCAvailabilityCheck()))
+          IS->isObjCAvailabilityCheck() ||
+          PatternCondition))
       break;
+
+    if (PatternCondition && !IS->isConstexpr() && !IS->isConsteval()) {
+      if (Stmt *Init = IS->getInit())
+        BuildScopeInformation(Init, ParentScope);
+      if (VarDecl *Var = IS->getConditionVariable())
+        BuildScopeInformation(Var, ParentScope);
+      BuildScopeInformation(IS->getCond(), ParentScope);
+      BuildPatternConditionHandlers(IS->getCond(), IS->getThen(), ParentScope);
+      if (Stmt *Else = IS->getElse())
+        BuildScopeInformation(Else, ParentScope);
+      return;
+    }
 
     unsigned Diag = diag::note_protected_by_if_available;
     if (IS->isConstexpr())
@@ -413,6 +516,32 @@ void JumpScopeChecker::BuildScopeInformation(Stmt *S,
       Scopes.push_back(GotoScope(ParentScope, Diag, 0, IS->getBeginLoc()));
       BuildScopeInformation(Else, NewParentScope);
     }
+    return;
+  }
+
+  case Stmt::WhileStmtClass: {
+    auto *WS = cast<WhileStmt>(S);
+    if (!MatchTestExpr::containsCaseCondition(WS->getCond()))
+      break;
+    if (VarDecl *Var = WS->getConditionVariable())
+      BuildScopeInformation(Var, ParentScope);
+    BuildScopeInformation(WS->getCond(), ParentScope);
+    BuildPatternConditionHandlers(WS->getCond(), WS->getBody(), ParentScope);
+    return;
+  }
+
+  case Stmt::ForStmtClass: {
+    auto *FS = cast<ForStmt>(S);
+    if (!MatchTestExpr::containsCaseCondition(FS->getCond()))
+      break;
+    if (Stmt *Init = FS->getInit())
+      BuildScopeInformation(Init, ParentScope);
+    if (VarDecl *Var = FS->getConditionVariable())
+      BuildScopeInformation(Var, ParentScope);
+    BuildScopeInformation(FS->getCond(), ParentScope);
+    if (Expr *Increment = FS->getInc())
+      BuildScopeInformation(Increment, ParentScope);
+    BuildPatternConditionHandlers(FS->getCond(), FS->getBody(), ParentScope);
     return;
   }
 
@@ -496,6 +625,45 @@ void JumpScopeChecker::BuildScopeInformation(Stmt *S,
                                diag::note_enters_statement_expression,
                                /*OutDiag=*/0, SE->getBeginLoc()));
     BuildScopeInformation(SE->getSubStmt(), NewParentScope);
+    return;
+  }
+
+  case Stmt::DoExprClass: {
+    // Jumping into a do-expression with goto, or using a switch outside the
+    // do-expression with a case/default label inside it, is not permitted.
+    // Jumping out is permitted; the normal cleanup machinery handles it.
+    auto *DE = cast<DoExpr>(S);
+    unsigned NewParentScope = Scopes.size();
+    Scopes.push_back(GotoScope(ParentScope, diag::note_enters_do_expression,
+                               /*OutDiag=*/0, DE->getBeginLoc()));
+    if (DE->hasInitStmt())
+      BuildScopeInformation(DE->getInitStmt(), NewParentScope);
+    BuildScopeInformation(DE->getBody(), NewParentScope);
+    return;
+  }
+
+  case Stmt::MatchSelectExprClass: {
+    auto *ME = cast<MatchSelectExpr>(S);
+    if (Stmt *Init = ME->getInitStmt())
+      BuildScopeInformation(Init, ParentScope);
+    BuildScopeInformation(ME->getHoldingVar() && ME->getHoldingVar()->hasInit()
+                              ? ME->getHoldingVar()->getInit()
+                              : ME->getSubject(),
+                          ParentScope);
+    for (const MatchCase &Case : ME->getCases()) {
+      unsigned CaseScope = ParentScope;
+      if (Case.Guard.Init)
+        BuildScopeInformation(Case.Guard.Init, CaseScope);
+      if (Case.Guard.ConditionVariable)
+        BuildScopeInformation(Case.Guard.ConditionVariable, CaseScope);
+      if (Case.Guard.Condition)
+        BuildScopeInformation(Case.Guard.Condition, CaseScope);
+
+      unsigned HandlerScope = Scopes.size();
+      Scopes.emplace_back(CaseScope, diag::note_enters_match_handler,
+                          /*OutDiag=*/0, Case.Handler->getBeginLoc());
+      BuildScopeInformation(Case.Handler, HandlerScope);
+    }
     return;
   }
 

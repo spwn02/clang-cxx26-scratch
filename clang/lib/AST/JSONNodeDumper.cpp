@@ -1,3 +1,5 @@
+#include "clang/AST/Reflection.h"
+#include "clang/Lex/Token.h"
 #include "clang/AST/JSONNodeDumper.h"
 #include "clang/AST/Type.h"
 #include "clang/Basic/SourceManager.h"
@@ -222,8 +224,13 @@ void JSONNodeDumper::Visit(const concepts::Requirement *R) {
     break;
   }
 
-  if (auto *ER = dyn_cast<concepts::ExprRequirement>(R))
+  if (auto *ER = dyn_cast<concepts::ExprRequirement>(R)) {
     attributeOnlyIfTrue("noexcept", ER->hasNoexceptRequirement());
+    // P3822R2: noexcept(constant-expression); the condition is the child
+    // expression following the requirement's expression.
+    attributeOnlyIfTrue("noexceptCondition",
+                        ER->getNoexceptCondition() != nullptr);
+  }
 
   attributeOnlyIfTrue("isDependent", R->isDependent());
   if (!R->isDependent())
@@ -241,7 +248,8 @@ void JSONNodeDumper::Visit(const APValue &Value, QualType Ty) {
 
 void JSONNodeDumper::Visit(const ConceptReference *CR) {
   JOS.attribute("kind", "ConceptReference");
-  JOS.attribute("id", createPointerRepresentation(CR->getNamedConcept()));
+  JOS.attribute("id", createPointerRepresentation(
+                          getWrittenConceptDecl(CR->getNamedConcept())));
   if (const auto *Args = CR->getTemplateArgsAsWritten()) {
     JOS.attributeArray("templateArgsAsWritten", [Args, this] {
       for (const TemplateArgumentLoc &TAL : Args->arguments())
@@ -254,6 +262,10 @@ void JSONNodeDumper::Visit(const ConceptReference *CR) {
   JOS.attributeObject("range",
                       [CR, this] { writeSourceRange(CR->getSourceRange()); });
 }
+
+void JSONNodeDumper::VisitMatchTestExpr(const MatchTestExpr *Node) {}
+void JSONNodeDumper::VisitMatchSelectExpr(const MatchSelectExpr *Node) {}
+void JSONNodeDumper::Visit(const MatchPattern *Node) {}
 
 void JSONNodeDumper::writeIncludeStack(PresumedLoc Loc, bool JustFirst) {
   if (Loc.isInvalid())
@@ -1609,6 +1621,23 @@ void JSONNodeDumper::VisitCXXDefaultInitExpr(const CXXDefaultInitExpr *Node) {
 
 void JSONNodeDumper::VisitLambdaExpr(const LambdaExpr *LE) {
   JOS.attribute("hasExplicitParameters", LE->hasExplicitParameters());
+}
+
+void JSONNodeDumper::VisitCXXTokenSequenceExpr(const CXXTokenSequenceExpr *E) {
+  if (E->getValue().isTokenSequence()) {
+    TokenSequenceData TSD = E->getValue().getTokenSequence();
+    JOS.attribute("numTokens", static_cast<int64_t>(TSD.size()));
+    JOS.attribute("tokens", spellTokenSequence(TSD));
+  }
+  JOS.attribute("numInterpolations",
+                static_cast<int64_t>(E->getNumInterpolationExprs()));
+}
+
+void JSONNodeDumper::VisitDoExpr(const DoExpr *DE) {
+  attributeOnlyIfTrue("hasExplicitType", DE->hasExplicitType());
+  attributeOnlyIfTrue("hasInitStmt", DE->hasInitStmt());
+  if (const VarDecl *Cand = DE->getNRVOCandidate())
+    JOS.attribute("nrvoCandidate", createBareDeclRef(Cand));
 }
 
 void JSONNodeDumper::VisitCXXDependentScopeMemberExpr(

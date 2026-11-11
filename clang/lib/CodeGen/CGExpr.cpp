@@ -260,6 +260,19 @@ void CodeGenFunction::EmitIgnoredExpr(const Expr *E) {
   EmitLValue(E);
 }
 
+void CodeGenFunction::EmitDivergingExpr(const Expr *E) {
+  EmitIgnoredExpr(E);
+  EmitDivergencePoint();
+}
+
+void CodeGenFunction::EmitDivergencePoint() {
+  if (HaveInsertPoint()) {
+    Builder.CreateUnreachable();
+    Builder.ClearInsertionPoint();
+  }
+  EnsureInsertPoint();
+}
+
 /// EmitAnyExpr - Emit code to compute the specified expression which
 /// can have any type.  The result is returned as an RValue struct.
 /// If this is an aggregate expression, AggSlot indicates where the
@@ -566,10 +579,23 @@ EmitMaterializeTemporaryExpr(const MaterializeTemporaryExpr *M) {
   for (const auto &Ignored : CommaLHSs)
     EmitIgnoredExpr(Ignored);
 
+  // An OVE of record type that is already bound (e.g. the common expression of
+  // a GNU binary conditional) denotes an existing object, so just reuse it.  A
+  // unique OVE whose source is a prvalue -- as produced by interpolating an
+  // expression-macro argument -- has no binding yet, and its source cannot be
+  // emitted as an l-value.  Materialize such a source through the
+  // reference-temporary path below, which handles lifetime extension and the
+  // temporary's destructor, then bind the OVE to the resulting object so that
+  // any other reference to it denotes the same object.
+  const OpaqueValueExpr *OpaqueToBind = nullptr;
   if (const auto *opaque = dyn_cast<OpaqueValueExpr>(E)) {
     if (opaque->getType()->isRecordType()) {
       assert(Adjustments.empty());
-      return EmitOpaqueValueLValue(opaque);
+      const Expr *Src = opaque->getSourceExpr();
+      if (OpaqueLValues.count(opaque) || !Src || Src->isGLValue())
+        return EmitOpaqueValueLValue(opaque);
+      OpaqueToBind = opaque;
+      E = Src;
     }
   }
 
@@ -680,7 +706,10 @@ EmitMaterializeTemporaryExpr(const MaterializeTemporaryExpr *M) {
     }
   }
 
-  return MakeAddrLValue(Object, M->getType(), AlignmentSource::Decl);
+  LValue Result = MakeAddrLValue(Object, M->getType(), AlignmentSource::Decl);
+  if (OpaqueToBind)
+    OpaqueLValues.try_emplace(OpaqueToBind, Result);
+  return Result;
 }
 
 RValue
@@ -1755,6 +1784,9 @@ LValue CodeGenFunction::EmitLValueHelper(const Expr *E,
   }
   case Expr::ParenExprClass:
     return EmitLValue(cast<ParenExpr>(E)->getSubExpr(), IsKnownNonNull);
+  case Expr::CXXMacroInvocationExprClass:
+    return EmitLValue(cast<CXXMacroInvocationExpr>(E)->getExpansion(),
+                      IsKnownNonNull);
   case Expr::GenericSelectionExprClass:
     return EmitLValue(cast<GenericSelectionExpr>(E)->getResultExpr(),
                       IsKnownNonNull);
@@ -1816,6 +1848,10 @@ LValue CodeGenFunction::EmitLValueHelper(const Expr *E,
     return EmitObjCIvarRefLValue(cast<ObjCIvarRefExpr>(E));
   case Expr::StmtExprClass:
     return EmitStmtExprLValue(cast<StmtExpr>(E));
+  case Expr::DoExprClass:
+    return EmitDoExprLValue(cast<DoExpr>(E));
+  case Expr::MatchSelectExprClass:
+    return EmitMatchSelectExprLValue(cast<MatchSelectExpr>(E));
   case Expr::UnaryOperatorClass:
     return EmitUnaryOpLValue(cast<UnaryOperator>(E));
   case Expr::ArraySubscriptExprClass:
@@ -5787,6 +5823,18 @@ static std::optional<LValue> EmitLValueOrThrowExpression(CodeGenFunction &CGF,
     return std::nullopt;
   }
 
+  // Likewise any diverging operand (P3549), which Sema converted to the
+  // other operand's type: there is no lvalue to merge.
+  if (auto *CE = dyn_cast<CastExpr>(Operand->IgnoreParens());
+      CE && CE->getCastKind() == CK_NoReturnToAny) {
+    CGF.EmitIgnoredExpr(CE->getSubExpr());
+    if (CGF.HaveInsertPoint()) {
+      CGF.Builder.CreateUnreachable();
+      CGF.Builder.ClearInsertionPoint();
+    }
+    return std::nullopt;
+  }
+
   return CGF.EmitLValue(Operand);
 }
 
@@ -5937,6 +5985,17 @@ LValue CodeGenFunction::EmitCastLValue(const CastExpr *E) {
   llvm::scope_exit RestoreCurCast([this, Prev = CurCast] { CurCast = Prev; });
   CurCast = E;
   switch (E->getCastKind()) {
+  case CK_NoReturnToAny: {
+    // A reference bound to a diverging expression (P3549): the operand never
+    // completes, so there is no object to refer to.
+    EmitDivergingExpr(E->getSubExpr());
+    QualType T = E->getType();
+    return MakeAddrLValue(
+        Address(llvm::PoisonValue::get(
+                    llvm::PointerType::getUnqual(getLLVMContext())),
+                ConvertTypeForMem(T), getContext().getTypeAlignInChars(T)),
+        T);
+  }
   case CK_ToVoid:
   case CK_BitCast:
   case CK_LValueToRValueBitCast:
@@ -5987,6 +6046,8 @@ LValue CodeGenFunction::EmitCastLValue(const CastExpr *E) {
   case CK_HLSLArrayRValue:
   case CK_HLSLElementwiseCast:
   case CK_HLSLAggregateSplatCast:
+  case CK_TokenArrayToSequence:
+  case CK_SequenceToTokenArray:
     return EmitUnsupportedLValue(E, "unexpected cast lvalue");
 
   case CK_Dependent:

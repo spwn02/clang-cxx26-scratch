@@ -10,6 +10,7 @@
 // representation that identifies a statement/expression.
 //
 //===----------------------------------------------------------------------===//
+#include "clang/Lex/Token.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclObjC.h"
@@ -39,6 +40,7 @@ namespace {
     virtual ~StmtProfiler() {}
 
     void VisitStmt(const Stmt *S);
+    void VisitMatchPattern(const MatchPattern *P);
 
     void VisitStmtNoChildren(const Stmt *S) {
       HandleStmtClass(S->getStmtClass());
@@ -255,6 +257,63 @@ void StmtProfiler::VisitStmt(const Stmt *S) {
     else
       ID.AddInteger(0);
   }
+}
+
+void StmtProfiler::VisitMatchPattern(const MatchPattern *P) {
+  ID.AddInteger(P->getMatchPatternClass());
+  switch (P->getMatchPatternClass()) {
+  case MatchPattern::WildcardPatternClass:
+    ID.AddBoolean(static_cast<const WildcardPattern *>(P)->isPackExpansion());
+    return;
+  case MatchPattern::ExpressionPatternClass: {
+    const auto *EP = static_cast<const ExpressionPattern *>(P);
+    ID.AddBoolean(EP->isPackExpansion());
+    Visit(EP->getExpr());
+    return;
+  }
+  case MatchPattern::ParenPatternClass:
+    VisitMatchPattern(static_cast<const ParenPattern *>(P)->getSubPattern());
+    return;
+  case MatchPattern::DeclarationPatternClass:
+    VisitType(static_cast<const DeclarationPattern *>(P)
+                  ->getDeclaration()
+                  ->getType());
+    return;
+  case MatchPattern::TypePatternClass:
+    VisitType(static_cast<const TypePattern *>(P)->getType());
+    return;
+  case MatchPattern::OrPatternClass: {
+    const auto *OP = static_cast<const OrPattern *>(P);
+    ID.AddInteger(OP->alternatives().size());
+    for (const MatchPattern *Alternative : OP->alternatives())
+      VisitMatchPattern(Alternative);
+    return;
+  }
+  case MatchPattern::AlternativePatternClass: {
+    const auto *AP = static_cast<const AlternativePattern *>(P);
+    ID.AddInteger(AP->getAlternativeKind());
+    VisitIdentifierInfo(AP->getName());
+    if (const ConceptReference *Constraint = AP->getTypeConstraintSelector()) {
+      VisitTemplateName(TemplateName(Constraint->getNamedConcept()));
+      if (const ASTTemplateArgumentListInfo *Args =
+              Constraint->getTemplateArgsAsWritten())
+        VisitTemplateArguments(Args->getTemplateArgs(), Args->NumTemplateArgs);
+    }
+    if (AP->getSelector())
+      VisitMatchPattern(AP->getSelector());
+    if (AP->getSubPattern())
+      VisitMatchPattern(AP->getSubPattern());
+    return;
+  }
+  case MatchPattern::DecompositionPatternClass: {
+    const auto *DP = static_cast<const DecompositionPattern *>(P);
+    ID.AddInteger(DP->getNumPatterns());
+    for (const MatchPattern *Child : DP->children())
+      VisitMatchPattern(Child);
+    return;
+  }
+  }
+  llvm_unreachable("unknown match pattern kind");
 }
 
 void StmtProfiler::VisitDeclStmt(const DeclStmt *S) {
@@ -1606,6 +1665,14 @@ void StmtProfiler::VisitStmtExpr(const StmtExpr *S) {
   VisitExpr(S);
 }
 
+void StmtProfiler::VisitDoExpr(const DoExpr *S) {
+  VisitExpr(S);
+  ID.AddBoolean(S->hasInitStmt());
+  ID.AddBoolean(S->hasExplicitType());
+  if (S->hasExplicitType())
+    VisitType(S->getExplicitType()->getType());
+}
+
 void StmtProfiler::VisitShuffleVectorExpr(const ShuffleVectorExpr *S) {
   VisitExpr(S);
 }
@@ -1719,7 +1786,7 @@ void StmtProfiler::VisitAtomicExpr(const AtomicExpr *S) {
 void StmtProfiler::VisitConceptSpecializationExpr(
                                            const ConceptSpecializationExpr *S) {
   VisitExpr(S);
-  VisitDecl(S->getNamedConcept());
+  VisitTemplateName(S->getNamedConcept());
   for (const TemplateArgument &Arg : S->getTemplateArguments())
     VisitTemplateArgument(Arg);
 }
@@ -1746,6 +1813,9 @@ void StmtProfiler::VisitRequiresExpr(const RequiresExpr *S) {
       //    expression. It is equivalent to the simple-requirement x++; [...]
       // We therefore do not profile isSimple() here.
       ID.AddBoolean(ExprReq->getNoexceptLoc().isValid());
+      ID.AddBoolean(ExprReq->getNoexceptCondition() != nullptr);
+      if (ExprReq->getNoexceptCondition())
+        Visit(ExprReq->getNoexceptCondition());
       const concepts::ExprRequirement::ReturnTypeRequirement &RetReq =
           ExprReq->getReturnTypeRequirement();
       if (RetReq.isEmpty()) {
@@ -2422,6 +2492,10 @@ void StmtProfiler::VisitCoreturnStmt(const CoreturnStmt *S) {
   VisitStmt(S);
 }
 
+void StmtProfiler::VisitDoReturnStmt(const DoReturnStmt *S) {
+  VisitStmt(S);
+}
+
 void StmtProfiler::VisitCoawaitExpr(const CoawaitExpr *S) {
   VisitExpr(S);
 }
@@ -2450,8 +2524,79 @@ void StmtProfiler::VisitCXXReflectExpr(const CXXReflectExpr *E) {
   }
 }
 
+void StmtProfiler::VisitCXXTokenSequenceExpr(const CXXTokenSequenceExpr *E) {
+  VisitExpr(E);
+  // The tokens by what they spell. (Not APValue::Profile: it keeps the
+  // annotation values of interpolations by address, which differ from one
+  // translation unit or module to the next for the same literal. An
+  // interpolation's expression is a child, profiled with the others.)
+  TokenSequenceData TSD = E->getTokenSequence();
+  ID.AddInteger(TSD.size());
+  for (const Token &Tok : TSD) {
+    ID.AddInteger(Tok.getKind());
+    if (Tok.isAnnotation())
+      continue;
+    if (Tok.isLiteral() && Tok.getLiteralData())
+      ID.AddString(StringRef(Tok.getLiteralData(), Tok.getLength()));
+    else if (Tok.is(tok::raw_identifier))
+      ID.AddString(Tok.getRawIdentifier());
+    else if (const IdentifierInfo *II = Tok.getIdentifierInfo())
+      ID.AddString(II->getName());
+  }
+  // The tokens that name a parameter: which token, which parameter.
+  ID.AddInteger(E->getParamBindings().size());
+  for (const TokenSequenceParamBinding &B : E->getParamBindings()) {
+    ID.AddInteger(B.TokenIndex);
+    VisitDecl(B.Param);
+  }
+}
+
 void StmtProfiler::VisitCXXMetafunctionExpr(const CXXMetafunctionExpr *E) {
   VisitExpr(E);
+}
+
+void StmtProfiler::VisitCXXBuiltinInjectExpr(const CXXBuiltinInjectExpr *E) {
+  VisitExpr(E);
+}
+
+void StmtProfiler::VisitCXXBuiltinReportTokensExpr(
+    const CXXBuiltinReportTokensExpr *E) {
+  VisitExpr(E);
+}
+
+void StmtProfiler::VisitCXXTokenInterpolationListExpr(
+    const CXXTokenInterpolationListExpr *E) {
+  VisitExpr(E);
+}
+
+void StmtProfiler::VisitCXXBuiltinIdExpr(const CXXBuiltinIdExpr *E) {
+  VisitExpr(E);
+}
+
+void StmtProfiler::VisitCXXBuiltinStrLiteralExpr(
+    const CXXBuiltinStrLiteralExpr *E) {
+  VisitExpr(E);
+}
+
+void StmtProfiler::VisitCXXBuiltinTokenizeExpr(
+    const CXXBuiltinTokenizeExpr *E) {
+  VisitExpr(E);
+}
+
+void StmtProfiler::VisitCXXBuiltinStringizeExpr(
+    const CXXBuiltinStringizeExpr *E) {
+  VisitExpr(E);
+}
+
+void StmtProfiler::VisitCXXMacroInvocationExpr(
+    const CXXMacroInvocationExpr *E) {
+  VisitExpr(E);
+  ID.AddBoolean(E->isResolved());
+  ID.AddBoolean(E->areArgsUnparsed());
+  if (E->isMemberInvocation()) {
+    ID.AddBoolean(E->isArrow());
+    VisitName(E->getMemberNameInfo().getName());
+  }
 }
 
 void StmtProfiler::VisitCXXSpliceExpr(const CXXSpliceExpr *E) {
@@ -2670,6 +2815,58 @@ void StmtProfiler::VisitTemplateArgument(const TemplateArgument &Arg) {
     for (const auto &P : Arg.pack_elements())
       VisitTemplateArgument(P);
     break;
+  }
+}
+
+void StmtProfiler::VisitMatchTestExpr(const MatchTestExpr *S) {
+  VisitStmt(S);
+  Visit(S->getHoldingVar() && S->getHoldingVar()->getInit()
+            ? S->getHoldingVar()->getInit()
+            : S->getSubject());
+  VisitMatchPattern(S->getPattern());
+  const MatchGuard &Guard = S->getGuard();
+  ID.AddBoolean(Guard.Init);
+  if (Guard.Init)
+    Visit(Guard.Init);
+  VisitDecl(Guard.ConditionVariable);
+  ID.AddBoolean(Guard.Condition);
+  if (Guard.Condition)
+    Visit(Guard.Condition);
+  ID.AddBoolean(S->needsCaseInstantiation());
+  ID.AddBoolean(S->hasSemanticInstantiations());
+  ID.AddBoolean(S->hasSubjectProduct());
+}
+
+void StmtProfiler::VisitCaseConditionExpr(const CaseConditionExpr *S) {
+  VisitMatchTestExpr(S);
+}
+
+void StmtProfiler::VisitMatchSelectExpr(const MatchSelectExpr *S) {
+  VisitStmt(S);
+  ID.AddBoolean(S->getInitStmt());
+  if (S->getInitStmt())
+    Visit(S->getInitStmt());
+  Visit(S->getHoldingVar() && S->getHoldingVar()->getInit()
+            ? S->getHoldingVar()->getInit()
+            : S->getSubject());
+  VisitType(S->getType());
+  ID.AddBoolean(S->isConstexpr());
+  ID.AddBoolean(S->isStatement());
+  ID.AddInteger(S->getNumPreambleStatements());
+  for (const Stmt *Statement : S->getPreamble())
+    Visit(Statement);
+  ID.AddInteger(S->getNumCases());
+  for (const MatchCase &Case : S->getCases()) {
+    VisitMatchPattern(Case.Pattern);
+    ID.AddBoolean(Case.Guard.Init);
+    if (Case.Guard.Init)
+      Visit(Case.Guard.Init);
+    VisitDecl(Case.Guard.ConditionVariable);
+    ID.AddBoolean(Case.Guard.Condition);
+    if (Case.Guard.Condition)
+      Visit(Case.Guard.Condition);
+    ID.AddBoolean(Case.isNonReturning());
+    Visit(Case.Handler);
   }
 }
 

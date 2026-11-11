@@ -37,6 +37,9 @@
 #ifndef COROUTINES_KEYWORD
 #define COROUTINES_KEYWORD(X) CXX20_KEYWORD(X,KEYCOROUTINES)
 #endif
+#ifndef DOEXPR_KEYWORD
+#define DOEXPR_KEYWORD(X) KEYWORD(X,KEYDOEXPR)
+#endif
 #ifndef MODULES_KEYWORD
 #define MODULES_KEYWORD(X) KEYWORD(X,KEYMODULES)
 #endif
@@ -260,6 +263,9 @@ PUNCTUATOR(coloncolon,          "::")
 PUNCTUATOR(l_splice,            "[:")
 PUNCTUATOR(r_splice,            ":]")
 
+// C++ Pattern Matching
+PUNCTUATOR(equalgreater,        "=>")
+
 // Objective C support.
 PUNCTUATOR(at,                  "@")
 
@@ -443,10 +449,13 @@ CXX20_KEYWORD(requires              , 0)
 
 // C++26 reflection keyword.
 KEYWORD(__metafunction              , KEYREFLECT)
+KEYWORD(__macro                     , KEYTOKENINJ)
 
 // C++ contracts keywords
 CONTRACTS_KEYWORD(contract_assert)
 ALIAS("__contract_assert"        , contract_assert      , KEYCXX11)
+// do-expressions keyword.
+DOEXPR_KEYWORD(do_return)
 
 // Not a CXX20_KEYWORD because it is disabled by -fno-char8_t.
 KEYWORD(char8_t                     , CHAR8SUPPORT)
@@ -919,6 +928,20 @@ ANNOTATION(pack_indexing_type) // annotation for an indexed pack of type,
 ANNOTATION(splice)       // annotation for a splice specifier
 ANNOTATION(splice_specialization) // annotation for a splice specialization
                                   // specifier
+ANNOTATION(token_seq_expr) // annotation for an interpolation expression \(e)
+ANNOTATION(template_name)  // annotation for a template named by an
+                           // interpolated reflection; the annotation value
+                           // is a TemplateName. Followed by '<' it forms a
+                           // template-id like an identifier would.
+                           // captured in a ^^{ ... } token sequence
+ANNOTATION(decl_spec)      // annotation for an interpolated declaration
+ANNOTATION(template_param_spec) // annotation for interpolated cloned template
+                                // parameters inside a template<...> list
+                           // description (std::meta::declaration_of); the
+                           // annotation value is a FunctionDeclSpec. In
+                           // member-declaration position it declares the
+                           // described function, optionally followed by a
+                           // body.
 
 // Annotation for #pragma unused(...)
 // For each argument inside the parentheses the pragma handler will produce

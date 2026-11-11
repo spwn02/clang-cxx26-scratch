@@ -90,6 +90,7 @@ template <> struct DenseMapInfo<ScalableVecTyKey> {
 namespace clang {
 
 class APValue;
+struct TokenSequenceStorageState;
 class ASTMutationListener;
 class ASTRecordLayout;
 class AtomicExpr;
@@ -309,6 +310,8 @@ class ASTContext : public RefCountedBase<ASTContext> {
     SubstTemplateTemplateParmPacks;
   mutable llvm::ContextualFoldingSet<DeducedTemplateStorage, ASTContext &>
       DeducedTemplates;
+  mutable llvm::ContextualFoldingSet<PackIndexingTemplateStorage, ASTContext &>
+      PackIndexingTemplates;
 
   mutable llvm::ContextualFoldingSet<ArrayParameterType, ASTContext &>
       ArrayParameterTypes;
@@ -1323,7 +1326,8 @@ public:
   CanQualType Float16Ty; // C11 extension ISO/IEC TS 18661-3
   CanQualType Float32Ty, Float64Ty; // C++23 std::float32_t/std::float64_t
   CanQualType VoidPtrTy, NullPtrTy;
-  CanQualType MetaInfoTy;
+  CanQualType MetaInfoTy, TokenSequenceTy, MetaTokenTy;
+  CanQualType NoReturnTy; // std::noreturn_t (P3549)
   CanQualType DependentTy, OverloadTy, BoundMemberTy, UnresolvedTemplateTy,
       UnknownAnyTy;
   CanQualType BuiltinFnTy;
@@ -1855,7 +1859,7 @@ private:
   QualType
   getAutoTypeInternal(QualType DeducedType, AutoTypeKeyword Keyword,
                       bool IsDependent, bool IsPack = false,
-                      TemplateDecl *TypeConstraintConcept = nullptr,
+                      TemplateName TypeConstraintConcept = TemplateName(),
                       ArrayRef<TemplateArgument> TypeConstraintArgs = {},
                       bool IsCanon = false) const;
 
@@ -2096,7 +2100,7 @@ public:
   QualType
   getAutoType(QualType DeducedType, AutoTypeKeyword Keyword, bool IsDependent,
               bool IsPack = false,
-              TemplateDecl *TypeConstraintConcept = nullptr,
+              TemplateName TypeConstraintConcept = TemplateName(),
               ArrayRef<TemplateArgument> TypeConstraintArgs = {}) const;
 
   /// C++11 deduction pattern for 'auto' type.
@@ -2623,6 +2627,11 @@ public:
                                                 Decl *AssociatedDecl,
                                                 unsigned Index,
                                                 bool Final) const;
+
+  TemplateName
+  getPackIndexingTemplateName(TemplateName Pattern, Expr *IndexExpr,
+                              bool FullySubstituted = false,
+                              ArrayRef<TemplateName> Expansions = {}) const;
 
   /// Represents a TemplateName which had some of its default arguments
   /// deduced. This both represents this default argument deduction as sugar,
@@ -3640,6 +3649,11 @@ public:
   UnnamedGlobalConstantDecl *
   getUnnamedGlobalConstantDecl(QualType Ty, const APValue &Value) const;
 
+  /// A new unnamed global constant of type \p Ty with value \p Value, not
+  /// shared with any other (getUnnamedGlobalConstantDecl interns by value).
+  UnnamedGlobalConstantDecl *
+  createUniqueUnnamedGlobalConstantDecl(QualType Ty, const APValue &Value) const;
+
   /// Return the template parameter object of the given type with the given
   /// value.
   TemplateParamObjectDecl *getTemplateParamObjectDecl(QualType T,
@@ -3893,6 +3907,20 @@ private:
   SmallVector<std::unique_ptr<OMPTraitInfo>, 4> OMPTraitInfoVector;
 
   llvm::DenseMap<GlobalDecl, llvm::StringSet<>> ThunksToBeAbbreviated;
+
+  /// Bookkeeping for token sequences (P4380; see AST/Reflection.cpp), made on
+  /// first use. It is per context because it names storage this context
+  /// allocated: a process serving several contexts (clangd, libclang),
+  /// possibly on several threads, must not share it. (Kept last, and out of
+  /// line, so that it does not disturb the layout of the members above.)
+  struct TokenSequenceStorageDeleter {
+    void operator()(TokenSequenceStorageState *P) const;
+  };
+  std::unique_ptr<TokenSequenceStorageState, TokenSequenceStorageDeleter>
+      TokenSequenceStorage;
+
+public:
+  TokenSequenceStorageState &getTokenSequenceStorage();
 };
 
 /// Insertion operator for diagnostics.

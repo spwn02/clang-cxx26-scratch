@@ -50,6 +50,7 @@
 #include "clang/Sema/SemaSYCL.h"
 #include "clang/Sema/Template.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include <algorithm>
@@ -58,6 +59,19 @@
 using namespace llvm::omp;
 
 namespace clang {
+
+/// The conversion between a token array and std::meta::token_sequence among
+/// the implicit conversions that \p E is (and its operand is, ...), if any:
+/// analysis does not recompute one, so transforming must keep it (P4380).
+inline ImplicitCastExpr *findTokenSequenceCast(Expr *E) {
+  while (auto *ICE = dyn_cast<ImplicitCastExpr>(E)) {
+    if (ICE->getCastKind() == CK_TokenArrayToSequence ||
+        ICE->getCastKind() == CK_SequenceToTokenArray)
+      return ICE;
+    E = ICE->getSubExpr();
+  }
+  return nullptr;
+}
 using namespace sema;
 
 // This helper class is used to facilitate pack expansion during tree transform.
@@ -560,6 +574,16 @@ public:
     TransformedLocalDecls[Old] = New.front();
   }
 
+  void remapTransformedLocalDecl(Decl *Old, Decl *New) {
+    TransformedLocalDecls[Old] = New;
+  }
+
+  void remapTransformedLocalDeclPack(Decl *Old, ArrayRef<ValueDecl *> New) {
+    assert(New.size() == 1 &&
+           "base tree transform cannot represent a local declaration pack");
+    TransformedLocalDecls[Old] = New.front();
+  }
+
   /// Transform the definition of the given declaration.
   ///
   /// By default, invokes TransformDecl() to transform the declaration.
@@ -641,6 +665,9 @@ public:
                                      QualType ObjectType = QualType(),
                                      NamedDecl *FirstQualifierInScope = nullptr,
                                      bool AllowInjectedClassName = false);
+
+  TemplateName TransformConceptTemplateName(TemplateName Name,
+                                            SourceLocation NameLoc);
 
   /// Transform the given template argument.
   ///
@@ -856,6 +883,17 @@ public:
 
   ExprResult TransformAddressOfOperand(Expr *E);
 
+  /// Parse the arguments of \p E, captured as tokens, according to the now
+  /// known shape \p RawParams, and transform them.
+  bool TransformDeferredMacroArguments(ArrayRef<MacroParamKind> RawParams,
+                                       CXXMacroInvocationExpr *E,
+                                       SmallVectorImpl<Expr *> &Args);
+  /// Give \p New, a rebuilt invocation of still unknown shape, the
+  /// environment its arguments are to be parsed in: the context being
+  /// transformed into, with the template parameters of \p Old that remain.
+  void TransformUnparsedMacroEnvironment(CXXMacroInvocationExpr *Old,
+                                         CXXMacroInvocationExpr *New);
+
   ExprResult TransformDependentScopeDeclRefExpr(DependentScopeDeclRefExpr *E,
                                                 bool IsAddressOfOperand,
                                                 TypeSourceInfo **RecoveryTSI);
@@ -884,6 +922,33 @@ public:
   ExprResult Transform##Node(Node *E);
 #define ABSTRACT_STMT(Stmt)
 #include "clang/AST/StmtNodes.inc"
+
+  struct CaseConditionTransformResult {
+    Expr *Condition = nullptr;
+    Stmt *Handler = nullptr;
+    Expr *Increment = nullptr;
+    bool Invalid = false;
+  };
+
+  struct CaseConditionElement {
+    Expr *Condition;
+    SourceLocation AndLoc;
+  };
+
+  ExprResult
+  TransformMatchTestExpr(MatchTestExpr *E, Stmt *Handler, Expr *Increment,
+                         bool SelectConstexprHandler = false,
+                         ArrayRef<CaseConditionElement> Continuation = {},
+                         Stmt **SelectedHandler = nullptr,
+                         Expr **SelectedIncrement = nullptr,
+                         Expr *ConstexprPrefix = nullptr);
+
+  CaseConditionTransformResult TransformCaseConditionChain(
+      ArrayRef<CaseConditionElement> Elements, Stmt *Handler, Expr *Increment,
+      bool SelectConstexprHandler = false, Expr *ConstexprPrefix = nullptr);
+  CaseConditionTransformResult
+  TransformCaseConditionChain(Expr *Condition, Stmt *Handler, Expr *Increment,
+                              bool SelectConstexprHandler = false);
 
 #define GEN_CLANG_CLAUSE_CLASS
 #define CLAUSE_CLASS(Enum, Str, Class)                                         \
@@ -1152,7 +1217,7 @@ public:
   ///
   /// By default, builds a new AutoType with the given deduced type.
   QualType RebuildAutoType(QualType Deduced, AutoTypeKeyword Keyword,
-                           ConceptDecl *TypeConstraintConcept,
+                           TemplateName TypeConstraintConcept,
                            ArrayRef<TemplateArgument> TypeConstraintArgs) {
     // Note, IsDependent is always false here: we implicitly convert an 'auto'
     // which has been deduced to a dependent type into an undeduced 'auto', so
@@ -1367,6 +1432,18 @@ public:
                                    bool Final) {
     return getSema().Context.getSubstTemplateTemplateParmPack(
         ArgPack, AssociatedDecl, Index, Final);
+  }
+
+  /// Build a new pack-index-template-name ([temp.names]).
+  ///
+  /// By default, performs semantic analysis to build the new template name.
+  /// Subclasses may override this routine to provide different behavior.
+  TemplateName
+  RebuildPackIndexingTemplateName(TemplateName Pattern, Expr *IndexExpr,
+                                  bool FullySubstituted,
+                                  ArrayRef<TemplateName> Expansions = {}) {
+    return getSema().BuildPackIndexingTemplateName(
+        Pattern, IndexExpr, FullySubstituted, Expansions);
   }
 
   /// Build a new compound statement.
@@ -3223,6 +3300,21 @@ public:
                                    TemplateDepth);
   }
 
+  /// Build a new do-expression.
+  ExprResult RebuildDoExpr(SourceLocation DoLoc, SourceLocation LBraceLoc,
+                           Stmt *InitStmt, Stmt *Body,
+                           SourceLocation RBraceLoc,
+                           TypeSourceInfo *ExplicitType,
+                           unsigned TemplateDepth) {
+    return getSema().BuildDoExpr(DoLoc, LBraceLoc, InitStmt, Body, RBraceLoc,
+                                 ExplicitType, TemplateDepth);
+  }
+
+  /// Build a new do_return statement.
+  StmtResult RebuildDoReturnStmt(SourceLocation DoReturnLoc, Expr *Operand) {
+    return getSema().BuildDoReturnStmt(DoReturnLoc, Operand);
+  }
+
   /// Build a new __builtin_choose_expr expression.
   ///
   /// By default, performs semantic analysis to build the new expression.
@@ -3843,16 +3935,17 @@ public:
   concepts::ExprRequirement *
   RebuildExprRequirement(
       concepts::Requirement::SubstitutionDiagnostic *SubstDiag, bool IsSimple,
-      SourceLocation NoexceptLoc,
+      SourceLocation NoexceptLoc, Expr *NoexceptCond,
       concepts::ExprRequirement::ReturnTypeRequirement Ret) {
     return SemaRef.BuildExprRequirement(SubstDiag, IsSimple, NoexceptLoc,
-                                        std::move(Ret));
+                                        NoexceptCond, std::move(Ret));
   }
 
   concepts::ExprRequirement *
   RebuildExprRequirement(Expr *E, bool IsSimple, SourceLocation NoexceptLoc,
+                         Expr *NoexceptCond,
                          concepts::ExprRequirement::ReturnTypeRequirement Ret) {
-    return SemaRef.BuildExprRequirement(E, IsSimple, NoexceptLoc,
+    return SemaRef.BuildExprRequirement(E, IsSimple, NoexceptLoc, NoexceptCond,
                                         std::move(Ret));
   }
 
@@ -4351,6 +4444,379 @@ public:
         AssociatedDecl, NTTP, Loc, Arg, PackIndex, Final);
   }
 
+  void
+  RemapSelectedOrPatternBindings(MatchPattern *Source,
+                                 MatchPattern *Transformed,
+                                 const Sema::MatchPatternState &PatternState) {
+    auto CollectSourceBindings = [&](MatchPattern *Pattern,
+                                     SmallVectorImpl<ValueDecl *> &Bindings,
+                                     auto &Recurse) -> void {
+      if (auto *Or = dyn_cast<OrPattern>(Pattern)) {
+        llvm::append_range(Bindings, Or->bindings());
+        return;
+      }
+      for (MatchPattern *Child : Pattern->children())
+        Recurse(Child, Bindings, Recurse);
+    };
+    auto CollectSelectedBindings = [&](MatchPattern *Pattern,
+                                       SmallVectorImpl<ValueDecl *> &Bindings,
+                                       auto &Recurse) -> void {
+      if (auto *Declaration = dyn_cast<DeclarationPattern>(Pattern)) {
+        VarDecl *Variable = Declaration->getDeclaration();
+        if (auto *Decomposition = dyn_cast<DecompositionDecl>(Variable)) {
+          for (BindingDecl *Binding : Decomposition->leaf_bindings()) {
+            if (!Binding->getDeclName())
+              continue;
+            if (Binding->isParameterPack() && Binding->getBinding())
+              llvm::append_range(Bindings, Binding->getBindingPackDecls());
+            else
+              Bindings.push_back(Binding);
+          }
+        } else if (Variable->getDeclName()) {
+          Bindings.push_back(Variable);
+        }
+        return;
+      }
+
+      if (auto *Or = dyn_cast<OrPattern>(Pattern)) {
+        unsigned Selected = 0;
+        if (const MatchPatternInfo *Info = PatternState.find(Or))
+          for (auto [I, Viable] : llvm::enumerate(Info->ViableOrAlternatives))
+            if (Viable) {
+              Selected = I;
+              break;
+            }
+        Recurse(Or->alternatives()[Selected], Bindings, Recurse);
+        return;
+      }
+
+      if (auto *Decomposition = dyn_cast<DecompositionPattern>(Pattern)) {
+        if (const MatchPatternInfo *Info = PatternState.find(Decomposition);
+            Info && Info->HasExpandedPatterns) {
+          for (MatchPattern *Child : Info->ExpandedPatterns)
+            Recurse(Child, Bindings, Recurse);
+          return;
+        }
+      }
+
+      for (MatchPattern *Child : Pattern->children())
+        Recurse(Child, Bindings, Recurse);
+    };
+
+    SmallVector<ValueDecl *, 4> SourceBindings;
+    SmallVector<ValueDecl *, 4> SelectedBindings;
+    CollectSourceBindings(Source, SourceBindings, CollectSourceBindings);
+    if (SourceBindings.empty())
+      return;
+    CollectSelectedBindings(Transformed, SelectedBindings,
+                            CollectSelectedBindings);
+    for (ValueDecl *SourceBinding : SourceBindings) {
+      if (SourceBinding->isParameterPack()) {
+        SmallVector<ValueDecl *, 4> Elements;
+        for (ValueDecl *SelectedBinding : SelectedBindings)
+          if (SelectedBinding->getDeclName() == SourceBinding->getDeclName())
+            Elements.push_back(SelectedBinding);
+        getDerived().remapTransformedLocalDeclPack(SourceBinding, Elements);
+      } else {
+        auto Selected =
+            llvm::find_if(SelectedBindings, [&](ValueDecl *Binding) {
+              return Binding->getDeclName() == SourceBinding->getDeclName();
+            });
+        assert(Selected != SelectedBindings.end() &&
+               "or-pattern binding missing after transformation");
+        getDerived().remapTransformedLocalDecl(SourceBinding, *Selected);
+      }
+    }
+  }
+
+  ActionResult<MatchPattern *> TransformPattern(MatchPattern *Pattern,
+                                                bool Rebuild) {
+    switch (Pattern->getMatchPatternClass()) {
+    case MatchPattern::WildcardPatternClass:
+      return Pattern;
+    case MatchPattern::ExpressionPatternClass: {
+      ExpressionPattern *P = static_cast<ExpressionPattern *>(Pattern);
+      ExprResult E = getDerived().TransformExpr(P->getExpr());
+      if (E.isInvalid())
+        return true;
+      if (E.get() == P->getExpr())
+        return Pattern;
+      return getSema().ActOnExpressionPattern(E.get());
+    }
+    case MatchPattern::ParenPatternClass: {
+      auto *P = static_cast<ParenPattern *>(Pattern);
+      ActionResult<MatchPattern *> Sub =
+          TransformPattern(P->getSubPattern(), Rebuild);
+      if (Sub.isInvalid())
+        return true;
+      if (!Rebuild && Sub.get() == P->getSubPattern())
+        return Pattern;
+      return getSema().ActOnParenPattern(P->getParens(), Sub.get());
+    }
+    case MatchPattern::DeclarationPatternClass: {
+      auto *P = static_cast<DeclarationPattern *>(Pattern);
+      // A declaration subpattern pack is expanded after the enclosing
+      // decomposition's arity is known. Give each semantic candidate its own
+      // wrapper declaration while retaining the source declaration used to
+      // transform references into the resulting local declaration pack.
+      if (P->getDeclaration()->isParameterPack()) {
+        VarDecl *Old = P->getDeclaration();
+        VarDecl *VD = VarDecl::Create(
+            getSema().Context, getSema().CurContext, Old->getInnerLocStart(),
+            Old->getLocation(), Old->getIdentifier(), Old->getType(),
+            Old->getTypeSourceInfo(), Old->getStorageClass());
+        if (Old->isImplicit())
+          VD->setImplicit();
+        if (Old->hasAttrs())
+          VD->setAttrs(Old->getAttrs());
+        return getSema().ActOnDeclarationPattern(VD, P->getSourceRange(),
+                                                 P->getPackSourceDeclaration());
+      }
+      // A declaration pattern has no source initializer. Its current
+      // initializer was synthesized by semantic pattern checking and may
+      // refer to projections from a previous instantiation. Transform only
+      // the source declaration; CheckCompleteMatchPattern will synthesize the
+      // initializer for the transformed subject. A decomposition declaration
+      // retains its initializer because its binding-pack transformation needs
+      // the initialized decomposition type.
+      Expr *PatternInit = P->getDeclaration()->getInit();
+      bool ClearPatternInit = !isa<DecompositionDecl>(P->getDeclaration());
+      if (ClearPatternInit)
+        P->getDeclaration()->setInit(nullptr);
+      auto RestorePatternInit = llvm::scope_exit([&] {
+        if (ClearPatternInit)
+          P->getDeclaration()->setInit(PatternInit);
+      });
+      auto *VD = dyn_cast_or_null<VarDecl>(getDerived().TransformDefinition(
+          P->getBeginLoc(), P->getDeclaration()));
+      if (!VD)
+        return true;
+      if (!Rebuild && VD == P->getDeclaration())
+        return Pattern;
+      VarDecl *PackSource = P->getPackSourceDeclaration();
+      if (PackSource == P->getDeclaration())
+        PackSource = nullptr;
+      return getSema().ActOnDeclarationPattern(VD, P->getSourceRange(),
+                                               PackSource);
+    }
+    case MatchPattern::TypePatternClass: {
+      auto *P = static_cast<TypePattern *>(Pattern);
+      TypeSourceInfo *TInfo =
+          getDerived().TransformType(P->getTypeSourceInfo());
+      if (!TInfo)
+        return true;
+      if (TInfo == P->getTypeSourceInfo())
+        return Pattern;
+      return getSema().ActOnTypePattern(TInfo);
+    }
+    case MatchPattern::OrPatternClass: {
+      auto *P = static_cast<OrPattern *>(Pattern);
+      SmallVector<MatchPattern *, 4> Alternatives;
+      Alternatives.reserve(P->alternatives().size());
+      bool Changed = false;
+      for (MatchPattern *Alternative : P->alternatives()) {
+        ActionResult<MatchPattern *> Transformed =
+            TransformPattern(Alternative, Rebuild);
+        if (Transformed.isInvalid())
+          return true;
+        Changed |= Transformed.get() != Alternative;
+        Alternatives.push_back(Transformed.get());
+      }
+      if (!Changed)
+        return Pattern;
+      return getSema().ActOnOrPattern(Alternatives, P->orLocations());
+    }
+    case MatchPattern::AlternativePatternClass: {
+      AlternativePattern *P = static_cast<AlternativePattern *>(Pattern);
+      if (!P->getSubPattern() && !P->getSelector() &&
+          !P->getTypeConstraintSelector())
+        return Pattern;
+
+      MatchPattern *Selector = P->getSelector();
+      if (P->getSelector()) {
+        ActionResult<MatchPattern *> TransformedSelector =
+            TransformPattern(P->getSelector(), Rebuild);
+        if (TransformedSelector.isInvalid())
+          return true;
+        Selector = TransformedSelector.get();
+      }
+      ConceptReference *Constraint = P->getTypeConstraintSelector();
+      if (Constraint) {
+        NestedNameSpecifierLoc NNS =
+            getDerived().TransformNestedNameSpecifierLoc(
+                Constraint->getNestedNameSpecifierLoc());
+        if (Constraint->getNestedNameSpecifierLoc() && !NNS)
+          return true;
+
+        const ASTTemplateArgumentListInfo *TransformedArgs = nullptr;
+        if (const ASTTemplateArgumentListInfo *Args =
+                Constraint->getTemplateArgsAsWritten()) {
+          TemplateArgumentListInfo NewArgs(Args->getLAngleLoc(),
+                                           Args->getRAngleLoc());
+          if (getDerived().TransformTemplateArguments(
+                  Args->getTemplateArgs(), Args->NumTemplateArgs, NewArgs))
+            return true;
+          TransformedArgs =
+              ASTTemplateArgumentListInfo::Create(getSema().Context, NewArgs);
+        }
+        Constraint = ConceptReference::Create(
+            getSema().Context, NNS, Constraint->getTemplateKWLoc(),
+            Constraint->getConceptNameInfo(), Constraint->getFoundDecl(),
+            Constraint->getNamedConcept(), TransformedArgs);
+      }
+      ActionResult<MatchPattern *> Sub = P->getSubPattern();
+      if (P->getSubPattern()) {
+        Sub = TransformPattern(P->getSubPattern(), Rebuild);
+        if (Sub.isInvalid())
+          return true;
+      }
+      if (!Constraint && Selector == P->getSelector() &&
+          Sub.get() == P->getSubPattern())
+        return Pattern;
+      if (P->isNamed())
+        return getSema().ActOnNamedAlternativePattern(
+            P->getBraces(), P->getDiscriminatorRange(), P->getName(),
+            P->getColonLoc(), Sub.get());
+      if (P->isParameterizedNamed())
+        return getSema().ActOnParameterizedNamedAlternativePattern(
+            P->getBraces(), P->getDiscriminatorRange(), P->getName(), Selector,
+            P->getColonLoc(), Sub.get());
+      if (P->isTypeConstraintSelected())
+        return getSema().ActOnTypeConstraintAlternativePattern(
+            P->getBraces(), P->getDiscriminatorRange(), Constraint,
+            P->getColonLoc(), Sub.get());
+      if (P->isSelected())
+        return getSema().ActOnSelectedAlternativePattern(
+            P->getBraces(), Selector, P->getColonLoc(), Sub.get());
+      return getSema().ActOnBracedAlternativePattern(P->getBraces(),
+                                                     Sub.get());
+    }
+    case MatchPattern::DecompositionPatternClass: {
+      DecompositionPattern *P = static_cast<DecompositionPattern *>(Pattern);
+      SmallVector<MatchPattern *, 4> Patterns;
+      Patterns.reserve(P->getNumPatterns());
+      auto Children = P->children();
+      bool HasDeclarationPack = llvm::any_of(Children, [](MatchPattern *Child) {
+        auto *Declaration = dyn_cast<DeclarationPattern>(Child);
+        return Declaration && Declaration->getDeclaration()->isParameterPack();
+      });
+      for (MatchPattern *C : Children) {
+        auto *TP = dyn_cast<TypePattern>(C);
+        auto *DP = dyn_cast<DeclarationPattern>(C);
+        QualType ExpansionType;
+        if (TP)
+          ExpansionType = TP->getType();
+        else if (DP && DP->getDeclaration()->isParameterPack())
+          ExpansionType = DP->getDeclaration()->getType();
+        if (!ExpansionType.isNull() &&
+            isa<PackExpansionType>(ExpansionType) &&
+            cast<PackExpansionType>(ExpansionType)
+                ->getPattern()
+                ->containsUnexpandedParameterPack()) {
+          const auto *Expansion = cast<PackExpansionType>(ExpansionType);
+          QualType PackPattern = Expansion->getPattern();
+          SmallVector<UnexpandedParameterPack, 2> Unexpanded;
+          getSema().collectUnexpandedParameterPacks(PackPattern, Unexpanded);
+          SmallVector<Decl *, 4> ExpandedDeclarations;
+
+          auto BuildPattern = [&](TypeSourceInfo *TInfo) {
+            if (TP)
+              return getSema().ActOnTypePattern(TInfo);
+            VarDecl *Old = DP->getDeclaration();
+            VarDecl *VD = VarDecl::Create(
+                getSema().Context, getSema().CurContext,
+                Old->getInnerLocStart(), Old->getLocation(),
+                Old->getIdentifier(), TInfo->getType(), TInfo,
+                Old->getStorageClass());
+            if (Old->isImplicit())
+              VD->setImplicit();
+            if (Old->hasAttrs())
+              VD->setAttrs(Old->getAttrs());
+            ExpandedDeclarations.push_back(VD);
+            return getSema().ActOnDeclarationPattern(VD, C->getSourceRange());
+          };
+
+          bool Expand = true;
+          bool RetainExpansion = false;
+          UnsignedOrNone OrigNumExpansions = Expansion->getNumExpansions();
+          UnsignedOrNone NumExpansions = OrigNumExpansions;
+          if (getDerived().TryExpandParameterPacks(
+                  C->getEndLoc(), C->getSourceRange(), Unexpanded,
+                  /*FailOnPackProducingTemplates=*/true, Expand,
+                  RetainExpansion, NumExpansions))
+            return true;
+
+          if (Expand) {
+            for (unsigned I = 0; I != *NumExpansions; ++I) {
+              Sema::ArgPackSubstIndexRAII SubstIndex(getSema(), I);
+              QualType Type = getDerived().TransformType(PackPattern);
+              if (Type.isNull())
+                return true;
+              if (Type->containsUnexpandedParameterPack())
+                Type = getSema().Context.getPackExpansionType(
+                    Type, OrigNumExpansions);
+              TypeSourceInfo *TInfo =
+                  getSema().Context.getTrivialTypeSourceInfo(
+                      Type, C->getBeginLoc());
+              ActionResult<MatchPattern *> NewPattern = BuildPattern(TInfo);
+              if (NewPattern.isInvalid())
+                return true;
+              Patterns.push_back(NewPattern.get());
+            }
+
+            if (RetainExpansion) {
+              ForgetPartiallySubstitutedPackRAII Forget(getDerived());
+              TypeSourceInfo *OldTInfo =
+                  TP ? TP->getTypeSourceInfo()
+                     : DP->getDeclaration()->getTypeSourceInfo();
+              TypeSourceInfo *TInfo = getDerived().TransformType(OldTInfo);
+              if (!TInfo)
+                return true;
+              ActionResult<MatchPattern *> NewPattern = BuildPattern(TInfo);
+              if (NewPattern.isInvalid())
+                return true;
+              Patterns.push_back(NewPattern.get());
+            }
+            if (DP)
+              getDerived().transformedLocalDecl(DP->getDeclaration(),
+                                                ExpandedDeclarations);
+            continue;
+          }
+        }
+
+        if (auto *EP = dyn_cast<ExpressionPattern>(C);
+            EP && EP->isPackExpansion()) {
+          Expr *E = EP->getExpr();
+          bool ArgumentChanged = false;
+          SmallVector<Expr *, 8> Args;
+          if (getDerived().TransformExprs(&E, 1, /*IsCall=*/false, Args,
+                                          &ArgumentChanged)) {
+            return true;
+          }
+          for (Expr *Arg : Args) {
+            ActionResult<MatchPattern *> NewEP =
+                getSema().ActOnExpressionPattern(Arg);
+            if (NewEP.isInvalid())
+              return true;
+            Patterns.push_back(NewEP.get());
+          }
+        } else {
+          auto Sub = TransformPattern(C, Rebuild || HasDeclarationPack);
+          if (Sub.isInvalid())
+            return true;
+          Patterns.push_back(Sub.get());
+        }
+      }
+      if (std::equal(Children.begin(), Children.end(), Patterns.begin(),
+                     Patterns.end())) {
+        return Pattern;
+      }
+      return getSema().ActOnDecompositionPattern(Patterns, P->getSquares());
+    }
+    }
+    llvm_unreachable("unknown match pattern kind");
+  }
+
 private:
   QualType TransformTypeInObjectScope(TypeLocBuilder &TLB, TypeLoc TL,
                                       QualType ObjectType,
@@ -4466,8 +4932,15 @@ ExprResult TreeTransform<Derived>::TransformInitializer(Expr *Init,
   if (!Init)
     return Init;
 
-  if (auto *FE = dyn_cast<FullExpr>(Init))
-    Init = FE->getSubExpr();
+  if (auto *FE = dyn_cast<FullExpr>(Init)) {
+    // Don't strip ConstantExpr that wraps an OpaqueValueExpr with a stored
+    // APValue result - it was created by token sequence interpolation and
+    // can't be re-evaluated.
+    if (auto *CE = dyn_cast<ConstantExpr>(FE);
+        !CE || !CE->hasAPValueResult() ||
+        !isa<OpaqueValueExpr>(CE->getSubExpr()))
+      Init = FE->getSubExpr();
+  }
 
   if (auto *AIL = dyn_cast<ArrayInitLoopExpr>(Init)) {
     OpaqueValueExpr *OVE = AIL->getCommonExpr();
@@ -4481,7 +4954,16 @@ ExprResult TreeTransform<Derived>::TransformInitializer(Expr *Init,
     Init = Binder->getSubExpr();
 
   if (ImplicitCastExpr *ICE = dyn_cast<ImplicitCastExpr>(Init))
-    Init = ICE->getSubExprAsWritten();
+    // Don't strip derived-to-base casts that represent base-specifier splices;
+    // they affect type deduction.
+    // Nor the conversions between token arrays and std::meta::token_sequence,
+    // which analysis does not recompute.
+    if (ImplicitCastExpr *TokenCast = findTokenSequenceCast(ICE))
+      Init = TokenCast;
+    else if (!((ICE->getCastKind() == CK_DerivedToBase ||
+                ICE->getCastKind() == CK_UncheckedDerivedToBase) &&
+               isa<CXXSpliceExpr>(ICE->getSubExpr())))
+      Init = ICE->getSubExprAsWritten();
 
   if (CXXStdInitializerListExpr *ILE =
           dyn_cast<CXXStdInitializerListExpr>(Init))
@@ -5008,6 +5490,101 @@ TemplateName TreeTransform<Derived>::TransformTemplateName(
         S->getFinal());
   }
 
+  if (PackIndexingTemplateStorage *PI = Name.getAsPackIndexingTemplate()) {
+    assert(!QualifierLoc && "Unexpected qualified pack-index-template-name");
+
+    ExprResult IndexExpr;
+    {
+      EnterExpressionEvaluationContext ConstantContext(
+          SemaRef, Sema::ExpressionEvaluationContext::ConstantEvaluated);
+      IndexExpr = getDerived().TransformExpr(PI->getIndexExpr());
+      if (IndexExpr.isInvalid())
+        return TemplateName();
+    }
+
+    auto TransformOne = [&](TemplateName N) {
+      NestedNameSpecifierLoc NoQualifier;
+      return getDerived().TransformTemplateName(
+          NoQualifier, TemplateKWLoc, N, NameLoc, ObjectType,
+          FirstQualifierInScope, AllowInjectedClassName);
+    };
+
+    TemplateName Pattern = PI->getPattern();
+    SmallVector<TemplateName, 4> SubstitutedNames;
+    ArrayRef<TemplateName> Names = PI->getExpansions();
+
+    bool NotYetExpanded = Names.empty();
+    bool FullySubstituted = true;
+
+    if (Names.empty() && !PI->expandsToEmptyPack())
+      Names = ArrayRef(&Pattern, 1);
+
+    for (TemplateName N : Names) {
+      if (!N.containsUnexpandedParameterPack()) {
+        TemplateName Transformed = TransformOne(N);
+        if (Transformed.isNull())
+          return TemplateName();
+        SubstitutedNames.push_back(Transformed);
+        continue;
+      }
+
+      SmallVector<UnexpandedParameterPack, 2> Unexpanded;
+      getSema().collectUnexpandedParameterPacks(N, Unexpanded);
+      assert(!Unexpanded.empty() && "Pack expansion without parameter packs?");
+
+      bool ShouldExpand = true;
+      bool RetainExpansion = false;
+      UnsignedOrNone NumExpansions = std::nullopt;
+      if (getDerived().TryExpandParameterPacks(
+              NameLoc, SourceRange(), Unexpanded,
+              /*FailOnPackProducingTemplates=*/true, ShouldExpand,
+              RetainExpansion, NumExpansions))
+        return TemplateName();
+
+      if (!ShouldExpand) {
+        Sema::ArgPackSubstIndexRAII SubstIndex(getSema(), std::nullopt);
+        TemplateName Pack = TransformOne(N);
+        if (Pack.isNull())
+          return TemplateName();
+        if (NotYetExpanded) {
+          FullySubstituted = false;
+          return getDerived().RebuildPackIndexingTemplateName(
+              Pack, IndexExpr.get(), FullySubstituted);
+        }
+        SubstitutedNames.push_back(Pack);
+        continue;
+      }
+
+      for (unsigned I = 0; I != *NumExpansions; ++I) {
+        Sema::ArgPackSubstIndexRAII SubstIndex(getSema(), I);
+        TemplateName Out = TransformOne(N);
+        if (Out.isNull())
+          return TemplateName();
+        SubstitutedNames.push_back(Out);
+        FullySubstituted &= !Out.containsUnexpandedParameterPack();
+      }
+
+      // If we're supposed to retain a pack expansion, do so by temporarily
+      // forgetting the partially-substituted parameter pack.
+      if (RetainExpansion) {
+        FullySubstituted = false;
+        ForgetPartiallySubstitutedPackRAII Forget(getDerived());
+        TemplateName Out = TransformOne(N);
+        if (Out.isNull())
+          return TemplateName();
+        SubstitutedNames.push_back(Out);
+      }
+    }
+
+    Sema::ArgPackSubstIndexRAII SubstIndex(getSema(), std::nullopt);
+    TemplateName NewPattern = TransformOne(Pattern);
+    if (NewPattern.isNull())
+      return TemplateName();
+
+    return getDerived().RebuildPackIndexingTemplateName(
+        NewPattern, IndexExpr.get(), FullySubstituted, SubstitutedNames);
+  }
+
   assert(!Name.getAsDeducedTemplateName() &&
          "DeducedTemplateName should not escape partial ordering");
 
@@ -5029,6 +5606,15 @@ TemplateName TreeTransform<Derived>::TransformTemplateName(
 
   // These should be getting filtered out before they reach the AST.
   llvm_unreachable("overloaded function decl survived to here");
+}
+
+template <typename Derived>
+TemplateName
+TreeTransform<Derived>::TransformConceptTemplateName(TemplateName Name,
+                                                     SourceLocation NameLoc) {
+  NestedNameSpecifierLoc QualifierLoc;
+  return getDerived().TransformTemplateName(
+      QualifierLoc, /*TemplateKWLoc=*/SourceLocation(), Name, NameLoc);
 }
 
 template <typename Derived>
@@ -7260,9 +7846,19 @@ QualType TreeTransform<Derived>::TransformReflectionSpliceType(
     NewSplice = SR.get();
   }
 
-  return getDerived().RebuildReflectionSpliceTypeLoc(TLB,
-                                                     TL.getTypenameKWLoc(),
-                                                     NewSplice);
+  QualType Result = getDerived().RebuildReflectionSpliceTypeLoc(
+      TLB, TL.getTypenameKWLoc(), NewSplice);
+  if (!Result.isNull() && isa<ReflectionSpliceType>(Result)) {
+    // The splice of the type is the first occurrence's (the type is uniqued):
+    // the locations of this occurrence are those of the TypeLoc.
+    if (auto NewTL = TLB.getTypeLocInContext(SemaRef.Context, Result)
+                         .template getAs<ReflectionSpliceTypeLoc>()) {
+      NewTL.setTypenameKWLoc(TL.getTypenameKWLoc());
+      NewTL.setSpliceBeginLoc(TL.getSpliceBeginLoc());
+      NewTL.setSpliceEndLoc(TL.getSpliceEndLoc());
+    }
+  }
+  return Result;
 }
 
 template<typename Derived>
@@ -7622,13 +8218,15 @@ QualType TreeTransform<Derived>::TransformAutoType(TypeLocBuilder &TLB,
       return QualType();
   }
 
-  ConceptDecl *NewCD = nullptr;
+  TemplateName NewCD;
   TemplateArgumentListInfo NewTemplateArgs;
   NestedNameSpecifierLoc NewNestedNameSpec;
   if (T->isConstrained()) {
     assert(TL.getConceptReference());
-    NewCD = cast_or_null<ConceptDecl>(getDerived().TransformDecl(
-        TL.getConceptNameLoc(), T->getTypeConstraintConcept()));
+    NewCD = getDerived().TransformConceptTemplateName(
+        T->getTypeConstraintConcept(), TL.getConceptNameLoc());
+    if (NewCD.isNull())
+      return QualType();
 
     NewTemplateArgs.setLAngleLoc(TL.getLAngleLoc());
     NewTemplateArgs.setRAngleLoc(TL.getRAngleLoc());
@@ -7667,10 +8265,8 @@ QualType TreeTransform<Derived>::TransformAutoType(TypeLocBuilder &TLB,
   NewTL.setConceptReference(nullptr);
 
   if (T->isConstrained()) {
-    DeclarationNameInfo DNI = DeclarationNameInfo(
-        TL.getTypePtr()->getTypeConstraintConcept()->getDeclName(),
-        TL.getConceptNameLoc(),
-        TL.getTypePtr()->getTypeConstraintConcept()->getDeclName());
+    DeclarationNameInfo DNI = SemaRef.Context.getNameForTemplate(
+        TL.getTypePtr()->getTypeConstraintConcept(), TL.getConceptNameLoc());
     auto *CR = ConceptReference::Create(
         SemaRef.Context, NewNestedNameSpec, TL.getTemplateKWLoc(), DNI,
         TL.getFoundDecl(), TL.getTypePtr()->getTypeConstraintConcept(),
@@ -8212,6 +8808,18 @@ TreeTransform<Derived>::TransformCompoundStmt(CompoundStmt *S,
   bool SubStmtInvalid = false;
   bool SubStmtChanged = false;
   SmallVector<Stmt*, 8> Statements;
+  // Save any pending injected statements from an outer compound; we'll
+  // restore them at the end so a nested transform can't drain stmts that
+  // belong to the enclosing scope.
+  SmallVector<Stmt *> SavedPendingInjected;
+  SavedPendingInjected.swap(getSema().PendingInjectedStmts);
+  unsigned SavedInjectedLocalDeclsForLookupSize =
+      getSema().InjectedLocalDeclsForLookup.size();
+  auto RestoreInjectedState = llvm::make_scope_exit([&] {
+    SavedPendingInjected.swap(getSema().PendingInjectedStmts);
+    getSema().InjectedLocalDeclsForLookup.resize(
+        SavedInjectedLocalDeclsForLookupSize);
+  });
   for (auto *B : S->body()) {
     StmtResult Result = getDerived().TransformStmt(
         B, IsStmtExpr && B == S->body_back() ? StmtDiscardKind::StmtExprResult
@@ -8230,6 +8838,15 @@ TreeTransform<Derived>::TransformCompoundStmt(CompoundStmt *S,
 
     SubStmtChanged = SubStmtChanged || Result.get() != B;
     Statements.push_back(Result.getAs<Stmt>());
+
+    // Pick up any statements injected by consteval blocks
+    // (e.g., return statements from queue_injection).
+    if (!getSema().PendingInjectedStmts.empty()) {
+      Statements.append(getSema().PendingInjectedStmts.begin(),
+                        getSema().PendingInjectedStmts.end());
+      getSema().PendingInjectedStmts.clear();
+      SubStmtChanged = true;
+    }
   }
 
   if (SubStmtInvalid)
@@ -8396,6 +9013,40 @@ TreeTransform<Derived>::TransformIfStmt(IfStmt *S) {
   if (Init.isInvalid())
     return StmtError();
 
+  if (MatchTestExpr::containsCaseCondition(S->getCond()) &&
+      (S->getCond()->isInstantiationDependent() ||
+       MatchTestExpr::findCaseConditionRequiringInstantiation(S->getCond()))) {
+    CaseConditionTransformResult Transformed =
+        getDerived().TransformCaseConditionChain(S->getCond(), S->getThen(),
+                                                 nullptr, S->isConstexpr());
+    if (Transformed.Invalid)
+      return StmtError();
+    Sema::ConditionResult Cond = getSema().ActOnCondition(
+        nullptr, S->getIfLoc(), Transformed.Condition,
+        S->isConstexpr() ? Sema::ConditionKind::ConstexprIf
+                         : Sema::ConditionKind::Boolean,
+        /*MissingOK=*/false);
+    if (Cond.isInvalid())
+      return StmtError();
+
+    Stmt *Then = Transformed.Handler;
+    if (!Then)
+      Then = new (getSema().Context)
+          CompoundStmt(S->getThen()->getBeginLoc(), S->getThen()->getEndLoc());
+    StmtResult Else;
+    if (S->getElse() && S->isConstexpr() && Transformed.Handler) {
+      Else = new (getSema().Context)
+          CompoundStmt(S->getElse()->getBeginLoc(), S->getElse()->getEndLoc());
+    } else {
+      Else = getDerived().TransformStmt(S->getElse());
+    }
+    if (Else.isInvalid())
+      return StmtError();
+    return getDerived().RebuildIfStmt(
+        S->getIfLoc(), S->getStatementKind(), S->getLParenLoc(), Cond,
+        S->getRParenLoc(), Init.get(), Then, S->getElseLoc(), Else.get());
+  }
+
   Sema::ConditionResult Cond;
   if (!S->isConsteval()) {
     // Transform the condition
@@ -8498,6 +9149,30 @@ TreeTransform<Derived>::TransformSwitchStmt(SwitchStmt *S) {
 template<typename Derived>
 StmtResult
 TreeTransform<Derived>::TransformWhileStmt(WhileStmt *S) {
+  if (MatchTestExpr::containsCaseCondition(S->getCond()) &&
+      (S->getCond()->isInstantiationDependent() ||
+       MatchTestExpr::findCaseConditionRequiringInstantiation(S->getCond()))) {
+    CaseConditionTransformResult Transformed =
+        getDerived().TransformCaseConditionChain(S->getCond(), S->getBody(),
+                                                 nullptr);
+    if (Transformed.Invalid)
+      return StmtError();
+    Sema::ConditionResult Cond = getSema().ActOnCondition(
+        nullptr, S->getWhileLoc(), Transformed.Condition,
+        Sema::ConditionKind::Boolean, /*MissingOK=*/false);
+    if (Cond.isInvalid())
+      return StmtError();
+
+    Stmt *Body = Transformed.Handler;
+    if (!Body)
+      Body = new (getSema().Context)
+          CompoundStmt(S->getBody()->getBeginLoc(), S->getBody()->getEndLoc());
+    SemaOpenACC::LoopInConstructRAII LCR{SemaRef.OpenACC()};
+    SemaRef.OpenACC().ActOnWhileStmt(S->getBeginLoc());
+    return getDerived().RebuildWhileStmt(S->getWhileLoc(), S->getLParenLoc(),
+                                         Cond, S->getRParenLoc(), Body);
+  }
+
   // Transform the condition
   Sema::ConditionResult Cond = getDerived().TransformCondition(
       S->getWhileLoc(), S->getConditionVariable(), S->getCond(),
@@ -8568,6 +9243,39 @@ TreeTransform<Derived>::TransformForStmt(ForStmt *S) {
   if (getSema().getLangOpts().OpenMP && Init.isUsable())
     getSema().OpenMP().ActOnOpenMPLoopInitialization(S->getForLoc(),
                                                      Init.get());
+
+  if (MatchTestExpr::containsCaseCondition(S->getCond()) &&
+      (S->getCond()->isInstantiationDependent() ||
+       MatchTestExpr::findCaseConditionRequiringInstantiation(S->getCond()))) {
+    CaseConditionTransformResult Transformed =
+        getDerived().TransformCaseConditionChain(S->getCond(), S->getBody(),
+                                                 S->getInc());
+    if (Transformed.Invalid)
+      return StmtError();
+    Sema::ConditionResult Cond = getSema().ActOnCondition(
+        nullptr, S->getForLoc(), Transformed.Condition,
+        Sema::ConditionKind::Boolean, /*MissingOK=*/false);
+    if (Cond.isInvalid())
+      return StmtError();
+
+    Sema::FullExprArg Inc(
+        getSema().MakeFullDiscardedValueExpr(Transformed.Increment));
+    if (Transformed.Increment && !Inc.get())
+      return StmtError();
+    Stmt *Body = Transformed.Handler;
+    if (!Body)
+      Body = new (getSema().Context)
+          CompoundStmt(S->getBody()->getBeginLoc(), S->getBody()->getEndLoc());
+
+    SemaOpenACC::LoopInConstructRAII LCR{SemaRef.OpenACC()};
+    SemaRef.OpenACC().ActOnForStmtBegin(
+        S->getBeginLoc(), S->getInit(), Init.get(), S->getCond(),
+        Cond.get().second, S->getInc(), Transformed.Increment);
+    SemaRef.OpenACC().ActOnForStmtEnd(S->getBeginLoc(), Body);
+    return getDerived().RebuildForStmt(S->getForLoc(), S->getLParenLoc(),
+                                       Init.get(), Cond, Inc, S->getRParenLoc(),
+                                       Body);
+  }
 
   // Transform the condition
   Sema::ConditionResult Cond = getDerived().TransformCondition(
@@ -8723,8 +9431,16 @@ TreeTransform<Derived>::TransformDeclStmt(DeclStmt *S) {
     } else {
       Transformed = TransformDefinition();
     }
-    if (!Transformed)
+        // A statement macro invocation deferred to instantiation leaves nothing
+    // of itself: its expansion was injected among the enclosing statements.
+    if (!Transformed) {
+      if (auto *CBD = dyn_cast<ConstevalBlockDecl>(D);
+          CBD && CBD->getDeclMacroInvocation()) {
+        DeclChanged = true;
+        continue;
+      }
       return StmtError();
+    }
 
     if (Transformed != D)
       DeclChanged = true;
@@ -8752,6 +9468,10 @@ TreeTransform<Derived>::TransformDeclStmt(DeclStmt *S) {
 
   if (!getDerived().AlwaysRebuild() && !DeclChanged)
     return S;
+
+  if (Decls.empty())
+    return new (getSema().Context)
+        NullStmt(S->getEndLoc(), /*HasLeadingEmptyMacro=*/true);
 
   return getDerived().RebuildDeclStmt(Decls, S->getBeginLoc(), S->getEndLoc());
 }
@@ -9193,13 +9913,25 @@ TreeTransform<Derived>::TransformCXXReflectExpr(CXXReflectExpr *E) {
   // A reflection value (std::meta::info) that was substituted for a non-type
   // template parameter is wrapped in a CXXReflectExpr whatever its kind. These
   // kinds have nothing that depends on a template parameter.
+  case ReflectionKind::Expression:
+    return E;
   case ReflectionKind::Null:
   case ReflectionKind::BaseSpecifier:
   case ReflectionKind::DataMemberSpec:
+  case ReflectionKind::DeclarationSpec:
   case ReflectionKind::Annotation:
     return E;
   }
   llvm_unreachable("invalid reflection");
+}
+
+template <typename Derived>
+ExprResult
+TreeTransform<Derived>::TransformCXXTokenSequenceExpr(CXXTokenSequenceExpr *E) {
+  // The default transform is a no-op since the token sequence captures raw
+  // tokens. Derived transforms (e.g., template instantiation) override this
+  // to substitute references inside the token sequence.
+  return E;
 }
 
 template <typename Derived>
@@ -9218,6 +9950,325 @@ TreeTransform<Derived>::TransformCXXMetafunctionExpr(CXXMetafunctionExpr *E) {
                                             E->getRParenLoc(),
                                             E->getMetaFnID(), E->getImpl(),
                                             Args);
+}
+
+template <typename Derived>
+ExprResult
+TreeTransform<Derived>::TransformCXXBuiltinInjectExpr(CXXBuiltinInjectExpr *E) {
+  ExprResult Operand = getDerived().TransformExpr(E->getOperand());
+  if (Operand.isInvalid())
+    return ExprError();
+
+  SmallVector<Expr *, 2> Args;
+  if (E->hasTargetNS()) {
+    ExprResult TransformedTarget = getDerived().TransformExpr(E->getTargetNS());
+    if (TransformedTarget.isInvalid())
+      return ExprError();
+    Args.push_back(TransformedTarget.get());
+  }
+  Args.push_back(Operand.get());
+
+  return getSema().ActOnCXXBuiltinInject(E->getKwLoc(), E->getLParenLoc(),
+                                         Args, E->getRParenLoc());
+}
+
+template <typename Derived>
+ExprResult
+TreeTransform<Derived>::TransformCXXBuiltinReportTokensExpr(
+    CXXBuiltinReportTokensExpr *E) {
+  ExprResult Msg = getDerived().TransformExpr(E->getMessage());
+  if (Msg.isInvalid())
+    return ExprError();
+
+  ExprResult Operand = getDerived().TransformExpr(E->getOperand());
+  if (Operand.isInvalid())
+    return ExprError();
+
+  Expr *Args[] = {Msg.get(), Operand.get()};
+  return getSema().ActOnCXXBuiltinReportTokens(E->getKwLoc(),
+                                               E->getLParenLoc(),
+                                               Args, E->getRParenLoc());
+}
+
+template <typename Derived>
+ExprResult TreeTransform<Derived>::TransformCXXTokenInterpolationListExpr(
+    CXXTokenInterpolationListExpr *E) {
+  // TransformExprs expands any pack expansion among the elements, as for the
+  // arguments of a call.
+  SmallVector<Expr *, 4> Elements;
+  if (getDerived().TransformExprs(const_cast<Expr **>(E->getElements().data()),
+                                  E->getNumElements(),
+                                  /*IsCall=*/true, Elements))
+    return ExprError();
+  Expr *Separator = nullptr;
+  if (Expr *Sep = E->getSeparator()) {
+    ExprResult S = getDerived().TransformExpr(Sep);
+    if (S.isInvalid())
+      return ExprError();
+    Separator = S.get();
+  }
+  return getSema().BuildTokenInterpolationList(E->getBeginLoc(), Elements,
+                                               Separator, E->getEndLoc());
+}
+
+template <typename Derived>
+ExprResult
+TreeTransform<Derived>::TransformCXXBuiltinIdExpr(CXXBuiltinIdExpr *E) {
+  // Transform only the original arguments (slot 0). The size()/data() calls
+  // for user-defined string-like args were synthesized by Sema based on the
+  // arg's type and will be re-synthesized by ActOnCXXBuiltinId once the
+  // transformed args are no longer dependent. Use TransformExprs so any
+  // PackExpansionExpr (from std::meta::id(args...) in a variadic template)
+  // is expanded.
+  SmallVector<Expr *, 4> Inputs;
+  for (unsigned I = 0; I < E->getNumArgs(); ++I)
+    Inputs.push_back(E->getArg(I));
+  SmallVector<Expr *, 4> TransformedArgs;
+  if (getDerived().TransformExprs(Inputs.data(), Inputs.size(),
+                                  /*IsCall=*/true, TransformedArgs))
+    return ExprError();
+
+  return getSema().ActOnCXXBuiltinId(E->getKwLoc(), E->getLParenLoc(),
+                                     TransformedArgs, E->getRParenLoc());
+}
+
+template <typename Derived>
+ExprResult
+TreeTransform<Derived>::TransformCXXBuiltinStrLiteralExpr(
+    CXXBuiltinStrLiteralExpr *E) {
+  SmallVector<Expr *, 4> Inputs;
+  for (unsigned I = 0; I < E->getNumArgs(); ++I)
+    Inputs.push_back(E->getArg(I));
+  SmallVector<Expr *, 4> TransformedArgs;
+  if (getDerived().TransformExprs(Inputs.data(), Inputs.size(),
+                                  /*IsCall=*/true, TransformedArgs))
+    return ExprError();
+
+  return getSema().ActOnCXXBuiltinStrLiteral(E->getKwLoc(), E->getLParenLoc(),
+                                             TransformedArgs, E->getRParenLoc());
+}
+
+template <typename Derived>
+ExprResult
+TreeTransform<Derived>::TransformCXXBuiltinTokenizeExpr(
+    CXXBuiltinTokenizeExpr *E) {
+  SmallVector<Expr *, 4> Inputs;
+  for (unsigned I = 0; I < E->getNumArgs(); ++I)
+    Inputs.push_back(E->getArg(I));
+  SmallVector<Expr *, 4> TransformedArgs;
+  if (getDerived().TransformExprs(Inputs.data(), Inputs.size(),
+                                  /*IsCall=*/true, TransformedArgs))
+    return ExprError();
+
+  return getSema().ActOnCXXBuiltinTokenize(E->getKwLoc(), E->getLParenLoc(),
+                                           TransformedArgs, E->getRParenLoc());
+}
+
+template <typename Derived>
+bool TreeTransform<Derived>::TransformDeferredMacroArguments(
+    ArrayRef<MacroParamKind> RawParams, CXXMacroInvocationExpr *E,
+    SmallVectorImpl<Expr *> &Args) {
+  // The arguments are parsed as part of the template they were written in,
+  // then transformed like the rest of it.
+  SmallVector<Expr *, 4> PatternArgs;
+  if (getSema().ParseDeferredMacroArguments(RawParams, E, PatternArgs) ||
+      getDerived().TransformExprs(PatternArgs.data(), PatternArgs.size(),
+                                  /*IsCall=*/true, Args))
+    return true;
+  getSema().ForgetConsumedMacroArguments(Args);
+  return false;
+}
+
+template <typename Derived>
+void TreeTransform<Derived>::TransformUnparsedMacroEnvironment(
+    CXXMacroInvocationExpr *Old, CXXMacroInvocationExpr *New) {
+  New->setUnparsedEnvironment(getSema().Context, getSema().CurContext,
+                              Old->getUnparsedTemplateParams());
+}
+
+template <typename Derived>
+ExprResult TreeTransform<Derived>::TransformCXXMacroInvocationExpr(
+    CXXMacroInvocationExpr *E) {
+  // A resolved invocation was expanded when it was written: only its
+  // expansion is transformed, and kept inside the same record of the
+  // invocation (so that, for one that expanded to nothing, an empty
+  // expression is not left in the statements).
+  if (E->isResolved()) {
+    ExprResult Expansion = getDerived().TransformExpr(E->getExpansion());
+    if (Expansion.isInvalid())
+      return ExprError();
+    // (The empty expansion of a statement-position invocation is a cast to
+    // void, which a transform drops.)
+    if (E->getExpansion()->getType()->isVoidType() &&
+        !Expansion.get()->getType()->isVoidType())
+      Expansion = SemaRef.ImpCastExprToType(Expansion.get(),
+                                            SemaRef.Context.VoidTy, CK_ToVoid);
+    if (!getDerived().AlwaysRebuild() && Expansion.get() == E->getExpansion())
+      return E;
+    ASTContext &Ctx = SemaRef.Context;
+    CXXMacroInvocationExpr *New;
+    if (E->isMemberInvocation()) {
+      New = CXXMacroInvocationExpr::CreateMember(
+          Ctx, E->getBase(), E->isArrow(), E->getOperatorLoc(),
+          E->getMemberNameInfo(), E->getArgs(), E->getExclaimLoc(),
+          E->getLParenLoc(), E->getRParenLoc());
+      New->setCallee(E->getCallee());
+    } else {
+      New = CXXMacroInvocationExpr::Create(Ctx, E->getCallee(), E->getArgs(),
+                                           E->getExclaimLoc(),
+                                           E->getLParenLoc(),
+                                           E->getRParenLoc());
+    }
+    New->setExpansion(Expansion.get());
+    return New;
+  }
+
+  // The explicit template arguments of 'name!<Args>(...)', if any: the
+  // callee's, or the member invocation's own.
+  TemplateArgumentListInfo TemplateArgsBuffer;
+  const TemplateArgumentListInfo *TemplateArgs = nullptr;
+  auto TransformMacroTemplateArgs = [&](ArrayRef<TemplateArgumentLoc> Args,
+                                        SourceLocation LAngleLoc,
+                                        SourceLocation RAngleLoc) {
+    TemplateArgsBuffer.setLAngleLoc(LAngleLoc);
+    TemplateArgsBuffer.setRAngleLoc(RAngleLoc);
+    TemplateArgs = &TemplateArgsBuffer;
+    return getDerived().TransformTemplateArguments(Args.data(), Args.size(),
+                                                   TemplateArgsBuffer);
+  };
+  if (const ASTTemplateArgumentListInfo *Args = E->getMemberTemplateArgs()) {
+    if (TransformMacroTemplateArgs(Args->arguments(), Args->LAngleLoc,
+                                   Args->RAngleLoc))
+      return ExprError();
+  } else if (UnresolvedLookupExpr *Callee = E->getCallee();
+             Callee && Callee->hasExplicitTemplateArgs()) {
+    if (TransformMacroTemplateArgs(Callee->template_arguments(),
+                                   Callee->getLAngleLoc(),
+                                   Callee->getRAngleLoc()))
+      return ExprError();
+  }
+
+  // A member invocation looks its macros up in the (now known) class of the
+  // object expression.
+  if (E->isMemberInvocation()) {
+    ExprResult Base = getDerived().TransformExpr(E->getBase());
+    if (Base.isInvalid())
+      return ExprError();
+    if (E->areArgsUnparsed()) {
+      // The arguments were captured as tokens, the shape being unknown.
+      const IdentifierInfo *II =
+          E->getMemberNameInfo().getName().getAsIdentifierInfo();
+      SmallVector<MacroParamKind, 4> RawParams;
+      bool ShapeUnknown = false;
+      if (getSema().GetMemberMacroParameterShape(
+              Base.get(), E->isArrow() ? tok::arrow : tok::period, II,
+              E->getMemberNameInfo().getLoc(), RawParams, ShapeUnknown))
+        return ExprError();
+      if (ShapeUnknown) {
+        ExprResult Blob = getDerived().TransformExpr(E->getArg(0));
+        if (Blob.isInvalid())
+          return ExprError();
+        auto *New = CXXMacroInvocationExpr::CreateMember(
+            getSema().Context, Base.get(), E->isArrow(), E->getOperatorLoc(),
+            E->getMemberNameInfo(), {Blob.get()}, E->getExclaimLoc(),
+            E->getLParenLoc(), E->getRParenLoc(), TemplateArgs);
+        getDerived().TransformUnparsedMacroEnvironment(E, New);
+        return New;
+      }
+      SmallVector<Expr *, 4> Args;
+      if (getDerived().TransformDeferredMacroArguments(RawParams, E, Args))
+        return ExprError();
+      return getSema().BuildMemberMacroInvocation(
+          Base.get(), E->isArrow(), E->getOperatorLoc(), E->getMemberNameInfo(),
+          E->getExclaimLoc(), E->getLParenLoc(), Args, E->getRParenLoc(),
+          /*InstantiationPattern=*/E, TemplateArgs);
+    }
+    SmallVector<Expr *, 4> Args;
+    if (getDerived().TransformExprs(E->getArgs().data(), E->getNumArgs(),
+                                    /*IsCall=*/true, Args))
+      return ExprError();
+    return getSema().BuildMemberMacroInvocation(
+        Base.get(), E->isArrow(), E->getOperatorLoc(), E->getMemberNameInfo(),
+        E->getExclaimLoc(), E->getLParenLoc(), Args, E->getRParenLoc(),
+        /*InstantiationPattern=*/E, TemplateArgs);
+  }
+
+  // A dependent qualifier: the macros are looked up only now, and the
+  // arguments, captured as tokens, parsed according to their shape.
+  if (E->areArgsUnparsed()) {
+    UnresolvedLookupExpr *Old = E->getCallee();
+    NestedNameSpecifierLoc QualifierLoc =
+        getDerived().TransformNestedNameSpecifierLoc(Old->getQualifierLoc());
+    if (!QualifierLoc)
+      return ExprError();
+    UnresolvedLookupExpr *Callee = nullptr;
+    SmallVector<MacroParamKind, 4> RawParams;
+    bool StillDependent = false;
+    if (getSema().LookupDeferredQualifiedMacro(QualifierLoc, Old->getNameInfo(),
+                                               Callee, RawParams,
+                                               StillDependent, TemplateArgs))
+      return ExprError();
+    if (StillDependent) {
+      ExprResult Blob = getDerived().TransformExpr(E->getArg(0));
+      if (Blob.isInvalid())
+        return ExprError();
+      auto *New = CXXMacroInvocationExpr::Create(
+          getSema().Context, Callee, {Blob.get()}, E->getExclaimLoc(),
+          E->getLParenLoc(), E->getRParenLoc());
+      getDerived().TransformUnparsedMacroEnvironment(E, New);
+      return New;
+    }
+    SmallVector<Expr *, 4> Args;
+    if (getDerived().TransformDeferredMacroArguments(RawParams, E, Args))
+      return ExprError();
+    return getSema().BuildMacroInvocation(
+        /*S=*/nullptr, Callee, E->getExclaimLoc(), E->getLParenLoc(), Args,
+        E->getRParenLoc(), /*InstantiationPattern=*/E);
+  }
+
+  // The macros were found by ordinary lookup when the template was parsed;
+  // only the declarations themselves may need transforming.
+  UnresolvedLookupExpr *Old = E->getCallee();
+  UnresolvedSet<8> Macros;
+  for (auto I = Old->decls_begin(), End = Old->decls_end(); I != End; ++I) {
+    NamedDecl *D = cast_or_null<NamedDecl>(
+        getDerived().TransformDecl(Old->getNameLoc(), *I));
+    if (!D)
+      return ExprError();
+    Macros.addDecl(D, I.getAccess());
+  }
+  NestedNameSpecifierLoc QualifierLoc = Old->getQualifierLoc();
+  if (QualifierLoc) {
+    QualifierLoc = getDerived().TransformNestedNameSpecifierLoc(QualifierLoc);
+    if (!QualifierLoc)
+      return ExprError();
+  }
+  ExprResult Callee = getSema().BuildMacroCallee(
+      QualifierLoc, Old->getNameInfo(), Macros, TemplateArgs);
+  if (Callee.isInvalid())
+    return ExprError();
+
+  SmallVector<Expr *, 4> Args;
+  if (getDerived().TransformExprs(E->getArgs().data(), E->getNumArgs(),
+                                  /*IsCall=*/true, Args))
+    return ExprError();
+
+  return getSema().BuildMacroInvocation(
+      /*S=*/nullptr, cast<UnresolvedLookupExpr>(Callee.get()),
+      E->getExclaimLoc(), E->getLParenLoc(), Args, E->getRParenLoc(),
+      /*InstantiationPattern=*/E);
+}
+
+template <typename Derived>
+ExprResult
+TreeTransform<Derived>::TransformCXXBuiltinStringizeExpr(
+    CXXBuiltinStringizeExpr *E) {
+  ExprResult Operand = getDerived().TransformExpr(E->getOperand());
+  if (Operand.isInvalid())
+    return ExprError();
+
+  return getSema().ActOnCXXBuiltinStringize(E->getKwLoc(), E->getLParenLoc(),
+                                            {Operand.get()}, E->getRParenLoc());
 }
 
 template <typename Derived>
@@ -9470,11 +10521,9 @@ TreeTransform<Derived>::TransformCXXDestructurableExpansionStmt(
   DeclStmt *ExpansionVarStmt = cast<DeclStmt>(SR.get());
 
   // Transform the expression referencing the template parameter.
-  SR = getDerived().TransformStmt(S->getTParamRef(),
-                                  StmtDiscardKind::NotDiscarded);
-  if (SR.isInvalid())
+  ExprResult TParamRef = getDerived().TransformExpr(S->getTParamRef());
+  if (TParamRef.isInvalid())
     return StmtError();
-  DeclRefExpr *TParamRef = cast<DeclRefExpr>(SR.get());
 
   // Build a new expansion statement.
   SR = SemaRef.BuildCXXDestructurableExpansionStmt(S->getTemplateKWLoc(),
@@ -9483,7 +10532,7 @@ TreeTransform<Derived>::TransformCXXDestructurableExpansionStmt(
                                                    ExpansionVarStmt,
                                                    S->getColonLoc(),
                                                    S->getRParenLoc(),
-                                                   TParamRef);
+                                                   TParamRef.get());
   if (SR.isInvalid())
     return StmtError();
   Stmt *Rebuilt = SR.get();
@@ -13724,6 +14773,12 @@ ExprResult TreeTransform<Derived>::TransformOpenACCAsteriskSizeExpr(
 template<typename Derived>
 ExprResult
 TreeTransform<Derived>::TransformConstantExpr(ConstantExpr *E) {
+  // If this ConstantExpr wraps an OpaqueValueExpr and has a stored APValue
+  // result, it was created by token sequence interpolation and can't be
+  // re-evaluated. Preserve it as-is so the APValue survives template
+  // instantiation and reaches codegen.
+  if (E->hasAPValueResult() && isa<OpaqueValueExpr>(E->getSubExpr()))
+    return E;
   if (auto *SE = E->getSubExpr())
     return TransformExpr(SE);
   return E;
@@ -14038,6 +15093,23 @@ TreeTransform<Derived>::TransformOffsetOfExpr(OffsetOfExpr *E) {
 template<typename Derived>
 ExprResult
 TreeTransform<Derived>::TransformOpaqueValueExpr(OpaqueValueExpr *E) {
+  // A macro argument interpolated into an expansion parsed in a template: a
+  // unique opaque value of the argument expression, which is transformed like
+  // any other -- it may be value-dependent, and even if not, it may name the
+  // template's locals, which each instantiation has its own of.
+  if (E->isUnique() && E->getSourceExpr()) {
+    ExprResult Source = getDerived().TransformExpr(E->getSourceExpr());
+    if (Source.isInvalid())
+      return ExprError();
+    if (!getDerived().AlwaysRebuild() && Source.get() == E->getSourceExpr())
+      return E;
+    Expr *S = Source.get();
+    auto *New = new (getSema().Context)
+        OpaqueValueExpr(E->getExprLoc(), S->getType(), S->getValueKind(),
+                        S->getObjectKind(), S);
+    New->setIsUnique(true);
+    return New;
+  }
   assert((!E->getSourceExpr() || getDerived().AlreadyTransformed(E->getType())) &&
          "opaque value expression requires transformation");
   return E;
@@ -14608,6 +15680,59 @@ TreeTransform<Derived>::TransformConditionalOperator(ConditionalOperator *E) {
 template<typename Derived>
 ExprResult
 TreeTransform<Derived>::TransformImplicitCastExpr(ImplicitCastExpr *E) {
+  // The conversions between the compiler's token arrays and
+  // std::meta::token_sequence are not recomputed by analyzing the operand
+  // again (P4380): keep them, unless the transformed operand already has the
+  // type.
+  if (ImplicitCastExpr *TokenCast = findTokenSequenceCast(E);
+      TokenCast && TokenCast != E)
+    return getDerived().TransformExpr(TokenCast);
+  if (E->getCastKind() == CK_TokenArrayToSequence ||
+      E->getCastKind() == CK_SequenceToTokenArray) {
+    ExprResult Sub = getDerived().TransformExpr(E->getSubExpr());
+    if (Sub.isInvalid() || Sub.get()->isTypeDependent())
+      return Sub;
+    QualType T = Sub.get()->getType();
+    if (E->getCastKind() == CK_TokenArrayToSequence)
+      return T->isTokenSequenceType()
+                 ? getSema().BuildTokenSequenceValue(Sub.get())
+                 : Sub;
+    return T->isStdMetaTokenSequenceType()
+               ? getSema().BuildTokenArrayFromSequence(Sub.get())
+               : Sub;
+  }
+  // Derived-to-base casts from base specifier splices (e.g., object.[:base:])
+  // must be preserved. Unlike normal implicit conversions that can be
+  // recomputed by semantic analysis, these casts represent the semantic
+  // meaning of the splice expression itself. If we strip them, the expression
+  // type reverts to the derived type, causing incorrect template argument
+  // deduction.
+  if ((E->getCastKind() == CK_DerivedToBase ||
+       E->getCastKind() == CK_UncheckedDerivedToBase) &&
+      isa<CXXSpliceExpr>(E->getSubExpr())) {
+    auto *SE = cast<CXXSpliceExpr>(E->getSubExpr());
+    ExprResult Model = getDerived().TransformExpr(SE->getModel());
+    if (Model.isInvalid())
+      return ExprError();
+
+    if (!getDerived().AlwaysRebuild() && Model.get() == SE->getModel())
+      return E;
+
+    Expr *SubExpr = CXXSpliceExpr::Create(
+        getSema().Context, Model.get()->getValueKind(),
+        SE->getTemplateKeywordLoc(), SE->getSplice(), Model.get(),
+        SE->allowMemberReference());
+
+    // Copy the base path from the original cast.
+    CXXCastPath BasePath(E->path_begin(), E->path_end());
+
+    // Rebuild the derived-to-base cast with the transformed subexpression.
+    // The cast path and type should remain the same.
+    return ImplicitCastExpr::Create(
+        getSema().Context, E->getType(), E->getCastKind(), SubExpr,
+        &BasePath, E->getValueKind(), getSema().CurFPFeatureOverrides());
+  }
+
   // Implicit casts are eliminated during transformation, since they
   // will be recomputed by semantic analysis after transformation.
   return getDerived().TransformExpr(E->getSubExprAsWritten());
@@ -14912,6 +16037,85 @@ TreeTransform<Derived>::TransformStmtExpr(StmtExpr *E) {
 
   return getDerived().RebuildStmtExpr(E->getLParenLoc(), SubStmt.get(),
                                       E->getRParenLoc(), NewDepth);
+}
+
+template <typename Derived>
+ExprResult TreeTransform<Derived>::TransformDoExpr(DoExpr *E) {
+  TypeSourceInfo *ExplicitTSI = nullptr;
+  if (E->hasExplicitType()) {
+    ExplicitTSI = getDerived().TransformType(E->getExplicitType());
+    if (!ExplicitTSI)
+      return ExprError();
+  }
+
+  unsigned OldDepth = E->getTemplateDepth();
+  unsigned NewDepth = getDerived().TransformTemplateDepth(OldDepth);
+
+  // The body gets its own instantiation scope, as a lambda body does. A
+  // do-expression in a pack-expansion pattern is transformed once per element,
+  // and each of those transformations produces its own copy of every
+  // declaration in the body; without a scope of their own they would collide
+  // in the enclosing function's scope. Combined with the outer scope, so the
+  // body can still name the enclosing function's locals.
+  LocalInstantiationScope BodyScope(SemaRef, /*CombineWithOuterScope=*/true);
+
+  SemaRef.ActOnStartDoExpr(E->getDoLoc(), QualType(), NewDepth);
+  if (ExplicitTSI)
+    SemaRef.ActOnDoExprExplicitType(ExplicitTSI);
+
+  StmtResult InitStmt;
+  if (E->hasInitStmt()) {
+    EnterExpressionEvaluationContext EvalContext(
+        getSema(), Sema::ExpressionEvaluationContext::PotentiallyEvaluated,
+        /*LambdaContextDecl=*/nullptr,
+        Sema::ExpressionEvaluationContextRecord::EK_Other,
+        /*ShouldEnter=*/true);
+    getSema().currentEvaluationContext().InLifetimeExtendingContext = true;
+
+    InitStmt = getDerived().TransformStmt(E->getInitStmt());
+    if (InitStmt.isInvalid()) {
+      SemaRef.ActOnDoExprError();
+      return ExprError();
+    }
+
+    auto LifetimeExtendTemps =
+        getSema().currentEvaluationContext().ForRangeLifetimeExtendTemps;
+    SemaRef.ActOnDoExprInitStmt(InitStmt.get(), LifetimeExtendTemps);
+  }
+
+  // As when parsing: the body's statements get an evaluation context of their
+  // own so they do not consume the enclosing full-expression's pending cleanup
+  // state. Instantiation re-runs every full-expression in the body, so it can
+  // reproduce the same theft.
+  StmtResult Body;
+  {
+    EnterExpressionEvaluationContext BodyContext(
+        getSema(), getSema().currentEvaluationContext().Context);
+    Body =
+        getDerived().TransformCompoundStmt(E->getBody(), /*IsStmtExpr=*/false);
+  }
+  if (Body.isInvalid()) {
+    SemaRef.ActOnDoExprError();
+    return ExprError();
+  }
+
+  return getDerived().RebuildDoExpr(E->getDoLoc(), E->getLBraceLoc(),
+                                    InitStmt.isUsable() ? InitStmt.get()
+                                                        : nullptr,
+                                    Body.get(), E->getRBraceLoc(),
+                                    ExplicitTSI, NewDepth);
+}
+
+template <typename Derived>
+StmtResult TreeTransform<Derived>::TransformDoReturnStmt(DoReturnStmt *S) {
+  ExprResult Operand;
+  if (S->getOperand()) {
+    Operand = getDerived().TransformInitializer(S->getOperand(),
+                                                /*NotCopyInit=*/false);
+    if (Operand.isInvalid())
+      return StmtError();
+  }
+  return getDerived().RebuildDoReturnStmt(S->getKeywordLoc(), Operand.get());
 }
 
 template<typename Derived>
@@ -15922,7 +17126,7 @@ TreeTransform<Derived>::TransformConceptSpecializationExpr(
 
   return getDerived().RebuildConceptSpecializationExpr(
       E->getNestedNameSpecifierLoc(), E->getTemplateKWLoc(),
-      E->getConceptNameInfo(), E->getFoundDecl(), E->getNamedConcept(),
+      E->getConceptNameInfo(), E->getFoundDecl(), E->getConceptDecl(),
       &TransArgs);
 }
 
@@ -16031,6 +17235,21 @@ TreeTransform<Derived>::TransformExprRequirement(concepts::ExprRequirement *Req)
     TransExpr = TransExprRes.get();
   }
 
+  Expr *TransNoexceptCond = nullptr;
+  if (Expr *Cond = Req->getNoexceptCondition();
+      Cond && isa<Expr *>(TransExpr)) {
+    EnterExpressionEvaluationContext ConstantContext(
+        SemaRef, Sema::ExpressionEvaluationContext::ConstantEvaluated);
+    ExprResult TransCond = getDerived().TransformExpr(Cond);
+    if (TransCond.isUsable()) {
+      ExceptionSpecificationType EST;
+      TransCond = SemaRef.ActOnNoexceptSpec(TransCond.get(), EST);
+    }
+    if (TransCond.isInvalid())
+      return nullptr;
+    TransNoexceptCond = TransCond.get();
+  }
+
   std::optional<concepts::ExprRequirement::ReturnTypeRequirement> TransRetReq;
   const auto &RetReq = Req->getReturnTypeRequirement();
   if (RetReq.isEmpty())
@@ -16048,12 +17267,13 @@ TreeTransform<Derived>::TransformExprRequirement(concepts::ExprRequirement *Req)
   }
   assert(TransRetReq && "All code paths leading here must set TransRetReq");
   if (Expr *E = dyn_cast<Expr *>(TransExpr))
-    return getDerived().RebuildExprRequirement(E, Req->isSimple(),
-                                               Req->getNoexceptLoc(),
-                                               std::move(*TransRetReq));
+    return getDerived().RebuildExprRequirement(
+        E, Req->isSimple(), Req->getNoexceptLoc(), TransNoexceptCond,
+        std::move(*TransRetReq));
   return getDerived().RebuildExprRequirement(
       cast<concepts::Requirement::SubstitutionDiagnostic *>(TransExpr),
-      Req->isSimple(), Req->getNoexceptLoc(), std::move(*TransRetReq));
+      Req->isSimple(), Req->getNoexceptLoc(), Req->getNoexceptCondition(),
+      std::move(*TransRetReq));
 }
 
 template<typename Derived>
@@ -16485,6 +17705,8 @@ TreeTransform<Derived>::TransformLambdaExpr(LambdaExpr *E) {
   CXXRecordDecl *Class = getSema().createLambdaClosureType(
       E->getIntroducerRange(), /*Info=*/nullptr, DependencyKind,
       E->getCaptureDefault());
+  if (OldClass->isConstevalBlock())
+    Class->setIsConstevalBlock(true);
   getDerived().transformedLocalDecl(OldClass, {Class});
 
   CXXMethodDecl *NewCallOperator =
@@ -16863,21 +18085,20 @@ template <typename Derived>
 ExprResult TreeTransform<Derived>::TransformDependentTemplateIdExpr(
     DependentTemplateIdExpr *E) {
 
-  NestedNameSpecifierLoc Loc;
-  TemplateName Name = getDerived().TransformTemplateName(
-      Loc, /*Template Keyword=*/SourceLocation(), E->getTemplateName(),
-      E->getNameLoc());
+  TemplateName Name = getDerived().TransformConceptTemplateName(
+      E->getTemplateName(), E->getNameLoc());
   if (Name.isNull())
     return ExprError();
-
-  TemplateDecl *TD = Name.getAsTemplateDecl();
-
-  assert(TD && "A dependent template id always refers to a template decl");
 
   TemplateArgumentListInfo TransArgs(E->getLAngleLoc(), E->getRAngleLoc());
   if (getDerived().TransformTemplateArguments(
           E->template_arguments().data(), E->getNumTemplateArgs(), TransArgs))
     return ExprError();
+
+  TemplateDecl *TD = Name.getAsTemplateDecl();
+  if (!TD)
+    return SemaRef.CheckVarOrConceptTemplateTemplateId(E->getNameInfo(), Name,
+                                                       &TransArgs);
 
   CXXScopeSpec SS;
 
@@ -16900,6 +18121,26 @@ TreeTransform<Derived>::TransformCXXDependentScopeMemberExpr(
   QualType ObjectType;
   if (!E->isImplicitAccess()) {
     OldBase = E->getBase();
+    SourceLocation PotentialMatchCallLoc;
+    SourceLocation PotentialMatchResultTypeLoc;
+    if (SemaRef.getLangOpts().PatternMatching && E->isArrow()) {
+      if (const auto *Call = dyn_cast<CallExpr>(OldBase)) {
+        if (const auto *Lookup =
+                dyn_cast<UnresolvedLookupExpr>(Call->getCallee())) {
+          const IdentifierInfo *Name = Lookup->getName().getAsIdentifierInfo();
+          if (Name && Name->isStr("match") && Lookup->requiresADL() &&
+              !Lookup->getQualifierLoc() &&
+              !Lookup->hasExplicitTemplateArgs() &&
+              !Lookup->hasTemplateKeyword() &&
+              Lookup->decls_begin() == Lookup->decls_end()) {
+            PotentialMatchCallLoc = Lookup->getNameLoc();
+            PotentialMatchResultTypeLoc = E->getMemberNameInfo().getEndLoc();
+          }
+        }
+      }
+    }
+    Sema::MatchResultTypeDiagnosticRAII MatchResultTypeDiagnostic(
+        SemaRef, PotentialMatchCallLoc, PotentialMatchResultTypeLoc);
     Base = getDerived().TransformExpr(OldBase);
     if (Base.isInvalid())
       return ExprError();
@@ -18728,6 +19969,648 @@ ExprResult TreeTransform<Derived>::TransformHLSLOutArgExpr(HLSLOutArgExpr *E) {
   // We can transform the base expression and allow argument resolution to fill
   // in the rest.
   return getDerived().TransformExpr(E->getArgLValue());
+}
+
+template <typename Derived>
+ExprResult
+TreeTransform<Derived>::TransformMatchTestExpr(MatchTestExpr *E) {
+  return getDerived().TransformMatchTestExpr(E, nullptr, nullptr);
+}
+
+template <typename Derived>
+ExprResult
+TreeTransform<Derived>::TransformCaseConditionExpr(CaseConditionExpr *E) {
+  return getDerived().TransformMatchTestExpr(E, nullptr, nullptr);
+}
+
+template <typename Derived>
+auto TreeTransform<Derived>::TransformCaseConditionChain(
+    Expr *Condition, Stmt *Handler, Expr *Increment,
+    bool SelectConstexprHandler) -> CaseConditionTransformResult {
+  if (auto *Constant = dyn_cast<ConstantExpr>(Condition->IgnoreParens()))
+    Condition = Constant->getSubExpr();
+
+  SmallVector<CaseConditionElement, 4> Elements;
+  auto Collect = [&](Expr *Current, auto &Collect) -> void {
+    if (auto *And = dyn_cast<BinaryOperator>(Current);
+        And && And->getOpcode() == BO_LAnd) {
+      Collect(And->getLHS(), Collect);
+      Elements.push_back({And->getRHS(), And->getOperatorLoc()});
+      return;
+    }
+    Elements.push_back({Current, {}});
+  };
+  Collect(Condition, Collect);
+  return getDerived().TransformCaseConditionChain(Elements, Handler, Increment,
+                                                  SelectConstexprHandler);
+}
+
+template <typename Derived>
+auto TreeTransform<Derived>::TransformCaseConditionChain(
+    ArrayRef<CaseConditionElement> Elements, Stmt *Handler, Expr *Increment,
+    bool SelectConstexprHandler, Expr *ConstexprPrefix)
+    -> CaseConditionTransformResult {
+  if (Elements.empty()) {
+    if (SelectConstexprHandler) {
+      assert(ConstexprPrefix && "constexpr condition chain has no condition");
+      Sema::ConditionResult Checked = getSema().ActOnCondition(
+          nullptr, ConstexprPrefix->getExprLoc(), ConstexprPrefix,
+          Sema::ConditionKind::ConstexprIf, /*MissingOK=*/false);
+      if (Checked.isInvalid())
+        return {nullptr, nullptr, nullptr, true};
+      if (!Checked.getKnownValue().value_or(false))
+        return {nullptr, nullptr, nullptr, false};
+    }
+
+    StmtResult TransformedHandler = getDerived().TransformStmt(Handler);
+    if (TransformedHandler.isInvalid())
+      return {nullptr, nullptr, nullptr, true};
+    ExprResult TransformedIncrement = getDerived().TransformExpr(Increment);
+    if (TransformedIncrement.isInvalid())
+      return {nullptr, nullptr, nullptr, true};
+    return {nullptr, TransformedHandler.get(), TransformedIncrement.get(),
+            false};
+  }
+
+  Expr *First = Elements.front().Condition;
+  if (auto *Match = dyn_cast<MatchTestExpr>(First->IgnoreParens());
+      Match && isa<CaseConditionExpr>(Match)) {
+    Stmt *SelectedHandler = nullptr;
+    Expr *SelectedIncrement = nullptr;
+    ExprResult Transformed = getDerived().TransformMatchTestExpr(
+        Match, Handler, Increment, SelectConstexprHandler,
+        Elements.drop_front(), &SelectedHandler, &SelectedIncrement,
+        ConstexprPrefix);
+    if (Transformed.isInvalid())
+      return {nullptr, nullptr, nullptr, true};
+    return {Transformed.get(), SelectedHandler, SelectedIncrement, false};
+  }
+
+  ExprResult TransformedFirst = getDerived().TransformExpr(First);
+  if (TransformedFirst.isInvalid())
+    return {nullptr, nullptr, nullptr, true};
+  TransformedFirst = getSema().CheckBooleanCondition(First->getExprLoc(),
+                                                     TransformedFirst.get());
+  if (TransformedFirst.isInvalid())
+    return {nullptr, nullptr, nullptr, true};
+
+  Expr *NextConstexprPrefix = ConstexprPrefix;
+  if (SelectConstexprHandler) {
+    if (!NextConstexprPrefix) {
+      NextConstexprPrefix = TransformedFirst.get();
+    } else {
+      ExprResult Combined = getSema().BuildCaseConditionAnd(
+          Elements.front().AndLoc, NextConstexprPrefix, TransformedFirst.get());
+      if (Combined.isInvalid())
+        return {nullptr, nullptr, nullptr, true};
+      NextConstexprPrefix = Combined.get();
+    }
+  }
+
+  CaseConditionTransformResult Rest = getDerived().TransformCaseConditionChain(
+      Elements.drop_front(), Handler, Increment, SelectConstexprHandler,
+      NextConstexprPrefix);
+  if (Rest.Invalid)
+    return Rest;
+  if (!Rest.Condition)
+    return {TransformedFirst.get(), Rest.Handler, Rest.Increment, false};
+
+  ExprResult Combined = getSema().BuildCaseConditionAnd(
+      Elements[1].AndLoc, TransformedFirst.get(), Rest.Condition);
+  if (Combined.isInvalid())
+    return {nullptr, nullptr, nullptr, true};
+  return {Combined.get(), Rest.Handler, Rest.Increment, false};
+}
+
+template <typename Derived>
+ExprResult TreeTransform<Derived>::TransformMatchTestExpr(
+    MatchTestExpr *E, Stmt *Handler, Expr *Increment,
+    bool SelectConstexprHandler, ArrayRef<CaseConditionElement> Continuation,
+    Stmt **SelectedHandler, Expr **SelectedIncrement, Expr *ConstexprPrefix) {
+  if (SelectedHandler)
+    *SelectedHandler = nullptr;
+  if (SelectedIncrement)
+    *SelectedIncrement = nullptr;
+  VarDecl *HoldingVar = nullptr;
+  bool IsSubjectFullExpression = isa<CaseConditionExpr>(E);
+  ExprResult LHS;
+  if (E->hasSubjectProduct()) {
+    ArrayRef<Expr *> ProductElements = E->getSubjectProductElements();
+    SmallVector<Expr *, 4> TransformedElements;
+    if (getDerived().TransformExprs(ProductElements.data(),
+                                    ProductElements.size(),
+                                    /*IsCall=*/false, TransformedElements))
+      return ExprError();
+    LHS = getSema().ActOnMatchSubjects(TransformedElements, E->getMatchLoc(),
+                                       HoldingVar, /*ForceProduct=*/true,
+                                       IsSubjectFullExpression);
+  } else if (VarDecl *HV = E->getHoldingVar()) {
+    assert(HV->hasInit() && "match subject holder must have an initializer");
+    ExprResult Subject = getDerived().TransformExpr(HV->getInit());
+    if (Subject.isInvalid())
+      return ExprError();
+    LHS = getSema().ActOnMatchSubject(Subject.get(), HoldingVar,
+                                      IsSubjectFullExpression);
+    if (LHS.isInvalid())
+      return ExprError();
+    if (HoldingVar)
+      getDerived().transformedLocalDecl(HV, {HoldingVar});
+  } else {
+    LHS = getDerived().TransformExpr(E->getSubject());
+  }
+  if (LHS.isInvalid())
+    return ExprError();
+  bool SubjectIsXValue = HoldingVar
+                             ? HoldingVar->getType()->isRValueReferenceType() ||
+                                   (!HoldingVar->getType()->isReferenceType() &&
+                                    E->getSubject()->isXValue())
+                             : E->getSubject()->isXValue();
+  if (SubjectIsXValue && LHS.get()->isLValue())
+    LHS = ImplicitCastExpr::Create(getSema().Context, LHS.get()->getType(),
+                                   CK_NoOp, LHS.get(), nullptr, VK_XValue,
+                                   FPOptionsOverride());
+
+  Sema::MatchProjectionCache ProjectionCache;
+  SmallVector<MatchTestInstantiation, 4> Instantiations;
+  Sema::MatchAlternativeSelectionPlan SelectionPlan;
+  bool HasViableCandidate = false;
+
+  bool PatternHasAlternativeChoice =
+      Sema::MatchAlternativeSelectionPlan::isRequired(E->getPattern());
+
+  while (true) {
+    SelectionPlan.beginCandidate(ProjectionCache, PatternHasAlternativeChoice);
+    size_t SavedProjectionCount = ProjectionCache.Entries.size();
+
+    std::optional<LocalInstantiationScope> CandidateScope;
+    if (PatternHasAlternativeChoice)
+      CandidateScope.emplace(getSema(), /*CombineWithOuterScope=*/true);
+    MatchPattern *TransformedPattern = nullptr;
+    Sema::MatchPatternState PatternState;
+    auto TransformAndCheckPattern = [&] {
+      ActionResult<MatchPattern *> Pattern = getDerived().TransformPattern(
+          E->getPattern(), LHS.get() != E->getSubject());
+      if (Pattern.isInvalid())
+        return true;
+      TransformedPattern = Pattern.get();
+      if (getSema().CheckConstantExpressionPatterns(TransformedPattern))
+        return true;
+      return getSema().CheckCompleteMatchPattern(
+          LHS.get(), TransformedPattern, PatternState, &ProjectionCache);
+    };
+
+    bool NoMatch = false;
+    if (PatternHasAlternativeChoice) {
+      Sema::SFINAETrap Trap(getSema(), /*WithAccessChecking=*/true);
+      if (TransformAndCheckPattern()) {
+        if (!ProjectionCache.CandidateIsNotViable &&
+            !Trap.hasErrorOccurred())
+          return ExprError();
+        NoMatch = true;
+      }
+    } else if (TransformAndCheckPattern()) {
+      return ExprError();
+    }
+
+    if (NoMatch) {
+      ProjectionCache.Entries.resize(SavedProjectionCount);
+    } else {
+      getDerived().RemapSelectedOrPatternBindings(
+          E->getPattern(), TransformedPattern, PatternState);
+      HasViableCandidate = true;
+      Sema::MatchPatternSemanticAnalysis Semantic =
+          getSema().AnalyzeMatchPatternSemantics(TransformedPattern,
+                                                 PatternState);
+      bool PatternIsIrrefutable = Semantic.isUnconditionallyMatched();
+      MatchPatternInstantiation *PatternInstantiation =
+          MatchPatternInstantiation::Create(
+              getSema().Context, TransformedPattern, PatternState.Infos);
+
+      StmtResult GuardInit;
+      if (E->getGuard().Init) {
+        GuardInit = getDerived().TransformStmt(E->getGuard().Init);
+        if (GuardInit.isInvalid())
+          return ExprError();
+      }
+      Sema::ConditionResult Guard = getDerived().TransformCondition(
+          E->getIfLoc(), E->getGuard().ConditionVariable,
+          E->getGuard().Condition, Sema::ConditionKind::Boolean);
+      if (Guard.isInvalid())
+        return ExprError();
+
+      Expr *CandidatePrefix = ConstexprPrefix;
+      if (SelectConstexprHandler) {
+        MatchGuard CandidateGuard{GuardInit.get(), Guard.get().first,
+                                  Guard.get().second};
+        ExprResult CandidateExpr;
+        if (isa<CaseConditionExpr>(E))
+          CandidateExpr = getSema().ActOnCaseConditionExpr(
+              HoldingVar, LHS.get(), E->getMatchLoc(), TransformedPattern,
+              PatternInstantiation, PatternIsIrrefutable,
+              /*NeedsCaseInstantiation=*/false,
+              /*Instantiations=*/{},
+              /*HasSemanticInstantiations=*/false);
+        else
+          CandidateExpr = getSema().ActOnMatchTestExpr(
+              HoldingVar, LHS.get(), E->getMatchLoc(), TransformedPattern,
+              PatternInstantiation, E->getIfLoc(), CandidateGuard,
+              PatternIsIrrefutable, /*NeedsCaseInstantiation=*/false);
+        if (CandidateExpr.isInvalid())
+          return ExprError();
+        if (!CandidatePrefix) {
+          CandidatePrefix = CandidateExpr.get();
+        } else {
+          ExprResult Combined = getSema().BuildCaseConditionAnd(
+              E->getMatchLoc(), CandidatePrefix, CandidateExpr.get());
+          if (Combined.isInvalid())
+            return ExprError();
+          CandidatePrefix = Combined.get();
+        }
+      }
+
+      CaseConditionTransformResult TransformedContinuation =
+          getDerived().TransformCaseConditionChain(
+              Continuation, Handler, Increment, SelectConstexprHandler,
+              CandidatePrefix);
+      if (TransformedContinuation.Invalid)
+        return ExprError();
+
+      if (SelectConstexprHandler && TransformedContinuation.Handler) {
+        assert(SelectedHandler && !*SelectedHandler &&
+               "multiple constexpr case-condition handlers selected");
+        *SelectedHandler = TransformedContinuation.Handler;
+      }
+      if (SelectConstexprHandler && TransformedContinuation.Increment) {
+        assert(SelectedIncrement && !*SelectedIncrement &&
+               "multiple constexpr case-condition increments selected");
+        *SelectedIncrement = TransformedContinuation.Increment;
+      }
+
+      Instantiations.push_back(
+          {TransformedPattern,
+           E->getIfLoc(),
+           {GuardInit.get(), Guard.get().first, Guard.get().second},
+           PatternInstantiation,
+           PatternIsIrrefutable,
+           TransformedContinuation.Condition,
+           TransformedContinuation.Handler,
+           TransformedContinuation.Increment});
+    }
+
+    if (!SelectionPlan.advance(ProjectionCache))
+      break;
+  }
+
+  if (!HasViableCandidate || Instantiations.empty()) {
+    if (SelectionPlan.SawAlternativeChoice)
+      getSema().Diag(E->getPattern()->getBeginLoc(),
+                     diag::err_braced_alternative_no_viable_state)
+          << LHS.get()->getType();
+    return ExprError();
+  }
+
+  const MatchTestInstantiation &Representative = Instantiations.front();
+  bool StillNeedsCaseInstantiation = LHS.get()->isTypeDependent();
+  if (isa<CaseConditionExpr>(E))
+    return getSema().ActOnCaseConditionExpr(
+        HoldingVar, LHS.get(), E->getMatchLoc(), Representative.Pattern,
+        Representative.PatternInstantiation,
+        Representative.PatternIsIrrefutable, StillNeedsCaseInstantiation,
+        Instantiations, /*HasSemanticInstantiations=*/true);
+  ExprResult Result = getSema().ActOnMatchTestExpr(
+      HoldingVar, LHS.get(), E->getMatchLoc(), Representative.Pattern,
+      Representative.PatternInstantiation, Representative.IfLoc,
+      Representative.Guard, Representative.PatternIsIrrefutable,
+      StillNeedsCaseInstantiation, Instantiations,
+      /*HasSemanticInstantiations=*/true);
+  if (Result.isUsable())
+    cast<MatchTestExpr>(Result.get())->setRParenLoc(E->getRParenLoc());
+  return Result;
+}
+
+template <typename Derived>
+ExprResult
+TreeTransform<Derived>::TransformMatchSelectExpr(MatchSelectExpr *E) {
+  LocalInstantiationScope MatchScope(getSema(),
+                                     /*CombineWithOuterScope=*/true);
+  StmtResult Init = getDerived().TransformStmt(E->getInitStmt());
+  if (Init.isInvalid())
+    return ExprError();
+
+  VarDecl *HoldingVar = nullptr;
+  ExprResult LHS;
+  bool IsSubjectProduct = E->hasSubjectProduct();
+  ArrayRef<Expr *> ProductElements = E->getSubjectProductElements();
+  if (IsSubjectProduct) {
+    SmallVector<Expr *, 4> TransformedElements;
+    if (getDerived().TransformExprs(ProductElements.data(),
+                                    ProductElements.size(),
+                                    /*IsCall=*/false, TransformedElements))
+      return ExprError();
+    LHS = getSema().ActOnMatchSubjects(TransformedElements, E->getMatchLoc(),
+                                       HoldingVar, /*ForceProduct=*/true);
+  } else if (VarDecl *OldHoldingVar = E->getHoldingVar()) {
+    assert(OldHoldingVar->hasInit() &&
+           "match subject holder must have an initializer");
+    ExprResult Subject =
+        getDerived().TransformExpr(OldHoldingVar->getInit());
+    if (Subject.isInvalid())
+      return ExprError();
+    LHS = getSema().ActOnMatchSubject(Subject.get(), HoldingVar);
+    if (LHS.isInvalid())
+      return ExprError();
+    if (HoldingVar)
+      getDerived().transformedLocalDecl(OldHoldingVar, {HoldingVar});
+  } else {
+    LHS = getDerived().TransformExpr(E->getSubject());
+  }
+  if (LHS.isInvalid())
+    return ExprError();
+  bool SubjectIsXValue = HoldingVar
+                             ? HoldingVar->getType()->isRValueReferenceType() ||
+                                   (!HoldingVar->getType()->isReferenceType() &&
+                                    E->getSubject()->isXValue())
+                             : E->getSubject()->isXValue();
+  if (SubjectIsXValue && LHS.get()->isLValue())
+    LHS = ImplicitCastExpr::Create(getSema().Context, LHS.get()->getType(),
+                                   CK_NoOp, LHS.get(), nullptr, VK_XValue,
+                                   FPOptionsOverride());
+
+  SmallVector<Stmt *, 8> Preamble;
+  Preamble.reserve(E->getPreamble().size());
+  for (Stmt *Statement : E->getPreamble()) {
+    StmtResult Transformed = getDerived().TransformStmt(Statement);
+    if (Transformed.isInvalid())
+      return ExprError();
+    Preamble.push_back(Transformed.get());
+  }
+
+  QualType RetTy;
+  if (E->getType()->isDependentType())
+    RetTy = E->getOrigResultType().getType();
+  else if (E->isLValue())
+    RetTy = getSema().Context.getLValueReferenceType(E->getType());
+  else if (E->isXValue())
+    RetTy = getSema().Context.getRValueReferenceType(E->getType());
+  else
+    RetTy = E->getType();
+  SmallVector<MatchCase, 32> SourceCases(E->getCases());
+  SmallVector<MatchCase, 32> CasesToTransform;
+  SmallVector<unsigned, 32> SourceCaseIndices;
+  if (E->getCaseInstantiations().empty()) {
+    CasesToTransform.append(E->getCases().begin(), E->getCases().end());
+    for (unsigned I = 0; I != E->getNumCases(); ++I)
+      SourceCaseIndices.push_back(I);
+  } else {
+    CasesToTransform.reserve(E->getNumCaseInstantiations());
+    SourceCaseIndices.reserve(E->getNumCaseInstantiations());
+    for (const MatchCaseInstantiation &Instantiation :
+         E->getCaseInstantiations()) {
+      const MatchCase &Source = E->getCases()[Instantiation.CaseIndex];
+      CasesToTransform.push_back(
+          {Instantiation.Pattern, Instantiation.IfLoc, Instantiation.Guard,
+           Instantiation.Handler, Source.MaybeUseful,
+           Instantiation.PatternInstantiation, Instantiation.Attributes,
+           Instantiation.NotReturnLoc});
+      SourceCaseIndices.push_back(Instantiation.CaseIndex);
+    }
+  }
+  SmallVector<MatchCaseInstantiation, 32> Instantiations;
+  Sema::MatchUsefulnessContext UsefulnessContext(LHS.get()->getType());
+  Sema::MatchProjectionCache ProjectionCache;
+  enum class TransformCaseResult { Success, NotUseful, NoMatch, Error };
+  auto TransformCase =
+      [&](const MatchCase &Case, unsigned CaseIndex,
+          MatchCaseInstantiation &Transformed,
+          std::optional<bool> &ConstexprConditionValue,
+          bool DiscardedByConstexpr) -> TransformCaseResult {
+    LocalInstantiationScope Scope(getSema(),
+                                  /*CombineWithOuterScope=*/true);
+    MatchPattern *TransformedPattern = nullptr;
+    Sema::MatchPatternState PatternState;
+    bool IsSubstitutionDependent =
+        E->getSubject()->isTypeDependent() ||
+        static_cast<bool>(Case.Pattern->getDependence() &
+                          ExprDependence::Instantiation);
+    SourceCases[CaseIndex].MaybeUseful |= IsSubstitutionDependent;
+    bool AllowsSubstitutionFailure =
+        IsSubstitutionDependent || ProjectionCache.IsExpandingCandidate;
+    ProjectionCache.CandidateUsefulness.Context =
+        AllowsSubstitutionFailure ? &UsefulnessContext : nullptr;
+    ProjectionCache.CandidateUsefulness.CaseIndex = CaseIndex;
+    ProjectionCache.CandidateUsefulness.IsNotUseful = false;
+    auto TransformAndCheckPattern = [&] {
+      ActionResult<MatchPattern *> Pattern = getDerived().TransformPattern(
+          Case.Pattern, LHS.get() != E->getSubject());
+      if (Pattern.isInvalid())
+        return true;
+      TransformedPattern = Pattern.get();
+      ProjectionCache.CandidateUsefulness.RootPattern = TransformedPattern;
+      return getSema().CheckCompleteMatchPattern(
+          LHS.get(), TransformedPattern, PatternState, &ProjectionCache);
+    };
+    if (AllowsSubstitutionFailure) {
+      Sema::SFINAETrap Trap(getSema(), /*WithAccessChecking=*/true);
+      if (TransformAndCheckPattern()) {
+        if (ProjectionCache.CandidateUsefulness.IsNotUseful)
+          return TransformCaseResult::NotUseful;
+        if (ProjectionCache.CandidateIsNotViable)
+          return TransformCaseResult::NoMatch;
+        return Trap.hasErrorOccurred() ? TransformCaseResult::NoMatch
+                                       : TransformCaseResult::Error;
+      }
+    } else if (TransformAndCheckPattern()) {
+      return TransformCaseResult::Error;
+    }
+
+    if (getSema().CheckConstantExpressionPatterns(TransformedPattern))
+      return TransformCaseResult::Error;
+
+    getDerived().RemapSelectedOrPatternBindings(
+        Case.Pattern, TransformedPattern, PatternState);
+
+    MatchPatternInstantiation *PatternInstantiation =
+        MatchPatternInstantiation::Create(getSema().Context, TransformedPattern,
+                                          PatternState.Infos);
+    Sema::MatchPatternSemanticAnalysis Semantic =
+        getSema().AnalyzeMatchPatternSemantics(TransformedPattern,
+                                               PatternState);
+    bool ContributesCoverage =
+        Semantic.Refutability != Sema::MatchPatternRefutability::Impossible &&
+        !Case.Guard.hasGuard() && Case.IfLoc.isInvalid();
+    Sema::MatchPatternUsefulness Usefulness = getSema().UpdateMatchUsefulness(
+        UsefulnessContext, TransformedPattern, PatternInstantiation, CaseIndex,
+        ContributesCoverage);
+
+    if (Semantic.Refutability == Sema::MatchPatternRefutability::Impossible)
+      return TransformCaseResult::NoMatch;
+
+    if (Usefulness == Sema::MatchPatternUsefulness::NotUseful)
+      return TransformCaseResult::NotUseful;
+
+    // The patterns in later arms still participate in exhaustiveness and
+    // usefulness analysis, but their guards and handlers are discarded once a
+    // preceding constexpr arm has been selected.
+    if (DiscardedByConstexpr)
+      return TransformCaseResult::Success;
+
+    StmtResult GuardInit;
+    if (Case.Guard.Init) {
+      GuardInit = getDerived().TransformStmt(Case.Guard.Init);
+      if (GuardInit.isInvalid())
+        return TransformCaseResult::Error;
+    }
+    if (Case.Guard.hasGuard())
+      getSema().CheckGuardedMatchPattern(TransformedPattern);
+    Sema::ConditionResult Guard = getDerived().TransformCondition(
+        Case.IfLoc, Case.Guard.ConditionVariable, Case.Guard.Condition,
+        E->isConstexpr() ? Sema::ConditionKind::ConstexprIf
+                         : Sema::ConditionKind::Boolean);
+    if (Guard.isInvalid())
+      return TransformCaseResult::Error;
+
+    if (E->isConstexpr()) {
+      if (Semantic.Domain.empty() &&
+          Semantic.Refutability ==
+              Sema::MatchPatternRefutability::Irrefutable) {
+        ConstexprConditionValue =
+            Case.Guard.hasGuard() ? Guard.getKnownValue() : true;
+      } else {
+        ExprResult Test = getSema().ActOnMatchTestExpr(
+            HoldingVar, LHS.get(), E->getMatchLoc(), TransformedPattern,
+            PatternInstantiation, Case.IfLoc,
+            {GuardInit.get(), Guard.get().first, Guard.get().second},
+            /*PatternIsIrrefutable=*/false,
+            /*NeedsCaseInstantiation=*/false);
+        if (Test.isInvalid())
+          return TransformCaseResult::Error;
+        Test = getSema().CheckBooleanCondition(E->getMatchLoc(), Test.get(),
+                                               /*IsConstexpr=*/true);
+        if (Test.isInvalid())
+          return TransformCaseResult::Error;
+        if (std::optional<llvm::APSInt> Value =
+                Test.get()->getIntegerConstantExpr(getSema().Context))
+          ConstexprConditionValue = !!*Value;
+      }
+
+      if (ConstexprConditionValue && !*ConstexprConditionValue)
+        return TransformCaseResult::Success;
+    }
+
+    StmtResult Handler =
+        getDerived().TransformStmt(Case.Handler, StmtDiscardKind::NotDiscarded);
+    if (Handler.isInvalid())
+      return TransformCaseResult::Error;
+
+    Stmt *HS = Handler.get();
+    if (!E->isStatement()) {
+      if (Case.isNonReturning()) {
+        Handler = getSema().ActOnExprStmt(cast<Expr>(HS),
+                                          /*DiscardedValue=*/true);
+      } else {
+        if (Expr *HE = dyn_cast<Expr>(HS))
+          Handler = getSema().ActOnMatchExprHandler(E->getOrigResultType(),
+                                                    RetTy, HE);
+        else if (auto *DS = dyn_cast<DeclStmt>(HS);
+                 isa<NullStmt>(HS) ||
+                 (DS && DS->isSingleDecl() &&
+                  isa<StaticAssertDecl>(DS->getSingleDecl()))) {
+          if (DS && cast<StaticAssertDecl>(DS->getSingleDecl())->isFailed())
+            return TransformCaseResult::Error;
+          if (getSema().ActOnMatchVoidHandler(E->getOrigResultType(), RetTy,
+                                              HS->getBeginLoc()))
+            return TransformCaseResult::Error;
+        }
+      }
+    }
+    if (Handler.isInvalid())
+      return TransformCaseResult::Error;
+
+    SmallVector<const Attr *, 4> TransformedAttributes;
+    bool AttributesChanged = false;
+    for (const Attr *A : Case.Attributes) {
+      const Attr *TransformedAttribute = getDerived().TransformStmtAttr(
+          Case.Handler, Handler.get(), A);
+      AttributesChanged |= A != TransformedAttribute;
+      if (TransformedAttribute)
+        TransformedAttributes.push_back(TransformedAttribute);
+    }
+    if (getSema().CheckRebuiltStmtAttributes(TransformedAttributes))
+      return TransformCaseResult::Error;
+    ArrayRef<const Attr *> Attributes = Case.Attributes;
+    if (AttributesChanged) {
+      const Attr **Storage = getSema().Context.template Allocate<const Attr *>(
+          TransformedAttributes.size());
+      llvm::copy(TransformedAttributes, Storage);
+      Attributes = {Storage, TransformedAttributes.size()};
+    }
+
+    Transformed = {TransformedPattern,
+                   Case.IfLoc,
+                   {GuardInit.get(), Guard.get().first, Guard.get().second},
+                   Handler.get(),
+                   CaseIndex,
+                   PatternInstantiation,
+                   Attributes,
+                   Case.NotReturnLoc};
+    return TransformCaseResult::Success;
+  };
+
+  bool ConstexprSelectionComplete = false;
+  for (auto [TransformIndex, Case] : llvm::enumerate(CasesToTransform)) {
+    unsigned CaseIndex = SourceCaseIndices[TransformIndex];
+    size_t InitialCaseCount = Instantiations.size();
+    Sema::MatchAlternativeSelectionPlan SelectionPlan;
+    bool PatternHasAlternativeChoice =
+        Sema::MatchAlternativeSelectionPlan::isRequired(Case.Pattern);
+    bool SawViableCandidate = false;
+    while (true) {
+      SelectionPlan.beginCandidate(ProjectionCache,
+                                   PatternHasAlternativeChoice);
+      size_t SavedProjectionCount = ProjectionCache.Entries.size();
+      MatchCaseInstantiation ExpandedCase;
+      std::optional<bool> ConstexprConditionValue;
+      bool DiscardedByConstexpr = ConstexprSelectionComplete;
+      TransformCaseResult Result =
+          TransformCase(Case, static_cast<unsigned>(CaseIndex), ExpandedCase,
+                        ConstexprConditionValue, DiscardedByConstexpr);
+      if (Result == TransformCaseResult::Error)
+        return ExprError();
+      if (Result == TransformCaseResult::NoMatch)
+        ProjectionCache.Entries.resize(SavedProjectionCount);
+      else if (Result == TransformCaseResult::Success) {
+        SawViableCandidate = true;
+        if (!DiscardedByConstexpr &&
+            (!E->isConstexpr() || !ConstexprConditionValue ||
+             *ConstexprConditionValue))
+          Instantiations.push_back(ExpandedCase);
+        ConstexprSelectionComplete |=
+            E->isConstexpr() && ConstexprConditionValue &&
+            *ConstexprConditionValue;
+      } else {
+        assert(Result == TransformCaseResult::NotUseful);
+        SawViableCandidate = true;
+      }
+      if (!SelectionPlan.advance(ProjectionCache))
+        break;
+    }
+    if (!SawViableCandidate && Instantiations.size() == InitialCaseCount &&
+        SelectionPlan.SawAlternativeChoice &&
+        !E->getSubject()->isTypeDependent()) {
+      getSema().Diag(Case.Pattern->getBeginLoc(),
+                     diag::err_braced_alternative_no_viable_state)
+          << LHS.get()->getType();
+      return ExprError();
+    }
+  }
+
+  return getSema().ActOnMatchSelectExpr(
+      Init.get(), HoldingVar, LHS.get(), E->getMatchLoc(), E->isConstexpr(),
+      E->isStatement(), E->getOrigResultType(), RetTy, Preamble, SourceCases,
+      E->getBraces(),
+      /*ExpandDeferredCases=*/false,
+      ArrayRef<MatchCaseInstantiation>(Instantiations),
+      &UsefulnessContext);
 }
 
 } // end namespace clang

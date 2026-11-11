@@ -136,9 +136,10 @@ bool Sema::CheckConstraintExpression(const Expr *ConstraintExpression,
         // The user probably isn't aware of the parentheses required around
         // the binary operator, and we're only going to parse 'func' as the
         // first operand, and complain that it is of non-bool type.
-        getBinOpPrecedence(NextToken.getKind(),
+        getBinOpPrecedence(NextToken,
                            /*GreaterThanIsOperator=*/true,
-                           getLangOpts().CPlusPlus11) > prec::LogicalAnd;
+                           getLangOpts().CPlusPlus11,
+                           getLangOpts().PatternMatching) > prec::LogicalAnd;
   };
 
   // An atomic constraint!
@@ -434,7 +435,8 @@ public:
     return inherited::TraverseStmt(E->getReplacement());
   }
 
-  bool TraverseTemplateName(TemplateName Template) {
+  bool TraverseTemplateName(TemplateName Template,
+                            bool TraverseQualifier = true) {
     if (auto *TTP = dyn_cast_if_present<TemplateTemplateParmDecl>(
             Template.getAsTemplateDecl());
         TTP && TTP->getDepth() < TemplateArgs.getNumLevels()) {
@@ -453,7 +455,7 @@ public:
       UsedTemplateArgs.push_back(
           SemaRef.Context.getCanonicalTemplateArgument(Arg));
     }
-    return inherited::TraverseTemplateName(Template);
+    return inherited::TraverseTemplateName(Template, TraverseQualifier);
   }
 
   void VisitConstraint(const NormalizedConstraintWithParamMapping &Constraint) {
@@ -1010,7 +1012,8 @@ ExprResult ConstraintSatisfactionChecker::EvaluateSlow(
   // There's a concern that even with the same concept, they may not have the
   // same ConceptReference, if they come from modules.
   if (TopLevelConceptId &&
-      ConceptId->getNamedConcept() == TopLevelConceptId->getNamedConcept()) {
+      ConceptId->getNamedConcept().getAsTemplateDecl() ==
+          TopLevelConceptId->getNamedConcept().getAsTemplateDecl()) {
     for (auto &A : Ori->arguments())
       OutArgs.addArgument(A);
   } else if (S.SubstTemplateArguments(Ori->arguments(), *SubstitutedArgs,
@@ -1042,7 +1045,8 @@ ExprResult ConstraintSatisfactionChecker::EvaluateSlow(
 
   ExprResult SubstitutedConceptId = S.CheckConceptTemplateId(
       SS, ConceptId->getTemplateKWLoc(), ConceptId->getConceptNameInfo(),
-      ConceptId->getFoundDecl(), ConceptId->getNamedConcept(), &OutArgs,
+      ConceptId->getFoundDecl(),
+      ConceptId->getNamedConcept().getAsTemplateDecl(), &OutArgs,
       /*DoCheckConstraintSatisfaction=*/false);
 
   if (SubstitutedConceptId.isInvalid() || Trap.hasErrorOccurred())
@@ -1066,7 +1070,7 @@ ExprResult ConstraintSatisfactionChecker::Evaluate(
   Sema::InstantiatingTemplate InstTemplate(
       S, ConceptId->getBeginLoc(),
       Sema::InstantiatingTemplate::ConstraintsCheck{},
-      ConceptId->getNamedConcept(),
+      ConceptId->getNamedConcept().getAsTemplateDecl(),
       // We may have empty template arguments when checking non-dependent
       // nested constraint expressions.
       // In such cases, non-SFINAE errors would have already been diagnosed
@@ -1081,7 +1085,8 @@ ExprResult ConstraintSatisfactionChecker::Evaluate(
   unsigned Size = Satisfaction.Details.size();
 
   llvm::SaveAndRestore PushConceptDecl(
-      ParentConcept, cast<ConceptDecl>(ConceptId->getNamedConcept()));
+      ParentConcept,
+      cast<ConceptDecl>(ConceptId->getNamedConcept().getAsTemplateDecl()));
 
   ExprResult E = Evaluate(Constraint.getNormalizedConstraint(), MLTAL);
 
@@ -1307,7 +1312,7 @@ bool Sema::CheckConstraintSatisfaction(
 
   const NamedDecl *Owner = Template;
   if (TopLevelConceptId)
-    Owner = TopLevelConceptId->getNamedConcept();
+    Owner = TopLevelConceptId->getNamedConcept().getAsTemplateDecl();
 
   llvm::FoldingSetNodeID ID;
   ConstraintSatisfaction::Profile(ID, Context, Owner, FlattenedArgs);
@@ -1359,7 +1364,7 @@ SubstituteConceptsInConstraintExpression(Sema &S, const NamedDecl *D,
   // If any such substitution results in an invalid concept-id,
   // the program is ill-formed; no diagnostic is required.
 
-  ConceptDecl *Concept = CSE->getNamedConcept()->getCanonicalDecl();
+  ConceptDecl *Concept = CSE->getConceptDecl()->getCanonicalDecl();
   Sema::ArgPackSubstIndexRAII _(S, SubstIndex);
 
   const ASTTemplateArgumentListInfo *ArgsAsWritten =
@@ -1887,7 +1892,7 @@ static void diagnoseUnsatisfiedConceptIdExpr(Sema &S,
             note_single_arg_concept_specialization_constraint_evaluated_to_false)
         << (int)First
         << Concept->getTemplateArgsAsWritten()->arguments()[0].getArgument()
-        << Concept->getNamedConcept();
+        << Concept->getNamedConcept().getAsTemplateDecl();
   } else {
     S.Diag(Loc, diag::note_concept_specialization_constraint_evaluated_to_false)
         << (int)First << Concept;
@@ -2271,14 +2276,14 @@ bool SubstituteParameterMappings::substitute(ConceptIdConstraint &CC) {
           ArgsAsWritten->arguments(), CC.getBeginLoc(), *MLTAL, Out))
     return true;
   Sema::CheckTemplateArgumentInfo CTAI;
-  if (SemaRef.CheckTemplateArgumentList(CSE->getNamedConcept(),
+  if (SemaRef.CheckTemplateArgumentList(CSE->getConceptDecl(),
                                         CSE->getConceptNameInfo().getLoc(), Out,
                                         /*DefaultArgs=*/{},
                                         /*PartialTemplateArgs=*/false, CTAI,
                                         /*UpdateArgsWithConversions=*/false))
     return true;
   auto TemplateArgs = *MLTAL;
-  TemplateArgs.replaceOutermostTemplateArguments(CSE->getNamedConcept(),
+  TemplateArgs.replaceOutermostTemplateArguments(CSE->getConceptDecl(),
                                                  CTAI.SugaredConverted);
   return SubstituteParameterMappings(SemaRef, &TemplateArgs, ArgsAsWritten,
                                      RemovePacksForFoldExpr)
@@ -2323,7 +2328,7 @@ bool SubstituteParameterMappings::substitute(NormalizedConstraint &N) {
         const_cast<ImplicitConceptSpecializationDecl *>(
             CSE->getSpecializationDecl()));
     SmallVector<TemplateArgument> InnerArgs(CSE->getTemplateArguments());
-    ConceptDecl *Concept = CSE->getNamedConcept();
+    ConceptDecl *Concept = CSE->getConceptDecl();
     if (RemovePacksForFoldExpr) {
       TemplateArgumentListInfo OutArgs;
       ArrayRef<TemplateArgumentLoc> InputArgLoc =
@@ -2441,7 +2446,7 @@ NormalizedConstraint *NormalizedConstraint::fromConstraintExpr(
 
       // Use canonical declarations to merge ConceptDecls across
       // different modules.
-      ConceptDecl *CD = CSE->getNamedConcept()->getCanonicalDecl();
+      ConceptDecl *CD = CSE->getConceptDecl()->getCanonicalDecl();
 
       ExprResult Res =
           SubstituteConceptsInConstraintExpression(S, D, CSE, SubstIndex);

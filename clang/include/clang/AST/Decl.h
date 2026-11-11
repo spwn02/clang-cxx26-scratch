@@ -1065,6 +1065,11 @@ protected:
     /// The number of parameters preceding this parameter in the
     /// function parameter scope in which it was declared.
     unsigned ParameterIndex : NumParameterIndexBits;
+
+    /// Whether this is a macro's pack of raw parameters,
+    /// 'std::meta::token_sequence... args'.
+    LLVM_PREFERRED_TYPE(bool)
+    unsigned IsMacroRawPack : 1;
   };
 
   class NonParmVarDeclBitfields {
@@ -1139,6 +1144,21 @@ protected:
     /// loop.
     LLVM_PREFERRED_TYPE(bool)
     unsigned IsCXXForRangeImplicitVar : 1;
+
+    /// Whether this variable is a do-expression init-capture. Unlike an
+    /// ordinary block-scoped local, such a variable's lifetime extends to the
+    /// end of the enclosing full-expression (it is not destroyed at the `}` of
+    /// the do-expression), so the lifetime analysis treats a reference into it
+    /// as valid for the rest of that full-expression but dangling if bound to
+    /// an entity that outlives it.
+    LLVM_PREFERRED_TYPE(bool)
+    unsigned IsDoExprInitCapture : 1;
+
+    /// Whether this variable is declared by a pattern (P2688), as `auto y` in
+    /// `case auto y`: it is declared by the pattern, its initializer is made
+    /// up from the subject it is matched against and has no source of its own.
+    LLVM_PREFERRED_TYPE(bool)
+    unsigned IsPatternVar : 1;
   };
 
   union {
@@ -1597,6 +1617,28 @@ public:
     NonParmVarDeclBits.IsConstexpr = IC;
   }
 
+  /// Whether this variable is a do-expression init-capture, whose lifetime
+  /// extends to the end of the enclosing full-expression rather than ending at
+  /// the `}` of the do-expression.
+  bool isDoExprInitCapture() const {
+    return isa<ParmVarDecl>(this) ? false
+                                  : NonParmVarDeclBits.IsDoExprInitCapture;
+  }
+  void setDoExprInitCapture(bool IC) {
+    assert(!isa<ParmVarDecl>(this));
+    NonParmVarDeclBits.IsDoExprInitCapture = IC;
+  }
+
+  /// Whether this variable is declared by a pattern (C++29); its initializer
+  /// is implicit, so it takes no part in the source range of the declaration.
+  bool isPatternVariable() const {
+    return isa<ParmVarDecl>(this) ? false : NonParmVarDeclBits.IsPatternVar;
+  }
+  void setPatternVariable(bool PV = true) {
+    assert(!isa<ParmVarDecl>(this));
+    NonParmVarDeclBits.IsPatternVar = PV;
+  }
+
   /// Whether this variable is the implicit variable for a lambda init-capture.
   bool isInitCapture() const {
     return isa<ParmVarDecl>(this) ? false : NonParmVarDeclBits.IsInitCapture;
@@ -1824,6 +1866,7 @@ protected:
     assert(ParmVarDeclBits.DefaultArgKind == DAK_None);
     assert(ParmVarDeclBits.IsKNRPromoted == false);
     assert(ParmVarDeclBits.IsObjCMethodParam == false);
+    assert(ParmVarDeclBits.IsMacroRawPack == false);
     setDefaultArg(DefArg);
   }
 
@@ -1897,6 +1940,13 @@ public:
   void setKNRPromoted(bool promoted) {
     ParmVarDeclBits.IsKNRPromoted = promoted;
   }
+
+  /// Whether this is a macro's pack of raw parameters,
+  /// 'std::meta::token_sequence... args': each argument it takes is raw
+  /// tokens. (The macro is a template, its type an invented template
+  /// parameter pack, as for 'auto... args'.)
+  bool isMacroRawPack() const { return ParmVarDeclBits.IsMacroRawPack; }
+  void setMacroRawPack(bool V = true) { ParmVarDeclBits.IsMacroRawPack = V; }
 
   bool isExplicitObjectParameter() const {
     return ExplicitObjectParameterIntroducerLoc.isValid();
@@ -2412,6 +2462,24 @@ public:
   bool isTrivialForCall() const { return FunctionDeclBits.IsTrivialForCall; }
   void setTrivialForCall(bool IT) { FunctionDeclBits.IsTrivialForCall = IT; }
 
+  /// Name of the implicit function-like DeclContext synthesized for a
+  /// do-expression body that is parsed where the current context cannot hold
+  /// block-scope declarations: a default member initializer, a default
+  /// argument, namespace scope. See Sema::ActOnStartDoExpr.
+  static constexpr llvm::StringLiteral DoExprBodyName = "__do_expr_body";
+
+  /// Whether this is that context. A do-expression introduces block scope but
+  /// *not* function scope, so this declaration is a storage detail with no
+  /// counterpart in the language: for any question of the form "which
+  /// function or class am I in?" it must be looked through, in the same way a
+  /// RequiresExprBodyDecl is. It is never added to a lookup table, and
+  /// `isImplicit` means user code cannot declare something that answers to
+  /// this name.
+  bool isDoExprBody() const {
+    return isImplicit() && getDeclName().isIdentifier() &&
+           getName() == DoExprBodyName;
+  }
+
   /// Whether this function is defaulted. Valid for e.g.
   /// special member functions, defaulted comparisions (not methods!).
   bool isDefaulted() const { return FunctionDeclBits.IsDefaulted; }
@@ -2529,6 +2597,10 @@ public:
   // This can be either a consteval function, or an immediate escalating
   // function containing an immediate escalating expression.
   bool isImmediateFunction() const;
+
+  /// Whether this is an expression macro ('__macro'), directly or as the
+  /// specialization of a macro template.
+  bool isExpressionMacro() const;
 
   /// Whether the instantiation of this function is pending.
   /// This bit is set when the decision to instantiate this function is made
@@ -5464,6 +5536,13 @@ bool hasArmZAState(const FunctionDecl *FD);
 
 /// Returns whether the given FunctionDecl has Arm ZT0 state.
 bool hasArmZT0State(const FunctionDecl *FD);
+
+/// Whether \p DC is the implicit DeclContext synthesized for a do-expression
+/// body. See FunctionDecl::isDoExprBody.
+inline bool isDoExprBodyContext(const DeclContext *DC) {
+  const auto *FD = dyn_cast_or_null<FunctionDecl>(DC);
+  return FD && FD->isDoExprBody();
+}
 
 } // namespace clang
 

@@ -142,7 +142,7 @@ def err_typecheck_converted_constant_expression_indirect : Error<
 def err_expr_not_cce : Error<
   "%select{case value|enumerator value|non-type template argument|non-type parameter of template template parameter|"
   "array size|explicit specifier argument|noexcept specifier argument|"
-  "call to 'size()'|call to 'data()'}0 is not a constant expression">;
+  "call to 'size()'|call to 'data()'|pattern}0 is not a constant expression">;
 def ext_cce_narrowing : ExtWarn<
   "%select{case value|enumerator value|non-type template argument|non-type parameter of template template parameter|"
   "array size|explicit specifier argument|noexcept specifier argument|"
@@ -289,6 +289,15 @@ def ext_cxx_designated_init : Extension<
 def warn_cxx17_compat_designated_init : Warning<
   "designated initializers are incompatible with C++ standards before C++20">,
   InGroup<CXXPre20CompatPedantic>, DefaultIgnore;
+def err_designator_ambiguous_base_member : Error<
+  "designator %0 is ambiguous: it names members of several base class "
+  "subobjects of %1">;
+def err_designated_init_base_twice : Error<
+  "base class %0 is initialized both by a positional initializer and by "
+  "designated initializers">;
+def err_positional_init_in_designated_list : Error<
+  "in an initializer list with designators, only the initializers of base "
+  "classes can be positional">;
 def ext_designated_init_mixed : ExtWarn<
   "mixture of designated and non-designated initializers in the same "
   "initializer list is a C99 extension">, InGroup<C99Designator>;
@@ -302,6 +311,9 @@ def ext_designated_init_reordered : ExtWarn<
   "ISO C++ requires field designators to be specified in declaration order; "
   "field %1 will be initialized after field %0">, InGroup<ReorderInitList>,
   SFINAEFailure;
+def err_designated_init_base_reordered : Error<
+  "designators naming members of base classes must be specified in "
+  "declaration order; field %1 will be initialized after field %0">;
 def note_previous_field_init : Note<
   "previous initialization for field %0 is here">;
 def ext_designated_init_brace_elision : ExtWarn<
@@ -613,6 +625,17 @@ def err_decomp_decl_wrong_number_bindings : Error<
   "type %0 binds to %3 %plural{1:element|:elements}2, but "
   "%select{%plural{0:no|:only %1}1|%1}4 "
   "%plural{1:name was|:names were}1 provided">;
+def err_decomp_pattern_multiple_packs : Error<
+  "multiple arity-inferred packs in decomposition pattern">;
+def err_decomp_pattern_pack_in_or_pattern : Error<
+  "pattern pack must be a direct element of a decomposition pattern">;
+def err_decomp_pattern_pack_too_small : Error<
+  "type %0 decomposes into %1 elements, but decomposition pattern requires "
+  "at least %2">;
+def err_decomp_pattern_concrete_declaration_pack : Error<
+  "arity-inferred declaration pattern pack requires a placeholder type">;
+def err_decomp_pattern_unbindable_type : Error<
+  "cannot decompose type %0 in pattern">;
 def err_decomp_decl_unbindable_type : Error<
   "cannot bind %select{union|non-class, non-array}1 type %2">;
 def err_decomp_decl_multiple_bases_with_members : Error<
@@ -2426,7 +2449,8 @@ def err_init_conversion_failed : Error<
   "base class|a constructor delegation|a vector element|a matrix element|a "
   "block element|a block element|a complex element|a lambda capture|a compound"
   " literal initializer|a related result|a parameter of CF audited function|a "
-  "structured binding|a member subobject}0 "
+  "structured binding|a member subobject|match expression result|"
+  "do-expression result}0 "
   "%diff{of type $ with an %select{rvalue|lvalue}2 of type $|"
   "with an %select{rvalue|lvalue}2 of incompatible type}1,3"
   "%select{|: different classes%diff{ ($ vs $)|}5,6"
@@ -2917,6 +2941,11 @@ def note_which_delegates_to : Note<"which delegates to">;
 // C++11 range-based for loop
 def err_for_range_decl_must_be_var : Error<
   "for range declaration must declare a variable">;
+def err_pattern_decl_must_be_var : Error<
+  "declaration pattern must declare a variable">;
+def err_pattern_storage_class : Error<
+  "pattern variable %0 may not be declared %select{'extern'|'static'|"
+  "'__private_extern__'|'auto'|'register'|'constexpr'|'thread_local'}1">;
 def err_for_range_storage_class : Error<
   "loop variable %0 may not be declared %select{'extern'|'static'|"
   "'__private_extern__'|'auto'|'register'|'constexpr'|'thread_local'}1">;
@@ -3246,6 +3275,73 @@ def err_reflect_intervening_lambda : Error<
   "cannot take the reflection of a local entity for which there is an "
   "intervening lambda expression">;
 
+def err_interpolation_not_constant : Error<
+  "interpolation expression is not a constant expression">;
+def err_macro_requires_invocation : Error<
+  "%0 is an expression macro and must be invoked as %1">;
+def err_undeclared_macro : Error<"use of undeclared expression macro %0">;
+def err_not_a_macro : Error<"%0 is not an expression macro">;
+def err_macro_overload_shape : Error<
+  "overloads of expression macro %0 disagree on which parameters are "
+  "token sequences">;
+def err_token_sequence_requires_meta : Error<
+  "a token sequence requires the definition of 'std::meta::token_sequence'; "
+  "include <meta>">;
+def err_macro_undefined : Error<
+  "expression macro %0 is invoked before it is defined">;
+def err_macro_token_argument_not_constant : Error<
+  "token sequence argument of expression macro is not a constant expression">;
+def err_macro_evaluation_failed : Error<
+  "expression macro %0 did not produce a token sequence">;
+def err_macro_reported_error : Error<
+  "expression macro %0 reported an error">;
+def err_macro_raw_pack_not_last : Error<
+  "a pack of raw macro parameters must be the last parameter">;
+def err_macro_expand_at_instantiation_unsupported : Error<
+  "macro %0 cannot wait for template instantiation in this position">;
+def err_builtin_constexpr_diag_arg : Error<
+  "argument %0 of '%1' must be %select{an integer|a pointer to 'char'|"
+  "a pointer to 'char' or 'char8_t'}2">;
+def err_macro_argument_evaluated_twice : Error<
+  "expansion of expression macro would evaluate this argument more than once">;
+def note_macro_expanded_here : Note<"in expansion of expression macro %0">;
+def err_macro_expansion_depth_exceeded : Error<
+  "recursive expansion of expression macro %0 exceeded maximum depth of %1">,
+  DefaultFatal, NoSFINAE;
+def note_macro_expansion_depth : Note<
+  "use -fmacro-expansion-depth=N to increase the maximum depth of nested "
+  "expression macro expansions">, NoSFINAE;
+def err_token_sequence_param_pack : Error<
+  "template parameter pack %0 cannot be substituted into a token sequence">;
+def err_macro_member : Error<
+  "a non-static member expression macro must have an explicit object "
+  "parameter">;
+def err_macro_virtual : Error<"an expression macro cannot be virtual">;
+def err_macro_operator_kind : Error<
+  "%select{a conversion function|a literal operator|an allocation or "
+  "deallocation function|operator co_await}0 cannot be an expression macro">;
+def err_macro_operator_raw_parameter : Error<
+  "an operator expression macro cannot have a token sequence parameter">;
+def err_macro_defaulted_deleted : Error<
+  "an expression macro cannot be %select{defaulted|deleted}0">;
+def err_macro_static_member_via_object : Error<
+  "static member expression macro %0 must be invoked as %1">;
+def err_annotation_inject_members_not_tokens : Error<
+  "'inject_members' callback of annotation type %0 must return a token "
+  "sequence">;
+def err_decl_macro_dependent : Error<
+  "macro %0 cannot form declarations in a dependent context; use "
+  "'consteval { queue_injection(...); }' to defer the injection to "
+  "instantiation">;
+def err_operator_macro_requires_operator : Error<
+  "%0 is an expression macro and can only be invoked with operator syntax">;
+def err_macro_argument_in_lambda : Error<
+  "an expression argument cannot be interpolated into the body of a lambda">;
+def err_decl_spec_wrong_context : Error<
+  "a declaration description can only declare a member of a class currently "
+  "being defined">;
+def err_decl_spec_clone_failed : Error<
+  "could not declare a clone of %0 here">;
 def err_splice_operand_not_reflection : Error<
   "splice operand must be a reflection">;
 def err_splice_operand_not_constexpr : Error<
@@ -6247,6 +6343,10 @@ def err_expected_name_of_pack : Error<
 def err_pack_index_out_of_bound : Error<
   "invalid index %0 for pack %1 of size %2">;
 
+def err_pack_indexing_template_cxx29 : Error<
+  "pack indexing for template names is only available in C++29">;
+def err_pack_index_negative : Error<
+  "pack index evaluates to %0, which cannot be narrowed to type %1">;
 def ext_pack_indexing : ExtWarn<
   "pack indexing is a C++2c extension">, InGroup<CXX26>;
 def warn_cxx23_pack_indexing : Warning<
@@ -6979,6 +7079,12 @@ def note_enters_compound_literal_scope : Note<
 def note_enters_statement_expression : Note<
   "jump enters a statement expression">;
 def note_enters_defer_stmt : Note<"jump enters a defer statement">;
+def note_enters_do_expression : Note<
+  "jump enters a do-expression">;
+def note_enters_match_handler : Note<
+  "jump enters a match handler">;
+def note_enters_pattern_condition_handler : Note<
+  "jump enters a statement controlled by a pattern condition">;
 
 def note_exits_cleanup : Note<
   "jump exits scope of variable with __attribute__((cleanup))">;
@@ -7438,7 +7544,10 @@ def err_illegal_decl_mempointer_in_nonclass
 def err_reference_to_void : Error<"cannot form a reference to 'void'">;
 def err_nonfunction_block_type : Error<
   "block pointer to non-function type is invalid">;
-def err_return_block_has_expr : Error<"void block should not return a value">;
+def err_return_block_has_expr : Error<
+  "void %select{block|lambda}0 should not return a value">;
+def err_return_outside_function : Error<
+  "'return' cannot be used outside a function">;
 def err_block_return_missing_expr : Error<
   "non-void block should return a value">;
 def err_func_def_incomplete_result : Error<
@@ -9118,6 +9227,7 @@ def err_typecheck_missing_return_type_incompatible : Error<
   "%diff{return type $ must match previous return type $|"
   "return type must match previous return type}0,1 when %select{block "
   "literal|lambda expression}2 has unspecified explicit return type">;
+
 def warn_compatible_implicit_pointer_conv : Warning<
   "implicit conversion when %select{"
   "%diff{assigning to $ from type $|assigning to type from type}0,1|"
@@ -10365,6 +10475,9 @@ def err_operator_new_default_arg: Error<
 def err_operator_delete_dependent_param_type : Error<
   "%select{|type aware }0%select{|destroying }1%2 cannot take a dependent type as its %ordinal3 parameter; "
   "use %4 instead">;
+def err_deallocation_function_potentially_throwing : Error<
+  "deallocation function %0 must not have a potentially throwing exception "
+  "specification">;
 def err_operator_delete_param_type : Error<
   "%ordinal3 parameter of%select{| type aware}0%select{| destroying}1 %2 must have type %4">;
 def err_destroying_operator_delete_not_usual : Error<
@@ -10476,6 +10589,9 @@ def err_defaulted_special_member_return_type : Error<
 def err_defaulted_special_member_quals : Error<
   "an explicitly-defaulted %select{copy|move}0 assignment operator may not "
   "have 'const'%select{, 'constexpr'|}1 or 'volatile' qualifiers">;
+def err_defaulted_special_member_rvalue_ref_qual : Error<
+  "an explicitly-defaulted %select{copy|move}0 assignment operator may not "
+  "have the '&&' ref-qualifier">;
 def err_defaulted_special_member_explicit_object_mismatch : Error<
   "the type of the explicit object parameter of an explicitly-defaulted "
   "%select{copy|move}0 assignment operator should be reference to %1">;
@@ -10531,6 +10647,33 @@ def warn_cxx17_compat_defaulted_comparison : Warning<
   "before C++20">, InGroup<CXXPre20Compat>, DefaultIgnore;
 def err_defaulted_comparison_template : Error<
   "comparison operator template cannot be defaulted">;
+def err_defaulted_postfix_incdec_template : Error<
+  "postfix %select{increment|decrement}0 operator template cannot be defaulted">;
+def err_defaulted_postfix_incdec_param : Error<
+  "invalid first parameter type %1 for defaulted postfix "
+  "%select{increment|decrement}0 operator; expected a reference to "
+  "'%2' or 'volatile %2'">;
+def err_defaulted_postfix_incdec_return : Error<
+  "defaulted postfix %select{increment|decrement}0 operator must return %1">;
+def err_defaulted_postfix_incdec_default_arg : Error<
+  "defaulted postfix %select{increment|decrement}0 operator cannot have a "
+  "default argument">;
+def err_defaulted_postfix_incdec_would_delete : Error<
+  "defaulting this postfix %select{increment|decrement}0 operator after its "
+  "first declaration would delete it">;
+def err_defaulted_postfix_incdec_not_first : Error<
+  "defaulted postfix %select{increment|decrement}0 operator defined in a class "
+  "must be the first declaration of the function">;
+def note_defaulted_postfix_incdec_deleted_copy : Note<
+  "defaulted postfix %select{increment|decrement}0 operator is implicitly "
+  "deleted because %1 cannot be copy-initialized from an lvalue">;
+def note_defaulted_postfix_incdec_deleted_dtor : Note<
+  "defaulted postfix %select{increment|decrement}0 operator is implicitly "
+  "deleted because %1 has a deleted or inaccessible destructor">;
+def note_defaulted_postfix_incdec_deleted_prefix : Note<
+  "defaulted postfix %select{increment|decrement}0 operator is implicitly "
+  "deleted because the prefix %select{increment|decrement}0 operator is not "
+  "usable on an lvalue of type %1">;
 def err_defaulted_comparison_num_args : Error<
   "%select{non-member|member}0 %sub{select_defaulted_comparison_kind}1"
   " must have %select{2|1}0 parameters">;
@@ -12971,6 +13114,56 @@ def err_keyword_not_allowed_in_contract : Error<
 def err_lambda_decl_ref_not_modifiable_lvalue_contract : Error<
   "cannot assign to a variable captured by reference which was captured as const because it is inside a contract">;
 } // end of contracts issues
+let CategoryName = "do-expressions Issue" in {
+def err_do_return_outside_do_expr : Error<
+  "'do_return' can only appear inside a do-expression">;
+def err_do_return_crosses_function_scope : Error<
+  "'do_return' cannot appear inside a nested function or lambda body of an "
+  "enclosing do-expression">;
+def err_do_return_missing_value : Error<
+  "'do_return' without a value requires the enclosing do-expression to have "
+  "type 'void'">;
+def err_do_return_type_mismatch : Error<
+  "'do_return' yields type %0, conflicting with previously deduced type %1">;
+def err_do_expr_no_return_but_not_auto : Error<
+  "cannot deduce result type %0 for do-expression with no 'do_return' "
+  "statements">;
+def err_do_return_void_but_not_auto : Error<
+  "cannot deduce result type %0 from 'do_return' with omitted expression">;
+def err_do_expr_array_or_function_result_type : Error<
+  "do-expression cannot have %select{array|function}0 result type %1">;
+def err_do_expr_incomplete_result_type : Error<
+  "incomplete result type %0 of do-expression">;
+def err_do_expr_falls_off_end : Error<
+  "control may fall off the end of do-expression with non-void result type "
+  "%0; every path must exit via 'do_return', 'return', 'break', 'continue', "
+  "'throw', or a '[[noreturn]]' call">;
+} // end of do-expressions issue category
+
+let CategoryName = "Diverging Expressions Issue" in {
+def err_noreturn_object_init : Error<
+  "an object of type 'std::noreturn_t' can only be initialized by a diverging "
+  "expression of that type">;
+def warn_diverging_compat_deduction : Warning<
+  "%select{return type of function|return type of lambda}0 deduced as "
+  "'std::noreturn_t'; it was 'void' before P3549">,
+  InGroup<DivergingCompat>, DefaultIgnore;
+def warn_diverging_compat_comma : Warning<
+  "comma expression has type 'std::noreturn_t'; it had type %0 before P3549">,
+  InGroup<DivergingCompat>, DefaultIgnore;
+def warn_diverging_compat_conditional : Warning<
+  "conditional expression has type 'std::noreturn_t'; it had type 'void' "
+  "before P3549">,
+  InGroup<DivergingCompat>, DefaultIgnore;
+def warn_diverging_compat_decltype : Warning<
+  "'decltype' of a throw-expression is 'std::noreturn_t'; it was 'void' before "
+  "P3549">,
+  InGroup<DivergingCompat>, DefaultIgnore;
+def err_bit_cast_noreturn : Error<
+  "'__builtin_bit_cast' cannot produce a 'std::noreturn_t', which has no "
+  "values">;
+} // end of diverging expressions issue category
+
 let CategoryName = "Documentation Issue" in {
 def warn_not_a_doxygen_trailing_member_comment : Warning<
   "not a Doxygen trailing comment">, InGroup<Documentation>, DefaultIgnore;
@@ -14092,4 +14285,94 @@ def err_cuda_device_kernel_launch_require_rdc
 def err_annotation_appertainment : Error<
   "annotation cannot be applied to %select{a declaration whose host scope differs from its target scope|a non-defining friend declaration|a void parameter|a template parameter}0">;
 
+
+// Pattern Matching
+def err_pattern_binding_used_in_pattern : Error<
+  "pattern binding %0 cannot be used within the pattern that introduces it">;
+def err_pattern_binding_used_in_subject : Error<
+  "pattern binding %0 cannot be used in its own subject initializer">;
+def err_match_multiple_subject_void : Error<
+  "void expression cannot be an element of a multiple-subject match">;
+def err_match_multiple_subject_pattern : Error<
+  "multiple match subjects require a decomposition pattern, structured "
+  "binding declaration pattern, or wildcard">;
+def err_match_case_redundant : Error<"match case is redundant">;
+def err_match_case_impossible : Error<
+  "match case can never match a subject of type %0">;
+def err_case_condition_guard : Error<
+  "a pattern condition cannot have a trailing guard">;
+def err_case_init_statement : Error<
+  "a pattern condition cannot be used as an init-statement">;
+def err_case_switch_condition : Error<
+  "a pattern condition is not permitted in a switch statement">;
+def err_match_not_exhaustive : Error<
+  "match expression is not exhaustive%select{|; example of a missing case: %1}0">;
+def err_match_handler_type_mismatch : Error<
+  "match handler yields type %0, conflicting with previously deduced type %1">;
+def err_dependent_match_result_type_missing_body : Error<
+  "expected '{' after match result type">;
+def err_declaration_pattern_not_applicable : Error<
+  "declaration pattern of type %0 is not applicable to subject of type %1">;
+def err_type_pattern_not_applicable : Error<
+  "type pattern of type %0 is not applicable to subject of type %1">;
+def err_expression_pattern_not_testable : Error<
+  "expression pattern of type %0 is neither equality-comparable with a "
+  "subject of type %1 nor callable with it">;
+def err_or_pattern_binding_mismatch : Error<
+  "all alternatives in an or-pattern must introduce the same bindings">;
+def err_declaration_pattern_pack_not_in_decomposition : Error<
+  "declaration pattern pack must appear directly within a decomposition "
+  "pattern">;
+def note_or_pattern_binding_interface : Note<
+  "binding interface established by this alternative">;
+def err_or_pattern_no_viable_alternative : Error<
+  "no alternative in the or-pattern can match a subject of type %0">;
+def err_or_pattern_alternative_redundant : Error<
+  "or-pattern alternative is redundant">;
+def err_guarded_declaration_pattern_move : Error<
+  "guarded declaration pattern of type %0 invokes a non-trivial move "
+  "constructor before its guard; bind a reference and move in the handler "
+  "instead">;
+def err_alternative_traits_missing : Error<
+  "type %0 does not provide a usable 'std::alternative_traits' specialization">;
+def err_alternative_traits_alternatives_invalid : Error<
+  "invalid alternative protocol; 'std::alternative_traits<%0>::alternatives' "
+  "must be a constant array of 'std::alternative_info'">;
+def err_alternative_info_invalid : Error<
+  "invalid alternative protocol; state %1 of type %0 has an invalid %2 "
+  "in its 'alternative_info' descriptor">;
+def err_alternative_info_empty_and_typed : Error<
+  "invalid alternative protocol; state %1 of type %0 is both empty and typed">;
+def err_alternative_type_without_projection : Error<
+  "invalid alternative protocol; state %1 of type %0 advertises type %2, "
+  "but 'get<%1>' does not provide a compatible projection">;
+def err_alternative_traits_member_missing : Error<
+  "invalid alternative protocol; 'std::alternative_traits<%0>' does not "
+  "provide a usable %1 member">;
+def err_alternative_traits_index_not_noexcept : Error<
+  "invalid alternative protocol; 'std::alternative_traits<%0>::index' "
+  "must be noexcept">;
+def err_alternative_state_not_projectable : Error<
+  "alternative state %1 of type %0 has no projected value; omit the "
+  "': pattern'">;
+def err_alternative_name_not_found : Error<
+  "alternative name %0 is not defined by the discriminator type returned by "
+  "'std::alternative_traits<%1>::index'">;
+def err_braced_alternative_no_viable_state : Error<
+  "braced alternative pattern does not match any projectable state of %0">;
+def err_empty_alternative_not_found : Error<
+  "type %0 has no non-projectable alternative state">;
+def err_open_alternative_pattern_not_type_directed : Error<
+  "open alternative protocol for type %0 requires an explicit "
+  "non-placeholder, non-void type selector of the form '{ T: pattern }' or "
+  "declaration pattern of the form '{ T name }'">;
+def err_open_alternative_type_constraint_selector : Error<
+  "type-constraint alternative selector cannot be used with open alternative type %0">;
+def err_type_constraint_selector_not_satisfied : Error<
+  "projected type %0 does not satisfy type constraint %1">;
+def err_alternative_index_out_of_range : Error<
+  "alternative index %0 is outside the range [0, %1)">;
+def err_open_alternative_operation_result : Error<
+  "invalid open alternative protocol for type %0; '%1' must return a "
+  "contextually Boolean-testable and dereferenceable object">;
 } // end of sema component.

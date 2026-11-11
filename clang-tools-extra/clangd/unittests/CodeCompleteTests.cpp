@@ -170,6 +170,145 @@ TEST(CompletionTest, ReflectionOperatorOperand) {
                     Contains(named("evaluation_ns"))));
 }
 
+// P4380 token sequences: what is in scope is offered inside \( ) of a token
+// sequence literal (#391).
+TEST(CompletionTest, TokenSequenceInterpolation) {
+  Annotations Test(R"cpp(
+namespace std::meta {
+template <class... Ts> consteval auto id(Ts const &...) -> int;
+using token = decltype(id("x"));
+class token_sequence {
+public:
+  constexpr token_sequence() noexcept = default;
+  friend consteval auto operator+=(token_sequence &, const token_sequence &)
+      -> token_sequence &;
+};
+} // namespace std::meta
+using std::meta::token_sequence;
+    consteval token_sequence f(int count) {
+      int local = 1;
+      return @@{ x = \(co$p^) };
+    }
+  )cpp");
+  TestTU TU = TestTU::withCode(withReflectionOperator(Test.code()));
+  TU.ExtraArgs = {"-std=c++2d"};
+  clangd::CodeCompleteOptions Opts;
+  EXPECT_THAT(completions(TU, Test.point("p"), /*IndexSymbols=*/{}, Opts).Completions,
+              Contains(named("count")));
+  Annotations Local(R"cpp(
+namespace std::meta {
+template <class... Ts> consteval auto id(Ts const &...) -> int;
+using token = decltype(id("x"));
+class token_sequence {
+public:
+  constexpr token_sequence() noexcept = default;
+  friend consteval auto operator+=(token_sequence &, const token_sequence &)
+      -> token_sequence &;
+};
+} // namespace std::meta
+using std::meta::token_sequence;
+    consteval token_sequence f(int count) {
+      int local = 1;
+      return @@{ x = \(lo$p^) };
+    }
+  )cpp");
+  TU = TestTU::withCode(withReflectionOperator(Local.code()));
+  TU.ExtraArgs = {"-std=c++2d"};
+  EXPECT_THAT(completions(TU, Local.point("p"), /*IndexSymbols=*/{}, Opts).Completions,
+              Contains(named("local")));
+}
+
+// The enumerators of a scoped enum of the standard library are not offered for
+// a bare prefix (they can only be named qualified), but are after the enum;
+// those of other scoped enums still are.
+TEST(CompletionTest, StdScopedEnumConstantsNeedQualification) {
+  clangd::CodeCompleteOptions Opts;
+  Opts.AllScopes = true;
+  auto Std = enmConstant("std::meta::operators::op_equals");
+  Std.Flags |= Symbol::ScopedEnumConstant;
+  auto Other = enmConstant("ns::Color::op_red");
+  Other.Flags |= Symbol::ScopedEnumConstant;
+  EXPECT_THAT(completions("int x = op_^", {Std, Other}, Opts).Completions,
+              AllOf(Not(Contains(named("op_equals"))),
+                    Contains(named("op_red"))));
+  EXPECT_THAT(completions("int x = std::meta::operators::op_^", {Std, Other},
+                          Opts)
+                  .Completions,
+              Contains(named("op_equals")));
+}
+
+// P4380 expression macros: the keyword is offered for a declaration, and a
+// macro is completed with its `!` (an ordinary call is not expanded).
+TEST(CompletionTest, ExpressionMacros) {
+  clangd::CodeCompleteOptions Opts;
+  Opts.EnableSnippets = true;
+  const char *Pre = R"cpp(
+namespace std::meta {
+template <class... Ts> consteval auto id(Ts const &...) -> int;
+using token = decltype(id("x"));
+class token_sequence {
+public:
+  constexpr token_sequence() noexcept = default;
+};
+} // namespace std::meta
+__macro plus_one(int x) { return @@{ (\(x) + 1) }; }
+)cpp";
+  auto Complete = [&](llvm::StringRef Tail) {
+    Annotations Test((Pre + Tail).str());
+    TestTU TU = TestTU::withCode(withReflectionOperator(Test.code()));
+    TU.ExtraArgs = {"-std=c++2d"};
+    return completions(TU, Test.point(), /*IndexSymbols=*/{}, Opts).Completions;
+  };
+  EXPECT_THAT(Complete("__ma^"), Contains(named("__macro")));
+  EXPECT_THAT(Complete("mac^"), Contains(named("macro")));
+  EXPECT_THAT(Complete("int use() { return plus_^; }"),
+              Contains(AllOf(named("plus_one"), snippetSuffix("!(${1:int x})"))));
+}
+
+TEST(CompletionTest, DoExpressions) {
+  // P2806 do expressions (#366): the keyword in an expression, what may follow
+  // it, and `do_return` only where it is legal.
+  clangd::CodeCompleteOptions Opts;
+  Opts.EnableSnippets = true;
+  auto Complete = [&](llvm::StringRef Code, llvm::StringRef Std = "-std=c++2d") {
+    Annotations Test(Code);
+    auto TU = TestTU::withCode(Test.code());
+    TU.ExtraArgs = {Std.str()};
+    return completions(TU, Test.point(), /*IndexSymbols=*/{}, Opts);
+  };
+
+  EXPECT_THAT(Complete("int f() { int a = d^; }").Completions,
+              Contains(AllOf(named("do"), snippetSuffix(" {\n$0\n}"))));
+  // The introducer after `do`.
+  EXPECT_THAT(Complete("int f() { int a = do ^ { do_return 1; }; }").Completions,
+              AllOf(Contains(named("[")), Contains(named("->")),
+                    Contains(named("{"))));
+  EXPECT_THAT(Complete("int f() { int a = do [k = 1] ^ { do_return k; }; }")
+                  .Completions,
+              AllOf(Not(Contains(named("["))), Contains(named("->")),
+                    Contains(named("{"))));
+  // `do_return` in the body, also in a nested block ...
+  EXPECT_THAT(Complete("int f() { int a = do { do_r^ }; }").Completions,
+              Contains(named("do_return")));
+  EXPECT_THAT(Complete("int f(int n) { int a = do { if (n) { do_r^ } "
+                       "do_return 1; }; }")
+                  .Completions,
+              Contains(named("do_return")));
+  // ... but not in a lambda in the body, outside a do expression, or where the
+  // feature is off.
+  EXPECT_THAT(
+      Complete("int f() { int a = do { auto l = [] { do_r^ }; do_return 1; }; }")
+          .Completions,
+      Not(Contains(named("do_return"))));
+  EXPECT_THAT(Complete("int f() { do_r^ }").Completions,
+              Not(Contains(named("do_return"))));
+  EXPECT_THAT(Complete("int f() { int a = do { do_r^ }; }", "-std=c++26")
+                  .Completions,
+              Not(Contains(named("do_return"))));
+  EXPECT_THAT(Complete("int f() { int a = d^; }", "-std=c++26").Completions,
+              Not(Contains(AllOf(named("do"), snippetSuffix(" {\n$0\n}")))));
+}
+
 // Runs code completion without the clang parser.
 CodeCompleteResult completionsNoCompile(llvm::StringRef Text,
                                         std::vector<Symbol> IndexSymbols = {},

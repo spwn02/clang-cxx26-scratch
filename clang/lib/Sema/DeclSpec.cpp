@@ -28,6 +28,40 @@
 #include <cstring>
 using namespace clang;
 
+DecompositionDeclarator::Binding::Binding(
+    IdentifierInfo *Name, SourceLocation NameLoc, ParsedAttributes &&Attrs,
+    SourceLocation EllipsisLoc, std::unique_ptr<DecompositionDeclarator> Nested)
+    : Name(Name), NameLoc(NameLoc), Attrs(std::move(Attrs)),
+      EllipsisLoc(EllipsisLoc), Nested(std::move(Nested)) {}
+
+DecompositionDeclarator::Binding::Binding(Binding &&) = default;
+DecompositionDeclarator::Binding &
+DecompositionDeclarator::Binding::operator=(Binding &&Other) {
+  Name = Other.Name;
+  NameLoc = Other.NameLoc;
+  Attrs.reset();
+  if (Other.Attrs)
+    Attrs.emplace(std::move(*Other.Attrs));
+  EllipsisLoc = Other.EllipsisLoc;
+  Nested = std::move(Other.Nested);
+  return *this;
+}
+DecompositionDeclarator::Binding::~Binding() = default;
+
+void DecompositionDeclarator::setBindings(SourceLocation NewLSquareLoc,
+                                          MutableArrayRef<Binding> NewBindings,
+                                          SourceLocation NewRSquareLoc) {
+  clear();
+  LSquareLoc = NewLSquareLoc;
+  RSquareLoc = NewRSquareLoc;
+  NumBindings = NewBindings.size();
+  DeleteBindings = NumBindings != 0;
+  if (NumBindings) {
+    Bindings =
+        static_cast<Binding *>(::operator new[](sizeof(Binding) * NumBindings));
+    std::uninitialized_move(NewBindings.begin(), NewBindings.end(), Bindings);
+  }
+}
 
 void UnqualifiedId::setTemplateId(TemplateIdAnnotation *TemplateId) {
   assert(TemplateId && "NULL template-id annotation?");
@@ -302,7 +336,8 @@ void Declarator::setDecompositionBindings(
       InlineStorageUsed = true;
     } else {
       BindingGroup.Bindings =
-          new DecompositionDeclarator::Binding[Bindings.size()];
+          static_cast<DecompositionDeclarator::Binding *>(::operator new[](
+              sizeof(DecompositionDeclarator::Binding) * Bindings.size()));
       BindingGroup.DeleteBindings = true;
     }
     std::uninitialized_move(Bindings.begin(), Bindings.end(),
@@ -484,7 +519,7 @@ unsigned DeclSpec::getParsedSpecifiers() const {
     Res |= PQ_TypeSpecifier;
 
   if (FS_inline_specified || FS_virtual_specified || hasExplicitSpecifier() ||
-      FS_noreturn_specified || FS_forceinline_specified)
+      FS_noreturn_specified || FS_forceinline_specified || FS_macro_specified)
     Res |= PQ_FunctionSpecifier;
   return Res;
 }
@@ -1131,6 +1166,18 @@ bool DeclSpec::setFunctionSpecNoreturn(SourceLocation Loc,
   }
   FS_noreturn_specified = true;
   FS_noreturnLoc = Loc;
+  return false;
+}
+
+bool DeclSpec::setFunctionSpecMacro(SourceLocation Loc, const char *&PrevSpec,
+                                    unsigned &DiagID) {
+  if (FS_macro_specified) {
+    DiagID = diag::warn_duplicate_declspec;
+    PrevSpec = "__macro";
+    return true;
+  }
+  FS_macro_specified = true;
+  FS_macroLoc = Loc;
   return false;
 }
 

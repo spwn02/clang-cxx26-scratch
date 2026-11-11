@@ -947,6 +947,22 @@ const internal::VariadicDynCastAllOfMatcher<Stmt, BreakStmt> breakStmt;
 const internal::VariadicDynCastAllOfMatcher<Stmt, ContinueStmt> continueStmt;
 const internal::VariadicDynCastAllOfMatcher<Stmt, CoreturnStmt> coreturnStmt;
 const internal::VariadicDynCastAllOfMatcher<Stmt, ReturnStmt> returnStmt;
+const internal::VariadicDynCastAllOfMatcher<Stmt, DoExpr> doExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, MatchSelectExpr>
+    matchSelectExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, MatchTestExpr> matchTestExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, CaseConditionExpr>
+    caseConditionExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, CXXTokenSequenceExpr> tokenSequenceExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, CXXMacroInvocationExpr> macroInvocationExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinInjectExpr> queueInjectionExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinReportTokensExpr> reportTokensExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, CXXTokenInterpolationListExpr> tokenInterpolationListExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinIdExpr> builtinIdExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinStrLiteralExpr> builtinStrLiteralExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinTokenizeExpr> builtinTokenizeExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinStringizeExpr> builtinStringizeExpr;
+const internal::VariadicDynCastAllOfMatcher<Stmt, DoReturnStmt> doReturnStmt;
 const internal::VariadicDynCastAllOfMatcher<Stmt, GotoStmt> gotoStmt;
 const internal::VariadicDynCastAllOfMatcher<Stmt, LabelStmt> labelStmt;
 const internal::VariadicDynCastAllOfMatcher<Stmt, AddrLabelExpr> addrLabelExpr;

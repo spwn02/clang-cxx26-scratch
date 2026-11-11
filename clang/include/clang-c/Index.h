@@ -1691,7 +1691,48 @@ enum CXCursorKind {
    */
   CXCursor_PackIndexingExpr = 156,
 
-  CXCursor_LastExpr = CXCursor_PackIndexingExpr,
+  /**
+   * A C++29 do expression (P2806), `do { ... do_return value; }`.
+   */
+  CXCursor_DoExpr = 157,
+
+  /**
+   * A C++29 token sequence literal (P4380), `^^{ tokens }`.
+   */
+  CXCursor_TokenSequenceExpr = 158,
+
+  /**
+   * A C++29 expression macro invocation (P4380), `name!(args)`.
+   */
+  CXCursor_MacroInvocationExpr = 159,
+
+  /**
+   * A C++29 token injection builtin (P4380): `queue_injection`,
+   * `report_tokens`, `id`, `str_lit`, `tokenize`, `stringize`, or a `\(a, b)`
+   * interpolation list.
+   */
+  CXCursor_TokenInjectionExpr = 160,
+
+  /**
+   * A C++29 match selection (P2688), `match (subject) { case pattern => ...; }`,
+   * as an expression or as a statement. The cursor's children are the
+   * subject(s), then for each case its pattern (the expressions, types and
+   * declarations written in it), guard and handler.
+   */
+  CXCursor_MatchSelectExpr = 161,
+
+  /**
+   * A C++29 match test (P2688), `match (subject, case pattern)`.
+   */
+  CXCursor_MatchTestExpr = 162,
+
+  /**
+   * A C++29 pattern condition (P2688), `case pattern = subject`, as the
+   * condition of `if`, `while` or `for`.
+   */
+  CXCursor_CaseConditionExpr = 163,
+
+  CXCursor_LastExpr = CXCursor_CaseConditionExpr,
 
   /* Statements */
   CXCursor_FirstStmt = 200,
@@ -2222,7 +2263,12 @@ enum CXCursorKind {
    */
   CXCursor_OpenACCCacheConstruct = 333,
 
-  CXCursor_LastStmt = CXCursor_OpenACCCacheConstruct,
+  /**
+   * A C++29 `do_return` statement (P2806) inside a do expression.
+   */
+  CXCursor_DoReturnStmt = 334,
+
+  CXCursor_LastStmt = CXCursor_DoReturnStmt,
 
   /**
    * Cursor that represents the translation unit itself.
@@ -3039,7 +3085,10 @@ enum CXTypeKind {
   /* HLSL Types */
   CXType_HLSLResource = 179,
   CXType_HLSLAttributedResource = 180,
-  CXType_HLSLInlineSpirv = 181
+  CXType_HLSLInlineSpirv = 181,
+
+  /* The bottom type std::noreturn_t of a diverging expression (P3549, C++29). */
+  CXType_NoReturn = 182
 };
 
 /**

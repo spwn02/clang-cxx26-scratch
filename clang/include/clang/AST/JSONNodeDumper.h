@@ -316,6 +316,12 @@ public:
   void VisitCXXDefaultArgExpr(const CXXDefaultArgExpr *Node);
   void VisitCXXDefaultInitExpr(const CXXDefaultInitExpr *Node);
   void VisitLambdaExpr(const LambdaExpr *LE);
+  void VisitDoExpr(const DoExpr *DE);
+  void VisitCXXTokenSequenceExpr(const CXXTokenSequenceExpr *E);
+
+  void VisitMatchTestExpr(const MatchTestExpr *Node);
+  void VisitMatchSelectExpr(const MatchSelectExpr *Node);
+  void Visit(const MatchPattern *Node);
 
   void VisitObjCEncodeExpr(const ObjCEncodeExpr *OEE);
   void VisitObjCMessageExpr(const ObjCMessageExpr *OME);

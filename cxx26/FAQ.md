@@ -18,12 +18,12 @@ The release is a Linux x86_64 archive, and Linux x86_64 is the platform where th
 a C library and the GCC runtime (on Debian and Ubuntu, `build-essential`).
 
 The compiler and libc++ also build from source on two more platforms, checked on GitHub-hosted runners: macOS arm64
-(Apple Silicon, Xcode 15.4) and Windows x64 with the MSVC ABI (`clang-cl`, Visual Studio 2022). On both, six small programs
-(hello world, reflection, expansion statements, contracts, `std::execution`, `<simd>`) compile and run, and on macOS three of the new
+(Apple Silicon, Xcode 15.4) and Windows x64 with the MSVC ABI (`clang-cl`, Visual Studio 2022). On both, eight small programs
+(hello world, reflection, expansion statements, contracts, `std::execution`, `<simd>`, a constexpr exception, `std::text_encoding`) compile and run, and on macOS some of the new
 libc++ tests do. There are no binary releases for them, and their test suites have not been run. Constant evaluation of the transcendental functions of `<cmath>`
 (`constexpr double s = std::sin(0.5);`, P1383R2) needs GMP and MPFR when the compiler is built: the Linux archive is built with
 them, and a build from source finds them if they are installed (otherwise those functions are not usable in a constant
-expression, and everything else works). Two problems of the 10.27 sources are fixed on the `cxx26` branch: Apple's `ld` crashed when linking against the libc++
+expression, and everything else works; the Windows runner has neither, so that check is skipped there). On Windows the modes C++11 to C++26 are checked; C++03 is not one, because the headers of Visual Studio themselves need `noexcept`. Snapshots up to 10.27 had two problems there, fixed since cxx26-2026.10.30: Apple's `ld` crashed when linking against the libc++
 of the toolchain ([#350](https://github.com/spwn02/clang-cxx26/issues/350)), and `std::exception_ptr` was not constexpr
 with the MSVC ABI ([#351](https://github.com/spwn02/clang-cxx26/issues/351)).
 
@@ -53,6 +53,16 @@ fork is stricter than stock Clang, because it implements a rule of the standard 
 is listed in "Potentially Breaking Changes" in `clang/docs/ReleaseNotes.rst`; the README summarizes the one that affects
 ordinary code (function types with C and C++ language linkage are distinct types, [dcl.link]). The only leniency
 beyond the standard is that a system header does not tell the two linkages apart.
+
+## Are features locked behind experimental flags?
+
+Not the ones of C++26: a release has no experimental flag for a feature of the standard version the fork has completed.
+If a feature leaves that version (for example, contracts, if the committee delays them to C++29), it goes behind an
+experimental flag until the fork has completed the next standard and WG21 has accepted it.
+
+## Is there C++29 work?
+
+Yes, on the branch `cxx29` (branched from `cxx26`; the `cxx26` branch and its releases are not affected). It uses `-std=c++29` (alias `-std=c++2d`) and is a work in progress: `do` expressions (P2806) and token sequence injection (P4380) are implemented in the compiler, the library and the tools (clangd, clang-tidy, clang-format, the static analyzer, libclang), together with seventeen library papers of the C++29 draft; pattern matching (P2688R6, with `std::alternative_traits` and a batched `dynamic_cast` entry point in libc++abi) is implemented the same way; the networking papers (P4048, P4100) are planned. C++29 snapshots are published as pre-releases (`cxx29-YYYY.MM.DD`). A feature counts as done only when clangd, clang-tidy, clang-format and the other tools understand it as well. Progress is in the GitHub milestones whose names start with `C++29`. C++29 features are available only in `-std=c++29`; no flag enables them in an earlier mode.
 
 ## Will my existing code build?
 

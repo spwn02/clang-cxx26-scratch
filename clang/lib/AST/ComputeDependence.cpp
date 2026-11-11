@@ -19,6 +19,7 @@
 #include "clang/AST/ExprObjC.h"
 #include "clang/AST/ExprOpenMP.h"
 #include "clang/Basic/ExceptionSpecificationType.h"
+#include "clang/Lex/Token.h"
 #include "llvm/ADT/ArrayRef.h"
 
 using namespace clang;
@@ -196,6 +197,25 @@ ExprDependence clang::computeDependence(StmtExpr *E, unsigned TemplateDepth) {
     D |= ExprDependence::ValueInstantiation;
   // A param pack cannot be expanded over stmtexpr boundaries.
   return D & ~ExprDependence::UnexpandedPack;
+}
+
+ExprDependence clang::computeDependence(DoExpr *E, unsigned TemplateDepth,
+                                        bool ContainsUnexpandedParameterPack) {
+  auto D = toExprDependenceForImpliedType(E->getType()->getDependence());
+  // Like a statement-expression, treat a do-expression in a dependent context
+  // as always value- and instantiation-dependent: the body may contain
+  // do_return statements whose operand depends on enclosing template params.
+  if (TemplateDepth)
+    D |= ExprDependence::ValueInstantiation;
+  // Unlike a statement-expression, a pack *can* be expanded over a
+  // do-expression boundary: P2806 gives a do-expression the semantics of an
+  // immediately-invoked lambda, and a lambda propagates the bit out to the
+  // enclosing expansion in exactly this way. The body is duplicated once per
+  // element, which is what a lambda body does too.
+  D &= ~ExprDependence::UnexpandedPack;
+  if (ContainsUnexpandedParameterPack)
+    D |= ExprDependence::UnexpandedPack;
+  return D;
 }
 
 ExprDependence clang::computeDependence(ConvertVectorExpr *E) {
@@ -894,9 +914,7 @@ ExprDependence clang::computeDependence(CXXDependentScopeMemberExpr *E) {
 
 ExprDependence clang::computeDependence(DependentTemplateIdExpr *E) {
   auto D = ExprDependence::TypeValueInstantiation;
-  if (E->getTemplateName().getDependence() &
-      TemplateNameDependence::UnexpandedPack)
-    D |= ExprDependence::UnexpandedPack;
+  D |= toExprDependence(E->getTemplateName().getDependence());
   D |= getDependenceInExpr(E->getNameInfo());
   for (const auto &A : E->template_arguments())
     D |= toExprDependence(A.getArgument().getDependence());
@@ -1000,15 +1018,33 @@ ExprDependence clang::computeDependence(CXXReflectExpr *E,
     D |= RV.getReflectedAnnotation()->getArg()->getDependence();
     return D;
   }
+  case ReflectionKind::Expression:
+    return D | RV.getReflectedExpression()->getDependence();
   case ReflectionKind::Null:
   case ReflectionKind::Object:
   case ReflectionKind::Value:
   case ReflectionKind::Namespace:
   case ReflectionKind::BaseSpecifier:
   case ReflectionKind::DataMemberSpec:
+  case ReflectionKind::DeclarationSpec:
     return ExprDependence::None;
   }
   llvm_unreachable("unknown reflection kind while computing dependence");
+}
+
+ExprDependence clang::computeDependence(CXXTokenSequenceExpr *E) {
+  // Token sequences may contain dependent interpolation expressions.
+  ExprDependence D = ExprDependence::None;
+  TokenSequenceData TSD = E->getTokenSequence();
+  for (const Token &Tok : TSD) {
+    if (Tok.is(tok::annot_token_seq_expr)) {
+      const Expr *InterpExpr =
+          reinterpret_cast<const Expr *>(Tok.getAnnotationValue());
+      if (InterpExpr)
+        D |= InterpExpr->getDependence();
+    }
+  }
+  return D;
 }
 
 ExprDependence clang::computeDependence(CXXMetafunctionExpr *E) {
@@ -1056,6 +1092,30 @@ ExprDependence clang::computeDependence(ExplDependentCallExpr *E) {
   auto D = E->getDependence();
   if (E->getTemplateDepth() > 0)
     D |= ExprDependence::Value;
+  return D;
+}
+
+ExprDependence clang::computeDependence(CXXBuiltinStringizeExpr *E) {
+  return E->getOperand()->getDependence();
+}
+
+ExprDependence clang::computeDependence(CXXMacroInvocationExpr *E) {
+  // A resolved invocation is as dependent as its expansion.
+  if (Expr *Expansion = E->getExpansion())
+    return Expansion->getDependence();
+  // Until then the expansion is deferred, so it is always dependent; the
+  // operands contribute unexpanded packs and the like.
+  auto D = ExprDependence::TypeValueInstantiation;
+  if (Expr *Callee = E->getCallee())
+    D |= Callee->getDependence();
+  if (Expr *Base = E->getBase())
+    D |= Base->getDependence();
+  for (Expr *Arg : E->getArgs())
+    D |= Arg->getDependence();
+  if (const ASTTemplateArgumentListInfo *TArgs = E->getMemberTemplateArgs())
+    for (const TemplateArgumentLoc &A : TArgs->arguments())
+      D |= toExprDependence(A.getArgument().getDependence() &
+                            TemplateArgumentDependence::UnexpandedPack);
   return D;
 }
 
@@ -1120,4 +1180,105 @@ ExprDependence clang::computeDependence(OpenACCAsteriskSizeExpr *E) {
   // This represents a simple asterisk as typed, so cannot be dependent in any
   // way.
   return ExprDependence::None;
+}
+
+static ExprDependence getMatchStmtDependence(const Stmt *S) {
+  if (!S)
+    return ExprDependence::None;
+  if (const auto *E = dyn_cast<Expr>(S))
+    return E->getDependence();
+
+  ExprDependence D = ExprDependence::None;
+  if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+    for (const Decl *Declaration : DS->decls()) {
+      if (const auto *Assertion = dyn_cast<StaticAssertDecl>(Declaration)) {
+        D |= Assertion->getAssertExpr()->getDependence();
+        if (const Expr *Message = Assertion->getMessage())
+          D |= Message->getDependence();
+      }
+      if (const auto *Alias = dyn_cast<TypedefNameDecl>(Declaration))
+        D |= toExprDependenceForImpliedType(
+            Alias->getUnderlyingType()->getDependence());
+      const auto *Value = dyn_cast<ValueDecl>(Declaration);
+      if (!Value)
+        continue;
+      D |= toExprDependenceForImpliedType(Value->getType()->getDependence());
+      if (const auto *Variable = dyn_cast<VarDecl>(Value))
+        if (const Expr *Init = Variable->getInit())
+          D |= Init->getDependence();
+    }
+  }
+  for (const Stmt *Child : S->children())
+    D |= getMatchStmtDependence(Child);
+  return D;
+}
+
+static ExprDependence getMatchGuardDependence(const MatchGuard &Guard) {
+  ExprDependence D = getMatchStmtDependence(Guard.Init);
+  if (const VarDecl *Variable = Guard.ConditionVariable) {
+    D |= toExprDependenceForImpliedType(Variable->getType()->getDependence());
+    if (const Expr *Init = Variable->getInit())
+      D |= Init->getDependence();
+  }
+  if (Guard.Condition)
+    D |= Guard.Condition->getDependence();
+  return D;
+}
+
+static ExprDependence
+getMatchPatternDependence(const MatchPattern *Pattern,
+                          const MatchPatternInstantiation *Instantiation) {
+  if (const auto *Or = dyn_cast<OrPattern>(Pattern)) {
+    ExprDependence D = ExprDependence::None;
+    for (auto [I, Alternative] : llvm::enumerate(Or->alternatives()))
+      if (Instantiation->isViableOrAlternative(Or, I))
+        D |= getMatchPatternDependence(Alternative, Instantiation);
+    return D;
+  }
+  if (const auto *Decomposition = dyn_cast<DecompositionPattern>(Pattern)) {
+    ExprDependence D = ExprDependence::None;
+    for (const MatchPattern *Child :
+         Instantiation->getDecompositionPatterns(Decomposition))
+      D |= getMatchPatternDependence(Child, Instantiation);
+    return D;
+  }
+  if (const auto *Alternative = dyn_cast<AlternativePattern>(Pattern)) {
+    ExprDependence D = ExprDependence::None;
+    if (const ConceptReference *Constraint =
+            Alternative->getTypeConstraintSelector())
+      if (const ASTTemplateArgumentListInfo *Args =
+              Constraint->getTemplateArgsAsWritten())
+        for (const TemplateArgumentLoc &Arg : Args->arguments())
+          D |= toExprDependence(Arg.getArgument().getDependence());
+    if (const MatchPattern *Selector = Alternative->getSelector())
+      D |= getMatchPatternDependence(Selector, Instantiation);
+    if (const MatchPattern *SubPattern = Alternative->getSubPattern())
+      D |= getMatchPatternDependence(SubPattern, Instantiation);
+    return D;
+  }
+  return Pattern->getDependence();
+}
+
+ExprDependence clang::computeDependence(MatchTestExpr *E) {
+  return turnTypeToValueDependence(
+      E->getSubject()->getDependence() |
+      getMatchPatternDependence(E->getPattern(), E->getPatternInstantiation()) |
+      getMatchGuardDependence(E->getGuard()));
+}
+
+ExprDependence clang::computeDependence(MatchSelectExpr *E) {
+  ExprDependence D =
+      toExprDependenceForImpliedType(E->getType()->getDependence());
+  if (const Stmt *Init = E->getInitStmt())
+    D |= turnTypeToValueDependence(getMatchStmtDependence(Init));
+  D |= turnTypeToValueDependence(E->getSubject()->getDependence());
+  for (const Stmt *Statement : E->getPreamble())
+    D |= turnTypeToValueDependence(getMatchStmtDependence(Statement));
+  for (const MatchCaseInstantiation &Case : E->getCaseInstantiations()) {
+    D |= turnTypeToValueDependence(
+        getMatchPatternDependence(Case.Pattern, Case.PatternInstantiation));
+    D |= turnTypeToValueDependence(getMatchGuardDependence(Case.Guard));
+    D |= turnTypeToValueDependence(getMatchStmtDependence(Case.Handler));
+  }
+  return D;
 }

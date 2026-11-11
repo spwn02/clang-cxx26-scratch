@@ -127,6 +127,15 @@ struct ASTConstraintSatisfaction final :
 ///
 ///   template <std::derives_from<Expr> T> void dump();
 ///             ~~~~~~~~~~~~~~~~~~~~~~~ (in TemplateTypeParmDecl)
+/// The declaration a concept name written in the source refers to: the
+/// concept (or the template template parameter naming one), and for a
+/// pack-index-template-name ``CC...[N]`` (P3670R4) the written pack ``CC``.
+inline TemplateDecl *getWrittenConceptDecl(TemplateName Concept) {
+  if (const auto *PI = Concept.getAsPackIndexingTemplate())
+    return PI->getPattern().getAsTemplateDecl();
+  return Concept.getAsTemplateDecl();
+}
+
 class ConceptReference {
 protected:
   // \brief The optional nested name specifier used when naming the concept.
@@ -146,7 +155,7 @@ protected:
   NamedDecl *FoundDecl;
 
   /// \brief The concept named.
-  TemplateDecl *NamedConcept;
+  TemplateName NamedConcept;
 
   /// \brief The template argument list source info used to specialize the
   /// concept.
@@ -154,7 +163,7 @@ protected:
 
   ConceptReference(NestedNameSpecifierLoc NNS, SourceLocation TemplateKWLoc,
                    DeclarationNameInfo ConceptNameInfo, NamedDecl *FoundDecl,
-                   TemplateDecl *NamedConcept,
+                   TemplateName NamedConcept,
                    const ASTTemplateArgumentListInfo *ArgsAsWritten)
       : NestedNameSpec(NNS), TemplateKWLoc(TemplateKWLoc),
         ConceptName(ConceptNameInfo), FoundDecl(FoundDecl),
@@ -164,7 +173,7 @@ public:
   static ConceptReference *
   Create(const ASTContext &C, NestedNameSpecifierLoc NNS,
          SourceLocation TemplateKWLoc, DeclarationNameInfo ConceptNameInfo,
-         NamedDecl *FoundDecl, TemplateDecl *NamedConcept,
+         NamedDecl *FoundDecl, TemplateName NamedConcept,
          const ASTTemplateArgumentListInfo *ArgsAsWritten);
 
   const NestedNameSpecifierLoc &getNestedNameSpecifierLoc() const {
@@ -198,7 +207,7 @@ public:
     return FoundDecl;
   }
 
-  TemplateDecl *getNamedConcept() const { return NamedConcept; }
+  TemplateName getNamedConcept() const { return NamedConcept; }
 
   const ASTTemplateArgumentListInfo *getTemplateArgsAsWritten() const {
     return ArgsAsWritten;
@@ -251,9 +260,7 @@ public:
 
   // FIXME: Instead of using these concept related functions the callers should
   // directly work with the corresponding ConceptReference.
-  TemplateDecl *getNamedConcept() const {
-    return ConceptRef->getNamedConcept();
-  }
+  TemplateName getNamedConcept() const { return ConceptRef->getNamedConcept(); }
 
   SourceLocation getConceptNameLoc() const {
     return ConceptRef->getConceptNameLoc();

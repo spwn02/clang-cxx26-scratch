@@ -39,6 +39,7 @@
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/Support/Casting.h"
@@ -64,6 +65,7 @@ class CXXConstructorDecl;
 class CXXDestructorDecl;
 class CXXFinalOverriderMap;
 class CXXIndirectPrimaryBaseSet;
+class CXXMacroInvocationExpr;
 class CXXMethodDecl;
 class CXXRecordDecl;
 class DecompositionDecl;
@@ -4271,6 +4273,9 @@ class BindingDecl : public ValueDecl {
   /// binding).
   Expr *Binding = nullptr;
 
+  /// The nested structured binding introduced for this binding, if any.
+  DecompositionDecl *NestedDecomposition = nullptr;
+
   BindingDecl(DeclContext *DC, SourceLocation IdLoc, IdentifierInfo *Id,
               QualType T)
       : ValueDecl(Decl::Binding, DC, IdLoc, Id, T) {}
@@ -4297,6 +4302,11 @@ public:
   /// decomposition of.
   ValueDecl *getDecomposedDecl() const { return Decomp; }
 
+  DecompositionDecl *getNestedDecomposition() const {
+    return NestedDecomposition;
+  }
+  bool isNestedDecomposition() const { return NestedDecomposition != nullptr; }
+
   /// Set the binding for this BindingDecl, along with its declared type (which
   /// should be a possibly-cv-qualified form of the type of the binding, or a
   /// reference to such a type).
@@ -4307,6 +4317,10 @@ public:
 
   /// Set the decomposed variable for this BindingDecl.
   void setDecomposedDecl(ValueDecl *Decomposed) { Decomp = Decomposed; }
+
+  void setNestedDecomposition(DecompositionDecl *Nested) {
+    NestedDecomposition = Nested;
+  }
 
   /// Get the variable (if any) that holds the value of evaluating the binding.
   /// Only present for user-defined bindings for tuple-like types.
@@ -4387,6 +4401,23 @@ public:
                                             std::move(PackBindings),
                                             std::move(Bindings));
   }
+
+  /// All semantic bindings in initialization order. Binding packs are
+  /// expanded, and unnamed bindings that introduce nested decompositions are
+  /// included.
+  SmallVector<BindingDecl *, 8> all_bindings() const;
+
+  /// All semantic leaf bindings. Binding packs are expanded and nested
+  /// decompositions are recursively flattened.
+  SmallVector<BindingDecl *, 8> leaf_bindings() const;
+
+  /// All source bindings in source order. Binding packs are not expanded, and
+  /// unnamed bindings that introduce nested decompositions are included.
+  SmallVector<BindingDecl *, 8> all_source_bindings() const;
+
+  /// All named source bindings. Binding packs are not expanded and nested
+  /// decompositions are recursively flattened.
+  SmallVector<BindingDecl *, 8> source_leaf_bindings() const;
 
   void printName(raw_ostream &OS, const PrintingPolicy &Policy) const override;
 
@@ -4593,6 +4624,12 @@ public:
   static ConstevalBlockDecl *CreateDeserialized(ASTContext &C, GlobalDeclID ID);
 
   Expr *getEvaluatingExpr() const { return EvaluatingExpr; }
+
+  /// A declaration macro invocation in a class template ('name!(args);') is
+  /// recorded as a consteval block whose expression is the invocation: at
+  /// instantiation the macro expands into the specialization, as a
+  /// 'consteval { queue_injection(...); }' would.
+  CXXMacroInvocationExpr *getDeclMacroInvocation() const;
 
   SourceRange getSourceRange() const override LLVM_READONLY {
     return SourceRange(getLocation(), EvaluatingExpr->getEndLoc());

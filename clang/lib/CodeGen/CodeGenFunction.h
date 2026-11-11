@@ -718,6 +718,29 @@ public:
     }
   };
 
+  /// Retain deferred lifetime-extended cleanups in the surrounding scope
+  /// without running its ordinary cleanups.
+  class LifetimeExtendedCleanupScope {
+    CodeGenFunction &CGF;
+    size_t OldLifetimeExtendedSize;
+    CleanupDeactivationScope DeactivateCleanups;
+
+  public:
+    explicit LifetimeExtendedCleanupScope(CodeGenFunction &CGF)
+        : CGF(CGF),
+          OldLifetimeExtendedSize(CGF.LifetimeExtendedCleanupStack.size()),
+          DeactivateCleanups(CGF) {}
+
+    LifetimeExtendedCleanupScope(const LifetimeExtendedCleanupScope &) = delete;
+    LifetimeExtendedCleanupScope &
+    operator=(const LifetimeExtendedCleanupScope &) = delete;
+
+    ~LifetimeExtendedCleanupScope() {
+      DeactivateCleanups.ForceDeactivate();
+      CGF.PushLifetimeExtendedCleanups(OldLifetimeExtendedSize);
+    }
+  };
+
   llvm::SmallVector<const JumpDest *, 2> SEHTryEpilogueStack;
 
   llvm::Instruction *CurrentFuncletPad = nullptr;
@@ -1020,6 +1043,15 @@ public:
   /// process all branch fixups.
   void PopCleanupBlock(bool FallThroughIsBranchThrough = false,
                        bool ForDeactivation = false);
+
+  /// Push deferred lifetime-extended cleanups into the current cleanup scope.
+  void PushLifetimeExtendedCleanups(size_t OldSize);
+
+  void CaptureConditionTemporaryCleanups(
+      EHScopeStack::stable_iterator OldDepth, llvm::Instruction *InitIP,
+      SmallVectorImpl<EHScopeStack::stable_iterator> &Cleanups);
+  void EmitConditionTemporaryCleanups(
+      ArrayRef<EHScopeStack::stable_iterator> Cleanups);
 
   /// DeactivateCleanupBlock - Deactivates the given cleanup block.
   /// The block cannot be reactivated.  Pops it if it's the top of the
@@ -1586,6 +1618,34 @@ private:
     JumpDest ContinueBlock;
   };
   SmallVector<BreakContinue, 8> BreakContinueStack;
+
+  /// Per-do-expression CodeGen state. When emitting a do-expression body,
+  /// `do_return` writes its operand into `Slot` and branches to `EndBlock`.
+  /// When `Slot` is invalid (void result), the operand is emitted for side
+  /// effects only. When `IsReference` is true, the do-expression yields a
+  /// glvalue: `Slot` holds a pointer to the referent, and `do_return` stores
+  /// the address of its operand instead of constructing into the slot.
+  struct DoExprEmitInfo {
+    Address Slot;
+    JumpDest EndBlock;
+    bool IsReference;
+    /// The body local that is built directly into `Slot`, if the
+    /// do-expression has an NRVO candidate. See DoExpr::getNRVOCandidate.
+    const VarDecl *NRVOCandidate;
+  };
+  SmallVector<DoExprEmitInfo, 4> DoExprStack;
+
+  /// The variables entered into LocalDeclMap while emitting a do-expression,
+  /// one frame per do-expression currently being emitted (see EmitDoExpr).
+  ///
+  /// Unlike every other expression that can declare a variable, a
+  /// do-expression can appear in an expression tree that CodeGen emits more
+  /// than once in the same function: a default member initializer, or a
+  /// default argument, is one AST shared by every use. The second emission
+  /// needs its own storage, so the first emission's entries have to be taken
+  /// back out of LocalDeclMap when its scope closes -- they are unreachable by
+  /// then in any case, since nothing outside the body can name them.
+  SmallVector<SmallVector<const VarDecl *, 4>, 2> DoExprEmittedLocals;
 
   /// Handles cancellation exit points in OpenMP-related constructs.
   class OpenMPCancelExitStack {
@@ -2987,6 +3047,15 @@ public:
   /// result.
   void EmitIgnoredExpr(const Expr *E);
 
+  /// Emit \p E, a diverging expression (P3549), for its effects, then mark
+  /// the point after it unreachable. Leaves a fresh, unreachable insertion
+  /// point for whatever the caller emits next.
+  void EmitDivergingExpr(const Expr *E);
+
+  /// Mark the current point unreachable (as after a diverging expression)
+  /// and start a fresh, unreachable insertion point.
+  void EmitDivergencePoint();
+
   /// EmitAnyExpr - Emit code to compute the specified expression which can have
   /// any type.  The result is returned as an RValue struct.  If this is an
   /// aggregate expression, the aggloc/agglocvolatile arguments indicate where
@@ -3651,6 +3720,8 @@ public:
   void EmitLabel(const LabelDecl *D); // helper for EmitLabelStmt.
 
   void EmitLabelStmt(const LabelStmt &S);
+  void EmitWithStmtAttributes(const Stmt *S, ArrayRef<const Attr *> Attrs,
+                              llvm::function_ref<void()> Emit);
   void EmitAttributedStmt(const AttributedStmt &S);
   void EmitGotoStmt(const GotoStmt &S);
   void EmitIndirectGotoStmt(const IndirectGotoStmt &S);
@@ -3660,6 +3731,9 @@ public:
   void EmitDoStmt(const DoStmt &S, ArrayRef<const Attr *> Attrs = {});
   void EmitForStmt(const ForStmt &S, ArrayRef<const Attr *> Attrs = {});
   void EmitReturnStmt(const ReturnStmt &S);
+  void EmitDoReturnStmt(const DoReturnStmt &S);
+  Address EmitDoExpr(const DoExpr &E, AggValueSlot AVS);
+  LValue EmitDoExprLValue(const DoExpr *E);
   void EmitDeclStmt(const DeclStmt &S);
   void EmitBreakStmt(const BreakStmt &S);
   void EmitContinueStmt(const ContinueStmt &S);
@@ -3668,6 +3742,7 @@ public:
   void EmitCaseStmt(const CaseStmt &S, ArrayRef<const Attr *> Attrs);
   void EmitCaseStmtRange(const CaseStmt &S, ArrayRef<const Attr *> Attrs);
   void EmitDeferStmt(const DeferStmt &S);
+
   void EmitAsmStmt(const AsmStmt &S);
 
   const BreakContinue *GetDestForLoopControlStmt(const LoopControlStmt &S);
@@ -5220,6 +5295,62 @@ public:
   RValue EmitAtomicExpr(AtomicExpr *E);
 
   void EmitFakeUse(Address Addr);
+  RValue EmitMatchTestExpr(const MatchTestExpr &S);
+  void EmitMatchTestSubject(const MatchTestExpr &S);
+  void EmitMatchTestDispatch(
+      const MatchTestExpr &S, JumpDest SuccessDest,
+      llvm::function_ref<void(const MatchTestInstantiation &)> EmitSuccess,
+      JumpDest FailureDest, llvm::function_ref<void()> EmitFailure);
+  void EmitCaseConditionChain(
+      const Expr *Condition,
+      llvm::function_ref<void(const MatchTestInstantiation *)> EmitSuccess,
+      JumpDest FailureDest);
+  void EmitCaseConditionChainImpl(
+      const Expr *Condition,
+      llvm::function_ref<void(const MatchTestInstantiation *)> EmitSuccess,
+      JumpDest FailureDest,
+      SmallVectorImpl<EHScopeStack::stable_iterator> &TemporaryCleanups);
+  void EmitSelectedMatchTestInstantiation(
+      const MatchTestExpr &S, const MatchTestInstantiation &Instantiation,
+      llvm::function_ref<void()> EmitSuccess);
+  RValue EmitMatchSelectExpr(const MatchSelectExpr &S);
+  RValue EmitMatchSelectExpr(const MatchSelectExpr &S, AggValueSlot Dest);
+  LValue EmitMatchSelectExprLValue(const MatchSelectExpr *E);
+  enum class MatchCandidateKind { Test, Condition, Selection };
+  void EmitMatchCandidate(
+      const MatchPattern *Pattern,
+      const MatchPatternInstantiation *Instantiation, const MatchGuard &Guard,
+      llvm::BasicBlock *PatternFailure, llvm::BasicBlock *GuardFailure,
+      llvm::BasicBlock *Success,
+      llvm::function_ref<void(llvm::BasicBlock *, llvm::BasicBlock *)>
+          EmitPattern,
+      llvm::function_ref<void()> EmitAction, Stmt::Likelihood GuardLikelihood,
+      MatchCandidateKind Kind);
+  RValue
+  EmitMatchPattern(const MatchPattern *Pattern,
+                   const MatchPatternInstantiation *Instantiation,
+                   const Expr *Subject);
+  void EmitMatchPatternBranch(
+      const MatchPattern *Pattern,
+      const MatchPatternInstantiation *Instantiation, const Expr *Subject,
+      llvm::BasicBlock *Success, llvm::BasicBlock *Failure,
+      ArrayRef<const MatchPattern *> KnownTestPatterns = {},
+      ArrayRef<const MatchPattern *> CompletedPatterns = {});
+  void EmitMatchDiscriminator(const MatchProjection &Projection);
+  void EmitMatchProjectionValue(const MatchProjection &Projection);
+  void EmitSharedDeclarationProjections(
+      const MatchPattern *Pattern,
+      const MatchPatternInstantiation *Instantiation);
+  void
+  EmitMatchPatternDeclarations(const MatchPattern *Pattern,
+                               const MatchPatternInstantiation *Instantiation);
+  void EmitSelectedMatchPatternProjections(
+      const MatchPattern *Pattern,
+      const MatchPatternInstantiation *Instantiation);
+  void EmitMatchGuardBranch(const MatchGuard &MG, llvm::BasicBlock *Success,
+                            llvm::BasicBlock *Failure,
+                            Stmt::Likelihood LH = Stmt::LH_None);
+  RValue EmitMatchGuard(const MatchGuard &MG, llvm::Value *PatBoolRes);
 
   //===--------------------------------------------------------------------===//
   //                         Annotations Emission
@@ -5466,6 +5597,8 @@ private:
   void setAddrOfLocalVar(const VarDecl *VD, Address Addr) {
     assert(!LocalDeclMap.count(VD) && "Decl already exists in LocalDeclMap!");
     LocalDeclMap.insert({VD, Addr});
+    if (!DoExprEmittedLocals.empty())
+      DoExprEmittedLocals.back().push_back(VD);
   }
 
   /// ExpandTypeFromArgs - Reconstruct a structure of type \arg Ty

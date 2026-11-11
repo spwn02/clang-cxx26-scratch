@@ -34,6 +34,8 @@ bool Parser::isCXXDeclarationStatement(
   case tok::kw_static_assert:
   case tok::kw__Static_assert:
     return true;
+  case tok::kw___macro:
+    return true;
   case tok::kw_consteval:
     // consteval-block-declaration
     if (getLangOpts().Reflection)
@@ -137,12 +139,17 @@ bool Parser::isCXXSimpleDeclaration(bool AllowForRangeDecl) {
     return TPR != TPResult::False; // Returns true for TPResult::True or
                                    // TPResult::Error.
 
+  if (TPR == TPResult::False)
+    return false;
+  if (TPR == TPResult::Error)
+    return true;
+
   // FIXME: TryParseSimpleDeclaration doesn't look past the first initializer,
   // and so gets some cases wrong. We can't carry on if we've already seen
   // something which makes this statement invalid as a declaration in this case,
   // since it can cause us to misparse valid code. Revisit this once
   // TryParseInitDeclaratorList is fixed.
-  if (InvalidAsDeclaration)
+  if (TPR == TPResult::Ambiguous && InvalidAsDeclaration)
     return false;
 
   // FIXME: Add statistics about the number of ambiguous statements encountered
@@ -254,7 +261,9 @@ Parser::TPResult Parser::TryParseSimpleDeclaration(bool AllowForRangeDecl) {
   }
 
   TPResult TPR = TryParseInitDeclaratorList(
-      /*mayHaveTrailingReturnType=*/DeclSpecifierIsAuto);
+      /*MayHaveTrailingReturnType=*/DeclSpecifierIsAuto,
+      /*StopAfterFirstDeclarator=*/false,
+      /*MayBeAbstract=*/false);
   if (TPR != TPResult::Ambiguous)
     return TPR;
 
@@ -265,11 +274,13 @@ Parser::TPResult Parser::TryParseSimpleDeclaration(bool AllowForRangeDecl) {
 }
 
 Parser::TPResult
-Parser::TryParseInitDeclaratorList(bool MayHaveTrailingReturnType) {
+Parser::TryParseInitDeclaratorList(bool MayHaveTrailingReturnType,
+                                   bool StopAfterFirstDeclarator,
+                                   bool MayBeAbstract) {
   while (true) {
     // declarator
     TPResult TPR = TryParseDeclarator(
-        /*mayBeAbstract=*/false,
+        /*mayBeAbstract=*/MayBeAbstract,
         /*mayHaveIdentifier=*/true,
         /*mayHaveDirectInit=*/false,
         /*mayHaveTrailingReturnType=*/MayHaveTrailingReturnType);
@@ -310,7 +321,7 @@ Parser::TryParseInitDeclaratorList(bool MayHaveTrailingReturnType) {
       return TPResult::True;
     }
 
-    if (!TryConsumeToken(tok::comma))
+    if (StopAfterFirstDeclarator || !TryConsumeToken(tok::comma))
       break;
   }
 
@@ -463,6 +474,8 @@ Parser::isCXXConditionDeclarationOrInitStatement(bool CanBeInitStatement,
 
   if (CanBeInitStatement && Tok.is(tok::kw_using))
     return ConditionOrInitStatement::InitStmtDecl;
+  if (isPrefixMatchTestExpression())
+    return ConditionOrInitStatement::Expression;
   if (State.update(isCXXDeclarationSpecifier(ImplicitTypenameContext::No)))
     return State.result();
 
@@ -528,6 +541,41 @@ Parser::isCXXConditionDeclarationOrInitStatement(bool CanBeInitStatement,
 
 bool Parser::isCXXTypeId(TentativeCXXTypeIdContext Context, bool &isAmbiguous) {
   isAmbiguous = false;
+
+  if (Context == TentativeCXXTypeIdContext::InMatchTrailingReturnType) {
+    bool HasTypeSpecifier = false;
+    bool MayHaveTrailingReturnType = Tok.is(tok::kw_auto);
+
+    while (true) {
+      // In this context, `auto {` is a placeholder type followed by the match
+      // body, not a braced functional cast.
+      if (Tok.is(tok::kw_auto)) {
+        ConsumeToken();
+        HasTypeSpecifier = true;
+        continue;
+      }
+
+      TPResult TPR =
+          isCXXDeclarationSpecifier(ImplicitTypenameContext::No,
+                                    /*BracedCastResult=*/TPResult::True);
+      if (TPR == TPResult::False)
+        break;
+      if (TPR == TPResult::Error)
+        return false;
+
+      HasTypeSpecifier |= isCXXDeclarationSpecifierAType();
+      if (TryConsumeDeclarationSpecifier() == TPResult::Error)
+        return false;
+    }
+
+    if (!HasTypeSpecifier)
+      return false;
+
+    TPResult TPR = TryParseDeclarator(
+        /*mayBeAbstract=*/true, /*mayHaveIdentifier=*/false,
+        /*mayHaveDirectInit=*/false, MayHaveTrailingReturnType);
+    return TPR != TPResult::False && TPR != TPResult::Error;
+  }
 
   // C++ 8.2p2:
   // The ambiguity arising from the similarity between a function-style cast and
@@ -615,6 +663,12 @@ bool Parser::isCXXTypeId(TentativeCXXTypeIdContext Context, bool &isAmbiguous) {
     } else if (Context ==
                    TentativeCXXTypeIdContext::AsGenericSelectionArgument &&
                Tok.is(tok::comma)) {
+      TPR = TPResult::True;
+      isAmbiguous = true;
+    } else if (Context == TentativeCXXTypeIdContext::InMatchPattern &&
+               Tok.isOneOf(tok::equalgreater, tok::kw_if, tok::semi, tok::comma,
+                           tok::colon, tok::r_paren, tok::r_square,
+                           tok::r_brace, tok::eof)) {
       TPR = TPResult::True;
       isAmbiguous = true;
     // We are supposed to be inside a template argument, so if after
@@ -827,7 +881,9 @@ bool Parser::TrySkipAttributes() {
   return true;
 }
 
-Parser::TPResult Parser::TryParsePtrOperatorSeq() {
+Parser::TPResult Parser::TryParsePtrOperatorSeq(bool *HadPtrOperator) {
+  if (HadPtrOperator)
+    *HadPtrOperator = false;
   while (true) {
     if (TryAnnotateOptionalCXXScopeToken(true))
       return TPResult::Error;
@@ -835,6 +891,8 @@ Parser::TPResult Parser::TryParsePtrOperatorSeq() {
     if (Tok.isOneOf(tok::star, tok::amp, tok::caret, tok::ampamp) ||
         (Tok.is(tok::annot_cxxscope) && NextToken().is(tok::star))) {
       // ptr-operator
+      if (HadPtrOperator)
+        *HadPtrOperator = true;
       ConsumeAnyToken();
 
       // Skip attributes.
@@ -1119,9 +1177,13 @@ Parser::isCXXDeclarationSpecifier(ImplicitTypenameContext AllowImplicitTypename,
       return TPResult::True;
 
     const Token &Next = NextToken();
-    // In 'foo bar', 'foo' is always a type name outside of Objective-C.
-    if (!getLangOpts().ObjC && Next.is(tok::identifier))
+    // In 'foo bar', 'foo' is always a type name outside of Objective-C
+    // and pattern matching `match` expression.
+    if (!getLangOpts().ObjC && Next.is(tok::identifier) &&
+        (!getLangOpts().PatternMatching ||
+         Next.getIdentifierInfo() != Ident_match)) {
       return TPResult::True;
+    }
 
     // If this identifier was reverted from a token ID, and the next token
     // is a '(', we assume it to be a use of a type trait, so this
@@ -1233,6 +1295,7 @@ Parser::isCXXDeclarationSpecifier(ImplicitTypenameContext AllowImplicitTypename,
   case tok::kw_constexpr:
   case tok::kw_consteval:
   case tok::kw_constinit:
+  case tok::kw___macro:
     // storage-class-specifier
   case tok::kw_register:
   case tok::kw_static:
@@ -1348,6 +1411,17 @@ Parser::isCXXDeclarationSpecifier(ImplicitTypenameContext AllowImplicitTypename,
     }
     return TPResult::False;
   }
+  case tok::annot_template_name: {
+    if (!NextToken().is(tok::less))
+      return TPResult::False;
+    if (TryAnnotateTypeOrScopeToken(AllowImplicitTypename))
+      return TPResult::Error;
+    if (Tok.is(tok::annot_template_name))
+      return TPResult::False;
+    return isCXXDeclarationSpecifier(AllowImplicitTypename, BracedCastResult,
+                                     InvalidAsDeclSpec);
+  }
+
   case tok::annot_template_id: {
     TemplateIdAnnotation *TemplateId = takeTemplateIdAnnotation(Tok);
     // If lookup for the template-name found nothing, don't assume we have a
@@ -1513,6 +1587,17 @@ Parser::isCXXDeclarationSpecifier(ImplicitTypenameContext AllowImplicitTypename,
 
   case tok::annot_typename:
   case_typename:
+    // An already-annotated type followed by '::' -- e.g. a type reflection
+    // interpolated into an injected token sequence -- begins a
+    // nested-name-specifier, not a decl-specifier by itself. Annotate the
+    // scope and whatever follows it, then reconsider.
+    if (Tok.is(tok::annot_typename) && NextToken().is(tok::coloncolon)) {
+      if (TryAnnotateTypeOrScopeToken(AllowImplicitTypename))
+        return TPResult::Error;
+      return isCXXDeclarationSpecifier(AllowImplicitTypename, BracedCastResult,
+                                       InvalidAsDeclSpec);
+    }
+
     // In Objective-C, we might have a protocol-qualified type.
     if (getLangOpts().ObjC && NextToken().is(tok::less)) {
       // Tentatively parse the protocol qualifiers.

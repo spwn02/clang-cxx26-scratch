@@ -10,6 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/AST/Reflection.h"
+#include "clang/Lex/Token.h"
 #include "clang/AST/TextNodeDumper.h"
 #include "clang/AST/APValue.h"
 #include "clang/AST/DeclFriend.h"
@@ -552,7 +554,7 @@ void TextNodeDumper::Visit(const ConceptReference *R) {
   dumpPointer(R);
   dumpSourceRange(R->getSourceRange());
   OS << ' ';
-  dumpBareDeclRef(R->getNamedConcept());
+  dumpBareConcept(R->getNamedConcept());
 }
 
 void TextNodeDumper::Visit(const concepts::Requirement *R) {
@@ -622,6 +624,8 @@ static bool isSimpleAPValue(const APValue &Value) {
   case APValue::Struct:
   case APValue::Reflection:
     return false;
+  case APValue::TokenSequence:
+    return true;
   case APValue::Union:
     return isSimpleAPValue(Value.getUnionValue());
   }
@@ -757,6 +761,8 @@ void TextNodeDumper::Visit(const APValue &Value, QualType Ty) {
     OS << ", Null=" << Value.isNullPointer()
        << ", Offset=" << Value.getLValueOffset().getQuantity()
        << ", HasPath=" << Value.hasLValuePath();
+    if (Value.getLValueTag())
+      OS << ", Tag=" << Value.getLValueTag();
     if (Value.hasLValuePath()) {
       OS << ", PathLength=" << Value.getLValuePath().size();
       OS << ", Path=(";
@@ -859,6 +865,10 @@ void TextNodeDumper::Visit(const APValue &Value, QualType Ty) {
   case APValue::Reflection:
     OS << "Reflection <todo>";
     return;
+  case APValue::TokenSequence:
+    OS << "TokenSequence " << Value.getTokenSequence().size() << " '"
+       << spellTokenSequence(Value.getTokenSequence()) << "'";
+    return;
   }
   llvm_unreachable("Unknown APValue kind!");
 }
@@ -937,6 +947,24 @@ void TextNodeDumper::dumpType(QualType T) {
   dumpBareType(T);
 }
 
+void TextNodeDumper::dumpBareConcept(TemplateName TN) {
+  {
+    ColorScope Color(OS, ShowColors, DeclKindNameColor);
+    OS << "Concept";
+  }
+
+  const TemplateDecl *TD = TN.getAsTemplateDecl();
+  dumpPointer(TD ? static_cast<const void *>(TD) : TN.getAsVoidPointer());
+
+  ColorScope Color(OS, ShowColors, DeclNameColor);
+  OS << " '";
+  if (TD)
+    OS << TD->getDeclName();
+  else // a pack-index-template-name (P3670R4)
+    TN.print(OS, PrintPolicy);
+  OS << '\'';
+}
+
 void TextNodeDumper::dumpBareDeclRef(const Decl *D) {
   if (!D) {
     ColorScope Color(OS, ShowColors, NullColor);
@@ -958,7 +986,10 @@ void TextNodeDumper::dumpBareDeclRef(const Decl *D) {
       switch (ND->getKind()) {
       case Decl::Decomposition: {
         auto *DD = cast<DecompositionDecl>(ND);
-        OS << " first_binding '" << DD->bindings()[0]->getDeclName() << '\'';
+        if (auto Bindings = DD->source_leaf_bindings(); !Bindings.empty())
+          OS << " first_binding '" << Bindings[0]->getDeclName() << '\'';
+        else
+          OS << " no_bindings";
         break;
       }
       case Decl::Field: {
@@ -1360,6 +1391,19 @@ void TextNodeDumper::dumpBareTemplateName(TemplateName TN) {
     });
     return;
   }
+  case TemplateName::PackIndexingTemplate: {
+    OS << " pack_indexing";
+    const PackIndexingTemplateStorage *PI = TN.getAsPackIndexingTemplate();
+    if (PI->isFullySubstituted())
+      OS << " fully_substituted";
+    if (UnsignedOrNone Index = PI->getSelectedIndex())
+      OS << " index " << *Index;
+    dumpTemplateName(PI->getPattern(), "pattern");
+    AddChild("index", [=] { Visit(PI->getIndexExpr()); });
+    for (TemplateName Expansion : PI->getExpansions())
+      dumpTemplateName(Expansion, "expansion");
+    return;
+  }
   // FIXME: Implement these.
   case TemplateName::OverloadedTemplate:
     OS << " overloaded";
@@ -1498,6 +1542,23 @@ void clang::TextNodeDumper::VisitReturnStmt(const ReturnStmt *Node) {
   }
 }
 
+void clang::TextNodeDumper::VisitCXXTokenSequenceExpr(
+    const CXXTokenSequenceExpr *Node) {
+  if (Node->getValue().isTokenSequence()) {
+    TokenSequenceData TSD = Node->getValue().getTokenSequence();
+    ColorScope Color(OS, ShowColors, ValueColor);
+    OS << " tokens:" << TSD.size() << " '" << spellTokenSequence(TSD) << "'";
+  }
+}
+
+void clang::TextNodeDumper::VisitDoExpr(const DoExpr *Node) {
+  if (const VarDecl *Cand = Node->getNRVOCandidate()) {
+    OS << " nrvo_candidate(";
+    dumpBareDeclRef(Cand);
+    OS << ")";
+  }
+}
+
 void clang::TextNodeDumper::VisitCoawaitExpr(const CoawaitExpr *Node) {
   if (Node->isImplicit())
     OS << " implicit";
@@ -1583,8 +1644,7 @@ void clang::TextNodeDumper::VisitDependentScopeDeclRefExpr(
 void clang::TextNodeDumper::VisitDependentTemplateIdExpr(
     const DependentTemplateIdExpr *Node) {
   OS << (Node->isConceptReference() ? " concept" : " variable template");
-  OS << ' ';
-  dumpBareTemplateName(Node->getTemplateName());
+  dumpTemplateName(Node->getTemplateName(), "name");
 }
 
 void TextNodeDumper::VisitUnresolvedLookupExpr(
@@ -2235,7 +2295,7 @@ void TextNodeDumper::VisitAutoType(const AutoType *T) {
   if (!T->isDeduced())
     OS << " undeduced";
   if (T->isConstrained())
-    dumpDeclRef(T->getTypeConstraintConcept());
+    AddChild([=] { dumpBareConcept(T->getTypeConstraintConcept()); });
 }
 
 void TextNodeDumper::VisitDeducedTemplateSpecializationType(
@@ -2832,11 +2892,12 @@ void TextNodeDumper::VisitBuiltinTemplateDecl(const BuiltinTemplateDecl *D) {
 
 void TextNodeDumper::VisitTemplateTypeParmDecl(const TemplateTypeParmDecl *D) {
   if (const auto *TC = D->getTypeConstraint()) {
-    OS << " ";
-    dumpBareDeclRef(TC->getNamedConcept());
-    if (TC->getNamedConcept() != TC->getFoundDecl()) {
+    OS << ' ';
+    dumpBareConcept(TC->getNamedConcept());
+    if (const auto *USD =
+            dyn_cast_if_present<UsingShadowDecl>(TC->getFoundDecl())) {
       OS << " (";
-      dumpBareDeclRef(TC->getFoundDecl());
+      dumpBareDeclRef(USD);
       OS << ")";
     }
   } else if (D->wasDeclaredWithTypename())
@@ -3291,4 +3352,34 @@ void TextNodeDumper::VisitConvertVectorExpr(const ConvertVectorExpr *S) {
   VisitStmt(S);
   if (S->hasStoredFPFeatures())
     printFPOptions(S->getStoredFPFeatures());
+}
+
+void TextNodeDumper::VisitMatchTestExpr(const MatchTestExpr *Node) {
+  if (Node->hasSemanticInstantiations())
+    OS << " instantiated";
+}
+
+void TextNodeDumper::VisitCaseConditionExpr(const CaseConditionExpr *Node) {
+  VisitMatchTestExpr(Node);
+}
+
+void TextNodeDumper::VisitMatchSelectExpr(const MatchSelectExpr *Node) {
+  if (Node->isConstexpr())
+    OS << " constexpr";
+  if (Node->isStatement())
+    OS << " statement";
+}
+
+void TextNodeDumper::Visit(const MatchPattern *Node) {
+  if (!Node) {
+    ColorScope Color(OS, ShowColors, NullColor);
+    OS << "<<<NULL>>>";
+    return;
+  }
+  {
+    ColorScope Color(OS, ShowColors, StmtColor);
+    OS << Node->getMatchPatternClassName();
+  }
+  dumpPointer(Node);
+  dumpSourceRange(Node->getSourceRange());
 }

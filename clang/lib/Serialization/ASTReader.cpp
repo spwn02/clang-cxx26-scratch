@@ -7465,7 +7465,9 @@ void TypeLocReader::VisitDecltypeTypeLoc(DecltypeTypeLoc TL) {
 }
 
 void TypeLocReader::VisitReflectionSpliceTypeLoc(ReflectionSpliceTypeLoc TL) {
-  // nothing to do
+  TL.setTypenameKWLoc(readSourceLocation());
+  TL.setSpliceBeginLoc(readSourceLocation());
+  TL.setSpliceEndLoc(readSourceLocation());
 }
 
 void TypeLocReader::VisitPackIndexingTypeLoc(PackIndexingTypeLoc TL) {
@@ -7484,7 +7486,7 @@ ConceptReference *ASTRecordReader::readConceptReference() {
   auto TemplateKWLoc = readSourceLocation();
   auto ConceptNameLoc = readDeclarationNameInfo();
   auto FoundDecl = readDeclAs<NamedDecl>();
-  auto NamedConcept = readDeclAs<ConceptDecl>();
+  auto NamedConcept = readTemplateName();
   auto *CR = ConceptReference::Create(
       getContext(), NNS, TemplateKWLoc, ConceptNameLoc, FoundDecl, NamedConcept,
       (readBool() ? readASTTemplateArgumentListInfo() : nullptr));
@@ -7908,6 +7910,15 @@ QualType ASTReader::GetType(TypeID ID) {
       break;
     case PREDEF_TYPE_META_INFO_ID:
       T = Context.MetaInfoTy;
+      break;
+    case PREDEF_TYPE_TOKEN_SEQUENCE_ID:
+      T = Context.TokenSequenceTy;
+      break;
+    case PREDEF_TYPE_META_TOKEN_ID:
+      T = Context.MetaTokenTy;
+      break;
+    case PREDEF_TYPE_NORETURN_ID:
+      T = Context.NoReturnTy;
       break;
     case PREDEF_TYPE_OBJC_ID:
       T = Context.ObjCBuiltinIdTy;
@@ -9300,8 +9311,12 @@ StringRef ASTIdentifierIterator::Next() {
     if (SkipModules && F.isModule())
       continue;
 
+    // A module file whose load failed half way (a truncated file) has no
+    // identifier table.
     ASTIdentifierLookupTable *IdTable =
         (ASTIdentifierLookupTable *)F.IdentifierLookupTable;
+    if (!IdTable)
+      continue;
     Current = IdTable->key_begin();
     End = IdTable->key_end();
   }

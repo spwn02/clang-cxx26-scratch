@@ -733,6 +733,18 @@ static void InitializeCPlusPlusFeatureTestMacros(const LangOptions &LangOpts,
     Builder.defineMacro("__cpp_auto_cast", "202110L");
     Builder.defineMacro("__cpp_explicit_this_parameter", "202110L");
   }
+  // C++29 features.
+  if (LangOpts.DoExpressions) {
+    // P2806 asks for `__cpp_do_expressions`, but the paper is not adopted yet,
+    // so there is no plenary date to use as the value. Define it as 1, the way
+    // __cpp_modules above is defined, so that `#if __cpp_do_expressions` works
+    // today and the value can be set once WG21 fixes it.
+    Builder.defineMacro("__cpp_do_expressions", "1");
+  }
+  if (LangOpts.DivergingExpressions) {
+    // P3549, likewise not adopted: 1 for now.
+    Builder.defineMacro("__cpp_diverging_expressions", "1");
+  }
 
   // We provide those C++23 features as extensions in earlier language modes, so
   // we also define their feature test macros.
@@ -753,7 +765,7 @@ static void InitializeCPlusPlusFeatureTestMacros(const LangOptions &LangOpts,
     Builder.defineMacro("__cpp_trivial_union", "202603L");
     Builder.defineMacro("__cpp_constexpr_virtual_inheritance", "202506L");
     Builder.defineMacro("__cpp_constexpr_exceptions", "202411L");
-    Builder.defineMacro("__cpp_pp_embed", "202502L");
+    Builder.defineMacro("__cpp_pp_embed", LangOpts.CPlusPlus29 ? "202606L" : "202502L");
   }
 
   if (LangOpts.ExpansionStatements)
@@ -761,7 +773,8 @@ static void InitializeCPlusPlusFeatureTestMacros(const LangOptions &LangOpts,
 
   // [cpp.predefined]: defined when contract assertions are supported.
   if (LangOpts.Contracts)
-    Builder.defineMacro("__cpp_contracts", "202502L"); // N5050; 202606L is P3097 (C++29)
+    Builder.defineMacro("__cpp_contracts",
+                        LangOpts.CPlusPlus29 ? "202606L" : "202502L"); // N5054 (P3097R3)
 
   if (LangOpts.Reflection)
     Builder.defineMacro("__cpp_impl_reflection", "202603L");

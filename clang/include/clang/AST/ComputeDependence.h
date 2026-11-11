@@ -39,6 +39,7 @@ class BinaryOperator;
 class ConditionalOperator;
 class BinaryConditionalOperator;
 class StmtExpr;
+class DoExpr;
 class ConvertVectorExpr;
 class VAArgExpr;
 class ChooseExpr;
@@ -99,6 +100,7 @@ class ParenListExpr;
 class PseudoObjectExpr;
 class AtomicExpr;
 class CXXReflectExpr;
+class CXXTokenSequenceExpr;
 class CXXMetafunctionExpr;
 class CXXSpliceExpr;
 class CXXDependentMemberSpliceExpr;
@@ -110,6 +112,8 @@ class CXXIndeterminateExpansionSelectExpr;
 class StackLocationExpr;
 class ExtractLValueExpr;
 class ExplDependentCallExpr;
+class CXXBuiltinStringizeExpr;
+class CXXMacroInvocationExpr;
 class ArraySectionExpr;
 class OMPArrayShapingExpr;
 class OMPIteratorExpr;
@@ -124,6 +128,8 @@ class ObjCIsaExpr;
 class ObjCIndirectCopyRestoreExpr;
 class ObjCMessageExpr;
 class OpenACCAsteriskSizeExpr;
+class MatchTestExpr;
+class MatchSelectExpr;
 
 // The following functions are called from constructors of `Expr`, so they
 // should not access anything beyond basic
@@ -142,6 +148,8 @@ ExprDependence computeDependence(BinaryOperator *E);
 ExprDependence computeDependence(ConditionalOperator *E);
 ExprDependence computeDependence(BinaryConditionalOperator *E);
 ExprDependence computeDependence(StmtExpr *E, unsigned TemplateDepth);
+ExprDependence computeDependence(DoExpr *E, unsigned TemplateDepth,
+                                 bool ContainsUnexpandedParameterPack);
 ExprDependence computeDependence(ConvertVectorExpr *E);
 ExprDependence computeDependence(VAArgExpr *E);
 ExprDependence computeDependence(ChooseExpr *E);
@@ -210,12 +218,15 @@ ExprDependence computeDependence(PseudoObjectExpr *E);
 ExprDependence computeDependence(AtomicExpr *E);
 
 ExprDependence computeDependence(CXXReflectExpr *E, const ASTContext &C);
+ExprDependence computeDependence(CXXTokenSequenceExpr *E);
 ExprDependence computeDependence(CXXMetafunctionExpr *E);
 ExprDependence computeDependence(CXXSpliceExpr *E);
 ExprDependence computeDependence(CXXDependentMemberSpliceExpr *E);
 ExprDependence computeDependence(StackLocationExpr *E);
 ExprDependence computeDependence(ExtractLValueExpr *E);
 ExprDependence computeDependence(ExplDependentCallExpr *E);
+ExprDependence computeDependence(CXXBuiltinStringizeExpr *E);
+ExprDependence computeDependence(CXXMacroInvocationExpr *E);
 
 ExprDependence computeDependence(CXXExpansionInitListExpr *E);
 ExprDependence computeDependence(CXXExpansionInitListSelectExpr *E);
@@ -238,6 +249,9 @@ ExprDependence computeDependence(ObjCIsaExpr *E);
 ExprDependence computeDependence(ObjCIndirectCopyRestoreExpr *E);
 ExprDependence computeDependence(ObjCMessageExpr *E);
 ExprDependence computeDependence(OpenACCAsteriskSizeExpr *E);
+
+ExprDependence computeDependence(MatchTestExpr *E);
+ExprDependence computeDependence(MatchSelectExpr *E);
 
 } // namespace clang
 #endif

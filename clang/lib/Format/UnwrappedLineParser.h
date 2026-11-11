@@ -130,6 +130,14 @@ private:
                           bool KeepBraces = true, IfStmtKind *IfKind = nullptr,
                           bool UnindentWhitesmithsBraces = false);
   void parseChildBlock();
+  /// Whether the `{` about to be parsed is the body of a do expression.
+  bool lbraceStartsDoExpression() const;
+  /// Whether the `{` about to be parsed is the body of a match selection
+  /// (`match (subject) {`, `match constexpr (subject) -> type {`).
+  bool lbraceStartsMatchBody() const;
+  /// Whether the `{` after the `=>` of a match case begins a braced
+  /// initializer rather than a block: it has contents and no statement.
+  bool armHandlerIsBracedInit();
   void parsePPDirective();
   void parsePPDefine();
   void parsePPIf(bool IfDef);
@@ -290,6 +298,11 @@ private:
   // For recursive macro expansions, trigger reconstruction only on the
   // outermost expansion.
   bool InExpansion = false;
+
+  /// How many do-expression bodies (P2806) enclose the token being parsed.
+  unsigned DoExprBodyDepth = 0;
+  /// How many match selections (P2688) the parser is inside the body of.
+  unsigned MatchBodyDepth = 0;
 
   // Set while we reconstruct a macro call.
   // For reconstruction, we feed the expanded lines into the reconstructor

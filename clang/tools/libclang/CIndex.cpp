@@ -27,6 +27,7 @@
 #include "clang/AST/DeclObjCCommon.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
+#include "clang/AST/MatchPattern.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/OpenACCClause.h"
 #include "clang/AST/OpenMPClause.h"
@@ -64,6 +65,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/thread.h"
 #include <mutex>
+#include <functional>
 #include <optional>
 
 #if LLVM_ENABLE_THREADS != 0 && defined(__APPLE__)
@@ -936,7 +938,9 @@ bool CursorVisitor::VisitVarDecl(VarDecl *D) {
   if (VisitDeclaratorDecl(D))
     return true;
 
-  if (Expr *Init = D->getInit())
+  // The initializer of a variable declared by a pattern is made up from the
+  // subject; the subject is visited where it is written.
+  if (Expr *Init = D->getInit(); Init && !D->isPatternVariable())
     return Visit(MakeCXCursor(Init, StmtParent, TU, RegionOfInterest));
 
   return false;
@@ -1342,9 +1346,8 @@ bool CursorVisitor::VisitTypeConstraint(const TypeConstraint &TC) {
     if (VisitNestedNameSpecifierLoc(TC.getNestedNameSpecifierLoc()))
       return true;
   }
-  if (TC.getNamedConcept()) {
-    if (Visit(MakeCursorTemplateRef(TC.getNamedConcept(),
-                                    TC.getConceptNameLoc(), TU)))
+  if (TemplateDecl *TD = getWrittenConceptDecl(TC.getNamedConcept())) {
+    if (Visit(MakeCursorTemplateRef(TD, TC.getConceptNameLoc(), TU)))
       return true;
   }
   if (auto Args = TC.getTemplateArgsAsWritten()) {
@@ -1434,6 +1437,21 @@ bool CursorVisitor::VisitNestedNameSpecifierLoc(
   }
   case NestedNameSpecifier::Kind::Type:
     return Visit(Qualifier.castAsTypeLoc());
+  case NestedNameSpecifier::Kind::Splice:
+  case NestedNameSpecifier::Kind::SpliceWithTemplate: {
+    // '[:expr:]::' : the splice operand is an expression like any other.
+    const SpliceSpecifier *Splice = NNS.getAsSplice();
+    if (Splice->getOperand() &&
+        Visit(MakeCXCursor(Splice->getOperand(), StmtParent, TU,
+                           RegionOfInterest)))
+      return true;
+    if (Splice->isSpecialization())
+      for (const TemplateArgumentLoc &Arg :
+           Splice->getTemplateArgs()->arguments())
+        if (VisitTemplateArgumentLoc(Arg))
+          return true;
+    return false;
+  }
   case NestedNameSpecifier::Kind::Null:
   case NestedNameSpecifier::Kind::Global:
   case NestedNameSpecifier::Kind::MicrosoftSuper:
@@ -1501,6 +1519,10 @@ bool CursorVisitor::VisitTemplateName(TemplateName Name, SourceLocation NameLoc,
     return Visit(MakeCursorTemplateRef(
         Name.getAsSubstTemplateTemplateParmPack()->getParameterPack(), NameLoc,
         TU));
+
+  case TemplateName::PackIndexingTemplate:
+    return VisitTemplateName(Name.getAsPackIndexingTemplate()->getPattern(),
+                             NameLoc, NNS);
 
   case TemplateName::DeducedTemplate:
     llvm_unreachable("DeducedTemplate shouldn't appear in source");
@@ -1571,6 +1593,8 @@ bool CursorVisitor::VisitBuiltinTypeLoc(BuiltinTypeLoc TL) {
   case BuiltinType::NullPtr:
   case BuiltinType::Dependent:
   case BuiltinType::MetaInfo:
+  case BuiltinType::TokenSequence:
+  case BuiltinType::NoReturn:
 #define IMAGE_TYPE(ImgType, Id, SingletonId, Access, Suffix)                   \
   case BuiltinType::Id:
 #include "clang/Basic/OpenCLImageTypes.def"
@@ -2089,6 +2113,15 @@ public:
   EnqueueVisitor(VisitorWorkList &wl, CXCursor parent)
       : WL(wl), Parent(parent) {}
 
+  void AddStmtForMatch(const Stmt *S) { AddStmt(S); }
+  void AddDeclForMatch(const Decl *D) {
+    // The declarations the compiler makes up (an unnamed declaration pattern)
+    // have no source of their own.
+    if (D && !D->isImplicit())
+      AddDecl(D);
+  }
+  void AddTypeLocForMatch(TypeSourceInfo *TI) { AddTypeLoc(TI); }
+
   void VisitAddrLabelExpr(const AddrLabelExpr *E);
   void VisitBlockExpr(const BlockExpr *B);
   void VisitCompoundLiteralExpr(const CompoundLiteralExpr *E);
@@ -2124,6 +2157,8 @@ public:
   void VisitUnaryExprOrTypeTraitExpr(const UnaryExprOrTypeTraitExpr *E);
   void VisitStmt(const Stmt *S);
   void VisitSwitchStmt(const SwitchStmt *S);
+  void VisitMatchTestExpr(const MatchTestExpr *E);
+  void VisitMatchSelectExpr(const MatchSelectExpr *E);
   void VisitWhileStmt(const WhileStmt *W);
   void VisitTypeTraitExpr(const TypeTraitExpr *E);
   void VisitArrayTypeTraitExpr(const ArrayTypeTraitExpr *E);
@@ -3234,6 +3269,111 @@ void EnqueueVisitor::VisitSwitchStmt(const SwitchStmt *S) {
   AddDecl(S->getConditionVariable());
 }
 
+// The cursors below a match are the entities written in it, in source order.
+// Patterns are not statements or declarations; what they contain is: the
+// expressions of value patterns, the types of type patterns and the
+// declarations of declaration patterns.
+namespace {
+using MatchItem = std::function<void(EnqueueVisitor &)>;
+} // namespace
+
+static void collectMatchPattern(const MatchPattern *P,
+                                SmallVectorImpl<MatchItem> &Items) {
+  if (!P)
+    return;
+  switch (P->getMatchPatternClass()) {
+  case MatchPattern::WildcardPatternClass:
+    return;
+  case MatchPattern::ExpressionPatternClass: {
+    const Expr *E = cast<ExpressionPattern>(P)->getExpr();
+    Items.push_back([E](EnqueueVisitor &V) { V.AddStmtForMatch(E); });
+    return;
+  }
+  case MatchPattern::DeclarationPatternClass: {
+    const VarDecl *D = cast<DeclarationPattern>(P)->getDeclaration();
+    Items.push_back([D](EnqueueVisitor &V) { V.AddDeclForMatch(D); });
+    return;
+  }
+  case MatchPattern::TypePatternClass: {
+    TypeSourceInfo *TI = cast<TypePattern>(P)->getTypeSourceInfo();
+    Items.push_back([TI](EnqueueVisitor &V) { V.AddTypeLocForMatch(TI); });
+    return;
+  }
+  case MatchPattern::AlternativePatternClass: {
+    auto *A = cast<AlternativePattern>(P);
+    collectMatchPattern(A->getSelector(), Items);
+    collectMatchPattern(A->getSubPattern(), Items);
+    return;
+  }
+  case MatchPattern::ParenPatternClass:
+  case MatchPattern::OrPatternClass:
+  case MatchPattern::DecompositionPatternClass:
+    for (const MatchPattern *Child : P->children())
+      collectMatchPattern(Child, Items);
+    return;
+  }
+}
+
+static void collectMatchGuard(const MatchGuard &G,
+                              SmallVectorImpl<MatchItem> &Items) {
+  const Stmt *Init = G.Init;
+  const VarDecl *Var = G.ConditionVariable;
+  const Expr *Cond = G.Condition;
+  Items.push_back([Init, Var, Cond](EnqueueVisitor &V) {
+    V.AddStmtForMatch(Init);
+    V.AddDeclForMatch(Var);
+    V.AddStmtForMatch(Cond);
+  });
+}
+
+// The subject as written: the initializer of the holding variable that the
+// compiler introduced, or the expressions of a multiple-subject selection.
+template <class MatchNode>
+static void collectMatchSubject(const MatchNode *E,
+                                SmallVectorImpl<MatchItem> &Items) {
+  if (E->hasSubjectProduct()) {
+    for (const Expr *Element : E->getSubjectProductElements())
+      Items.push_back([Element](EnqueueVisitor &V) { V.AddStmtForMatch(Element); });
+    return;
+  }
+  const Expr *Subject = E->getSubject();
+  if (const VarDecl *Holding = E->getHoldingVar())
+    if (const Expr *Init = Holding->getInit())
+      Subject = Init;
+  Items.push_back([Subject](EnqueueVisitor &V) { V.AddStmtForMatch(Subject); });
+}
+
+void EnqueueVisitor::VisitMatchTestExpr(const MatchTestExpr *E) {
+  SmallVector<MatchItem, 8> Items;
+  // `case pattern = subject` writes the pattern first; `match (subject, case
+  // pattern)` the subject.
+  if (isa<CaseConditionExpr>(E)) {
+    collectMatchPattern(E->getPattern(), Items);
+    collectMatchSubject(E, Items);
+  } else {
+    collectMatchSubject(E, Items);
+    collectMatchPattern(E->getPattern(), Items);
+  }
+  collectMatchGuard(E->getGuard(), Items);
+  for (const MatchItem &Item : llvm::reverse(Items))
+    Item(*this);
+}
+
+void EnqueueVisitor::VisitMatchSelectExpr(const MatchSelectExpr *E) {
+  SmallVector<MatchItem, 16> Items;
+  const Stmt *Init = E->getInitStmt();
+  Items.push_back([Init](EnqueueVisitor &V) { V.AddStmtForMatch(Init); });
+  collectMatchSubject(E, Items);
+  for (const MatchCase &Case : E->getCases()) {
+    collectMatchPattern(Case.Pattern, Items);
+    collectMatchGuard(Case.Guard, Items);
+    const Stmt *Handler = Case.Handler;
+    Items.push_back([Handler](EnqueueVisitor &V) { V.AddStmtForMatch(Handler); });
+  }
+  for (const MatchItem &Item : llvm::reverse(Items))
+    Item(*this);
+}
+
 void EnqueueVisitor::VisitWhileStmt(const WhileStmt *W) {
   AddStmt(W->getBody());
   AddStmt(W->getCond());
@@ -3952,8 +4092,8 @@ bool CursorVisitor::RunVisitorWorkList(VisitorWorkList &WL) {
           return true;
       }
 
-      if (E->getNamedConcept() &&
-          Visit(MakeCursorTemplateRef(E->getNamedConcept(),
+      if (E->getNamedConcept().getAsTemplateDecl() &&
+          Visit(MakeCursorTemplateRef(E->getConceptDecl(),
                                       E->getConceptNameLoc(), TU)))
         return true;
 
@@ -6072,6 +6212,22 @@ CXString clang_getCursorKindSpelling(enum CXCursorKind Kind) {
     return cxstring::createRef("SizeOfPackExpr");
   case CXCursor_PackIndexingExpr:
     return cxstring::createRef("PackIndexingExpr");
+  case CXCursor_DoExpr:
+    return cxstring::createRef("DoExpr");
+  case CXCursor_TokenSequenceExpr:
+    return cxstring::createRef("TokenSequenceExpr");
+  case CXCursor_MacroInvocationExpr:
+    return cxstring::createRef("MacroInvocationExpr");
+  case CXCursor_TokenInjectionExpr:
+    return cxstring::createRef("TokenInjectionExpr");
+  case CXCursor_MatchSelectExpr:
+    return cxstring::createRef("MatchSelectExpr");
+  case CXCursor_MatchTestExpr:
+    return cxstring::createRef("MatchTestExpr");
+  case CXCursor_CaseConditionExpr:
+    return cxstring::createRef("CaseConditionExpr");
+  case CXCursor_DoReturnStmt:
+    return cxstring::createRef("DoReturnStmt");
   case CXCursor_LambdaExpr:
     return cxstring::createRef("LambdaExpr");
   case CXCursor_UnexposedExpr:

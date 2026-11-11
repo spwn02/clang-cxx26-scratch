@@ -43,6 +43,49 @@ using DeclCallback =
 
 class ASTWalker : public RecursiveASTVisitor<ASTWalker> {
   DeclCallback Callback;
+  ASTContext *Ctx;
+
+  // Finds a named declaration directly in DC or in an inline namespace of it.
+  // A namespace is reopened many times, each redeclaration has its members.
+  NamedDecl *lookupIn(DeclContext *DC, llvm::StringRef Name, bool Namespace) {
+    llvm::SmallVector<DeclContext *, 4> Contexts;
+    if (auto *NS = dyn_cast<NamespaceDecl>(DC))
+      for (auto *R : NS->redecls())
+        Contexts.push_back(R);
+    else
+      Contexts.push_back(DC);
+    for (DeclContext *Context : Contexts) {
+      for (Decl *D : Context->decls()) {
+        if (auto *Inline = dyn_cast<NamespaceDecl>(D);
+            Inline && Inline->isInline()) {
+          if (auto *ND = lookupIn(Inline, Name, Namespace))
+            return ND;
+          continue;
+        }
+        auto *ND = dyn_cast<NamedDecl>(D);
+        if (ND && ND->getIdentifier() && ND->getName() == Name &&
+            isa<NamespaceDecl>(ND) == Namespace)
+          return ND;
+      }
+    }
+    return nullptr;
+  }
+
+  // The expressions ^^x and [: r :] have the type std::meta::info, which the
+  // program may only use when <meta> is included, but no declaration of the
+  // header is named in the source. Report the alias as an implicit use.
+  void reportReflectionType(SourceLocation Loc) {
+    if (!Ctx || Loc.isInvalid())
+      return;
+    auto *Std = dyn_cast_or_null<NamespaceDecl>(
+        lookupIn(Ctx->getTranslationUnitDecl(), "std", true));
+    if (!Std)
+      return;
+    auto *Meta = dyn_cast_or_null<NamespaceDecl>(lookupIn(Std, "meta", true));
+    if (!Meta)
+      return;
+    report(Loc, lookupIn(Meta, "info", false), RefType::Implicit);
+  }
 
   void report(SourceLocation Loc, NamedDecl *ND,
               RefType RT = RefType::Explicit) {
@@ -104,7 +147,8 @@ class ASTWalker : public RecursiveASTVisitor<ASTWalker> {
   }
 
 public:
-  ASTWalker(DeclCallback Callback) : Callback(Callback) {}
+  ASTWalker(DeclCallback Callback, ASTContext &Ctx)
+      : Callback(Callback), Ctx(&Ctx) {}
 
   // Operators are almost always ADL extension points and by design references
   // to them doesn't count as uses (generally the type should provide them, so
@@ -190,6 +234,24 @@ public:
   }
   bool VisitCXXDependentScopeMemberExpr(CXXDependentScopeMemberExpr *E) {
     report(E->getMemberLoc(), getMemberProvider(E->getBaseType()),
+           RefType::Implicit);
+    return true;
+  }
+
+  // Token sequence injection (P4380): `^^{ ... }` is a std::meta::token_sequence
+  // (a class of <meta> that has to be visible where a literal is written), and
+  // queue_injection, id, str_lit, tokenize and the like are evaluated by the
+  // compiler: nothing in the AST refers to the functions of <meta>, only the
+  // class of the token sequence they work on does.
+  bool VisitCXXTokenSequenceExpr(CXXTokenSequenceExpr *E) {
+    report(E->getBeginLoc(), getMemberProvider(E->getType()),
+           RefType::Implicit);
+    return true;
+  }
+
+  bool VisitCXXBuiltinInjectExpr(CXXBuiltinInjectExpr *E) {
+    report(E->getKwLoc(),
+           getMemberProvider(E->getOperand()->IgnoreImplicit()->getType()),
            RefType::Implicit);
     return true;
   }
@@ -387,6 +449,15 @@ public:
     return true;
   }
 
+  bool VisitCXXReflectExpr(CXXReflectExpr *E) {
+    reportReflectionType(E->getExprLoc());
+    return true;
+  }
+  bool VisitCXXSpliceExpr(CXXSpliceExpr *E) {
+    reportReflectionType(E->getExprLoc());
+    return true;
+  }
+
   bool VisitCXXNewExpr(CXXNewExpr *E) {
     report(E->getExprLoc(), E->getOperatorNew(), RefType::Ambiguous);
     return true;
@@ -400,7 +471,7 @@ public:
 } // namespace
 
 void walkAST(Decl &Root, DeclCallback Callback) {
-  ASTWalker(Callback).TraverseDecl(&Root);
+  ASTWalker(Callback, Root.getASTContext()).TraverseDecl(&Root);
 }
 
 } // namespace clang::include_cleaner

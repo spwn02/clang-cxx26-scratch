@@ -26,6 +26,10 @@ module std_core [system] {
       header "__cstddef/max_align_t.h"
       export *
     }
+    module noreturn_t {
+      header "__cstddef/noreturn_t.h"
+      export *
+    }
     module nullptr_t {
       header "__cstddef/nullptr_t.h"
       export *
@@ -167,6 +171,11 @@ module std_core [system] {
     }
   }
 
+  module meta_ids {
+    header "__meta/metafunction_ids.h"
+    export *
+  }
+
   module type_traits {
     module add_cv_quals {
       header "__type_traits/add_cv_quals.h"
@@ -190,6 +199,10 @@ module std_core [system] {
     }
     module alignment_of {
       header "__type_traits/alignment_of.h"
+      export *
+    }
+    module alternative_traits {
+      header "__type_traits/alternative_traits.h"
       export *
     }
     module common_reference {
@@ -408,6 +421,10 @@ module std_core [system] {
     module is_member_pointer {
       header "__type_traits/is_member_pointer.h"
       export *
+    }
+    module is_noreturn {
+      header "__type_traits/is_noreturn.h"
+      export std_core.type_traits.integral_constant
     }
     module is_nothrow_assignable {
       header "__type_traits/is_nothrow_assignable.h"
@@ -1655,6 +1672,14 @@ module std [system] {
     }
     module bit_floor {
       header "__bit/bit_floor.h"
+      export *
+    }
+    module bit_permutations {
+      header "__bit/bit_permutations.h"
+      export *
+    }
+    module bit_shift {
+      header "__bit/bit_shift.h"
       export *
     }
     module bit_log2 {
@@ -2906,6 +2931,284 @@ module std [system] {
     export *
   }
 
+  module io {
+    module any_executor {
+      header "__io/any_executor.h"
+      export *
+    }
+    module continuation {
+      header "__io/continuation.h"
+      export *
+    }
+    module execution_context {
+      header "__io/execution_context.h"
+      export *
+    }
+    module executor {
+      header "__io/executor.h"
+      export *
+    }
+    module executor_ref {
+      header "__io/executor_ref.h"
+      export *
+    }
+    module frame_allocator {
+      header "__io/frame_allocator.h"
+      export *
+    }
+    module io_awaitable {
+      header "__io/io_awaitable.h"
+      export *
+    }
+    module io_env {
+      header "__io/io_env.h"
+      export *
+    }
+    module join_support {
+      header "__io/join_support.h"
+      export *
+    }
+    module run {
+      header "__io/run.h"
+      export *
+    }
+    module run_async {
+      header "__io/run_async.h"
+      export *
+    }
+    module strand {
+      header "__io/strand.h"
+      export *
+    }
+    module support_config {
+      header "__io/support/config.h"
+      export *
+    }
+    module support_epoll_poller {
+      header "__io/support/epoll_poller.h"
+      export *
+    }
+    module support_kqueue_poller {
+      header "__io/support/kqueue_poller.h"
+      export *
+    }
+    module support_poller {
+      header "__io/support/poller.h"
+      export *
+    }
+    module support_poller_types {
+      header "__io/support/poller_types.h"
+      export *
+    }
+    module support_posix_signal {
+      header "__io/support/posix_signal.h"
+      export *
+    }
+    module task {
+      header "__io/task.h"
+      export *
+    }
+    module thread_pool {
+      header "__io/thread_pool.h"
+      export *
+    }
+    module when_all {
+      header "__io/when_all.h"
+      export *
+    }
+    module when_any {
+      header "__io/when_any.h"
+      export *
+    }
+
+    header "io"
+    export *
+  }
+
+  module io_bridge {
+    module as_sender {
+      header "__io_bridge/as_sender.h"
+      export *
+    }
+    module await_sender {
+      header "__io_bridge/await_sender.h"
+      export *
+    }
+    module split_ec {
+      header "__io_bridge/split_ec.h"
+      export *
+    }
+
+    header "io_bridge"
+    export *
+  }
+
+  module io_buffer {
+    module buffer {
+      header "__io_buffer/buffer.h"
+      export *
+    }
+    module buffer_algorithms {
+      header "__io_buffer/buffer_algorithms.h"
+      export *
+    }
+    module buffer_pair {
+      header "__io_buffer/buffer_pair.h"
+      export *
+    }
+    module buffer_sequence {
+      header "__io_buffer/buffer_sequence.h"
+      export *
+    }
+    module buffer_slice {
+      header "__io_buffer/buffer_slice.h"
+      export *
+    }
+    module circular_dynamic_buffer {
+      header "__io_buffer/circular_dynamic_buffer.h"
+      export *
+    }
+    module dynamic_buffer {
+      header "__io_buffer/dynamic_buffer.h"
+      export *
+    }
+    module flat_dynamic_buffer {
+      header "__io_buffer/flat_dynamic_buffer.h"
+      export *
+    }
+    module make_buffer {
+      header "__io_buffer/make_buffer.h"
+      export *
+    }
+    module string_dynamic_buffer {
+      header "__io_buffer/string_dynamic_buffer.h"
+      export *
+    }
+    module vector_dynamic_buffer {
+      header "__io_buffer/vector_dynamic_buffer.h"
+      export *
+    }
+
+    header "io_buffer"
+    export *
+  }
+
+  module io_context {
+    module io_context {
+      header "__io_context/io_context.h"
+      export *
+    }
+    module op {
+      header "__io_context/op.h"
+      export *
+    }
+    module reactor {
+      header "__io_context/reactor.h"
+      export *
+    }
+    module blocking_service {
+      header "__io_context/blocking_service.h"
+      export *
+    }
+    module reactor_wait {
+      header "__io_context/reactor_wait.h"
+      export *
+    }
+
+    header "io_context"
+    export *
+  }
+
+  module io_file {
+    module file {
+      header "__io_file/file.h"
+      export *
+    }
+    module file_base {
+      header "__io_file/file_base.h"
+      export *
+    }
+    module support {
+      module posix_file {
+        header "__io_file/support/posix_file.h"
+        export *
+      }
+    }
+
+    header "io_file"
+    export *
+  }
+
+  module io_signal {
+    module signal_set {
+      header "__io_signal/signal_set.h"
+      export *
+    }
+
+    header "io_signal"
+    export *
+  }
+
+  module io_stream {
+    module any_buffer_sink {
+      header "__io_stream/any_buffer_sink.h"
+      export *
+    }
+    module any_buffer_source {
+      header "__io_stream/any_buffer_source.h"
+      export *
+    }
+    module any_read_source {
+      header "__io_stream/any_read_source.h"
+      export *
+    }
+    module any_read_stream {
+      header "__io_stream/any_read_stream.h"
+      export *
+    }
+    module any_stream {
+      header "__io_stream/any_stream.h"
+      export *
+    }
+    module any_write_sink {
+      header "__io_stream/any_write_sink.h"
+      export *
+    }
+    module any_write_stream {
+      header "__io_stream/any_write_stream.h"
+      export *
+    }
+    module erased {
+      header "__io_stream/erased.h"
+      export *
+    }
+    module error {
+      header "__io_stream/error.h"
+      export *
+    }
+    module stream_algorithms {
+      header "__io_stream/stream_algorithms.h"
+      export *
+    }
+    module stream_concepts {
+      header "__io_stream/stream_concepts.h"
+      export *
+    }
+
+    header "io_stream"
+    export *
+  }
+
+  module io_timer {
+    module timer {
+      header "__io_timer/timer.h"
+      export *
+    }
+
+    header "io_timer"
+    export *
+  }
+
   module iomanip {
     header "iomanip"
     export *
@@ -3244,6 +3547,10 @@ module std [system] {
       header "__mdspan/aligned_accessor.h"
       export *
     }
+    module copy_fill {
+      header "__mdspan/copy_fill.h"
+      export *
+    }
     module default_accessor {
       header "__mdspan/default_accessor.h"
       export *
@@ -3384,6 +3691,10 @@ module std [system] {
     }
     module out_ptr {
       header "__memory/out_ptr.h"
+      export *
+    }
+    module pointer_tag_pair {
+      header "__memory/pointer_tag_pair.h"
       export *
     }
     module pointer_traits {
@@ -3537,6 +3848,128 @@ module std [system] {
     }
 
     header "mutex"
+    export *
+  }
+
+  module net {
+    module connect {
+      header "__net/connect.h"
+      export *
+    }
+    module datagram_core {
+      header "__net/datagram_core.h"
+      export *
+    }
+    module endpoint {
+      header "__net/endpoint.h"
+      export *
+    }
+    module family {
+      header "__net/family.h"
+      export *
+    }
+    module ip_address {
+      header "__net/ip_address.h"
+      export *
+    }
+    module ipv4_address {
+      header "__net/ipv4_address.h"
+      export *
+    }
+    module ipv6_address {
+      header "__net/ipv6_address.h"
+      export *
+    }
+    module local_datagram_socket {
+      header "__net/local_datagram_socket.h"
+      export *
+    }
+    module local_endpoint {
+      header "__net/local_endpoint.h"
+      export *
+    }
+    module local_stream_acceptor {
+      header "__net/local_stream_acceptor.h"
+      export *
+    }
+    module local_stream_socket {
+      header "__net/local_stream_socket.h"
+      export *
+    }
+    module message_flags {
+      header "__net/message_flags.h"
+      export *
+    }
+    module resolver {
+      header "__net/resolver.h"
+      export *
+    }
+    module resolver_error {
+      header "__net/resolver_error.h"
+      export *
+    }
+    module socket_core {
+      header "__net/socket_core.h"
+      export *
+    }
+    module socket_option {
+      header "__net/socket_option.h"
+      export *
+    }
+    module support_posix_resolve {
+      header "__net/support/posix_resolve.h"
+      export *
+    }
+    module support_posix_socket {
+      header "__net/support/posix_socket.h"
+      export *
+    }
+    module tcp_acceptor {
+      header "__net/tcp_acceptor.h"
+      export *
+    }
+    module tcp_socket {
+      header "__net/tcp_socket.h"
+      export *
+    }
+    module udp_socket {
+      header "__net/udp_socket.h"
+      export *
+    }
+
+    header "net"
+    export *
+  }
+
+  module net_tls {
+    module engine {
+      header "__net_tls/engine.h"
+      export *
+    }
+    module error {
+      header "__net_tls/error.h"
+      export *
+    }
+    module openssl_engine {
+      header "__net_tls/openssl_engine.h"
+      export *
+    }
+    module support {
+      module openssl_dl {
+        header "__net_tls/support/openssl_dl.h"
+        export *
+      }
+    }
+    module tls_context {
+      header "__net_tls/tls_context.h"
+      export *
+    }
+    module tls_stream {
+      header "__net_tls/tls_stream.h"
+      export *
+    }
+
+    header "net_tls"
     export *
   }
 
@@ -4322,6 +4755,10 @@ module std [system] {
     }
     module error_condition {
       header "__system_error/error_condition.h"
+      export *
+    }
+    module formatter {
+      header "__system_error/formatter.h"
       export *
     }
     module system_error {

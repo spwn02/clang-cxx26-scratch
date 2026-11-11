@@ -265,16 +265,98 @@ C++ Language Changes
   ``<=>``. This makes it possible to optimize certain facilities by using the ``<=>`` operation directly instead of
   doing multiple comparisons.
 
+C++2d (C++29) Feature Support
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Added ``-std=c++29`` (alias ``-std=c++2d``). It enables do expressions
+  (P2806); C++29 features are not available in earlier modes, not even as
+  extensions. ``__cpp_do_expressions`` is defined as ``1`` while the
+  paper is not adopted. See :ref:`do expressions <do_expressions>`.
+- Added token sequence injection (P4380R1, exploratory) under ``-std=c++29``: ``^^{ ... }`` token sequence literals,
+  ``\\(e)`` interpolation, ``std::meta::queue_injection``, annotation injection hooks and ``__macro`` expression macros
+  invoked as ``name!(...)`` (``macro`` is accepted as an alias of ``__macro``, a keyword only where a macro declaration
+  starts). See :ref:`token sequence injection <token_sequence_injection>`. A resolved macro
+  invocation stays in the AST around its expansion, so clangd, libclang and clang-tidy see the macro's name at the call
+  site (hover, go-to-definition, references and semantic tokens).
+
+- Added pattern matching (P2688R6) under ``-std=c++29``: ``match`` selections, match tests,
+  pattern conditions (``if (case P = e)``), nested/empty/unnamed-pack structured bindings,
+  exhaustiveness and redundancy checking, ``std::alternative_traits`` and the library
+  specializations, and ``__dynamic_cast_first`` in libc++abi for batched type patterns. See
+  :ref:`pattern matching <pattern_matching>`.
+  Redundant cases are errors, as the paper requires. The syntax-tree library has nodes for
+  match selections, cases, guards, tests, pattern conditions and every kind of pattern.
+
+- Implemented `P3668R4 <https://wg21.link/P3668R4>`_ Defaulting postfix increment and decrement operations
+  under ``-std=c++29``. A postfix ``operator++``/``operator--`` can be explicitly defaulted (as a member, a friend or a
+  non-member function); its definition is ``C tmp(c); ++c; return tmp;`` and it is defined as deleted when that is
+  ill-formed. Earlier modes, C++26 included, keep rejecting it.
+
+- Implemented `P2953R5 <https://wg21.link/P2953R5>`_ under ``-std=c++29``: an explicitly defaulted assignment operator
+  may not have the ``&&`` ref-qualifier, and a type mismatch of a defaulted special member is ill-formed instead of
+  deleting it (only a copy operation declared with ``const C&`` where the implicit one has ``C&`` is still deleted).
+- Implemented `P3424R2 <https://wg21.link/P3424R2>`_ under ``-std=c++29``: a deallocation function with a potentially
+  throwing exception specification (``noexcept(false)``) is ill-formed, also in a class whose exception specification
+  is parsed after the class is complete.
+
+- Implemented `P3540R3 <https://wg21.link/P3540R3>`_ under ``-std=c++29``: ``offset`` is a standard ``#embed`` and
+  ``__has_embed`` parameter (the existing ``clang::offset`` spelling is kept). ``__cpp_pp_embed`` is 202606L in C++29
+  mode (the value of the draft N5054) and 202502L in C++26.
+
+- Implemented `P3097R3 <https://wg21.link/P3097R3>`_ under ``-std=c++29``: a virtual function may have ``pre`` and
+  ``post`` assertions. A virtual call through a class member access evaluates the preconditions of the statically
+  chosen function and then those of the final overrider, and the postconditions of the final overrider and then those
+  of the statically chosen function, also in constant evaluation (as are the preconditions and postconditions of a
+  destructor, which constant evaluation used to skip) (assertions are not inherited by overriders;
+  qualified calls and calls through a pointer to member name one function). ``__cpp_contracts`` is 202606L in C++29
+  mode (the value of the draft N5054). C++26 keeps rejecting contract specifiers on virtual functions.
+
+- Implemented `P3822R2 <https://wg21.link/P3822R2>`_ under ``-std=c++29``: a compound requirement can have a
+  conditional ``noexcept``, ``{ E } noexcept(condition)``. The condition is a contextually converted constant
+  expression of type ``bool`` (as for a function), substituted after ``E``; the expression must not be
+  potentially-throwing only if the condition is true, and a substitution failure in the condition makes the requirement
+  unsatisfied. Earlier modes diagnose it. The Itanium ABI has no mangling for it yet: ``Nc <expression>`` is a provisional
+  vendor encoding that may change when the ABI defines one (the demangler in LLVM and libc++abi understands it).
+
+- Implemented `P2287R6 <https://wg21.link/P2287R6>`_ under ``-std=c++29``: a designator can name a non-static data
+  member of an aggregate base class (``B{.a1 = 1, .b = 2}`` with ``struct B : A``). The identifier must be found in
+  exactly one base class subobject (otherwise the designator is ambiguous), the base subobject is initialized from the
+  designators that name its members, and positional initializers before the designators initialize base classes only
+  (``B{A{1, 2}, .b = 3}``); a base class initialized both ways, or a positional initializer for a non-static data member
+  in a list with designators, is an error, and designators naming members of bases must be in element order
+  (an error; direct members keep ``-Wreorder-init-list``). Earlier modes keep rejecting a designator that names a member of a base class.
+
+- Implemented `P3670R4 <https://wg21.link/P3670R4>`_ under ``-std=c++29``: a pack of template template parameters
+  can be indexed, ``TT...[N]<args>`` (type, variable, alias templates and concepts, also as a type-constraint,
+  ``template <CC...[0] T>`` and ``CC...[0] auto``), based on the upstream LLVM implementation (llvm-project#218738 and
+  #217637: a type-constraint now stores the concept as a ``TemplateName``). Earlier modes reject it. The mangling of a
+  dependent one is provisional (``u10pack_index <template-param> <expression>``; the Itanium ABI has none yet,
+  cxx-abi issue 175) and may change.
+
+- Implemented `P3549R1 <https://wg21.link/P3549R1>`_ (exploratory, EWG) under ``-std=c++29``: diverging expressions
+  and the bottom type ``std::noreturn_t`` (``decltype(throw 0)``): a function or lambda that only diverges deduces
+  ``noreturn_t``, an operand of that type absorbs the expression, and a diverging ``match`` arm takes no part in the
+  deduction of the type of a match expression. ``__cpp_diverging_expressions`` is defined in C++29 mode. libc++ has
+  ``std::noreturn_t`` and ``std::is_noreturn``; ``std::terminate`` and ``std::unreachable`` return ``noreturn_t``.
+
 C++2c Feature Support
 ^^^^^^^^^^^^^^^^^^^^^
 
+- Added the builtins ``__builtin_pointer_tag_insert``, ``__builtin_pointer_tag_get`` and
+  ``__builtin_pointer_tag_strip`` that store a tag in the alignment bits of a pointer, also in constant expressions
+  (the compiler support for C++29 ``std::pointer_tag_pair``, P3125R6). See :ref:`langext-pointer-tag`.
 - Reflection (P2996R13 and the companion papers), parameter reflection, annotations, expansion statements and
   contracts (P2900) are part of ``-std=c++26``: ``-freflection``, ``-freflection-latest``, ``-fcontracts``,
   ``-fcontract-group-*``, ``-fcontract-*`` (except ``-fcontract-evaluation-semantic=``, the implementation-defined way
-  to select the evaluation semantic), ``-fexperimental-library`` and ``-f[no-]erroneous-initialization`` were removed,
+  to select the evaluation semantic), ``-f[no-]erroneous-initialization`` and, until it came back for the networking library (below), ``-fexperimental-library`` were removed,
   and so were the ``__has_feature`` names ``reflection``, ``parameter_reflection``, ``expansion_statements``,
   ``annotation_attributes`` and ``experimental_library``; use ``__cpp_impl_reflection`` and ``__cplusplus``.
   Erroneous behavior for uninitialized reads (P2795R5) is the default in C++26.
+- ``-fexperimental-library`` (and ``__has_feature(experimental_library)``) came back for one purpose: it enables the
+  C++29 networking and I/O library of libc++ (``<io>``, ``<io_buffer>``, ``<io_stream>``, ``<io_bridge>``,
+  ``<io_context>``, ``<io_timer>``, ``<io_signal>``, ``<io_file>``, ``<net>`` and ``<net_tls>``, P4100 and its companion
+  papers) in ``-std=c++29`` while its design is not final. Nothing is linked for it. The flag is removed again when the
+  networking work is complete.
 
 - The contract extensions that the draft does not have were removed (``[[clang::contract_semantic]]``,
   ``[[clang::contract_message]]``, ``[[clang::contract_emission]]``).
@@ -1067,6 +1149,10 @@ clang-format
   literals.
 - Add ``Leave`` suboption to ``IndentPPDirectives``.
 - Add ``AllowBreakBeforeQtProperty`` option.
+- Add ``BraceWrapping/BeforeDoExpressionBody`` option for the opening brace of the
+  body of a C++29 do expression (P2806); it is off in every built-in style.
+  Inside a do expression ``do_return`` is now treated like ``return``, so that
+  ``do_return -x;`` and ``do_return (x);`` keep their spacing.
 - Add ``BreakAfterOpenBracketBracedList'', ``BreakAfterOpenBracketFunction'',
   ``BreakAfterOpenBracketIf``, ``BreakAfterOpenBracketLoop``,
   ``BreakAfterOpenBracketSwitch``, ``BreakBeforeCloseBracketBracedList'',
@@ -1082,6 +1168,16 @@ clang-format
 
 libclang
 --------
+- Added ``CXCursor_TokenSequenceExpr`` (158), ``CXCursor_MacroInvocationExpr`` (159) and
+  ``CXCursor_TokenInjectionExpr`` (160) for C++29 token sequence injection (P4380).
+- Added ``CXCursor_MatchSelectExpr`` (161), ``CXCursor_MatchTestExpr`` (162) and
+  ``CXCursor_CaseConditionExpr`` (163) for C++29 pattern matching (P2688), and
+  ``CursorKind.MATCH_SELECT_EXPR`` / ``MATCH_TEST_EXPR`` / ``CASE_CONDITION_EXPR``
+  in the Python bindings.
+- Added ``CXCursor_DoExpr`` (157) and ``CXCursor_DoReturnStmt`` (334) for C++29 do
+  expressions (P2806), and ``CursorKind.DO_EXPR`` / ``CursorKind.DO_RETURN_STMT``
+  in the Python bindings. The numbers are fork-local; a future upstream kind may
+  claim them, in which case they move.
 
 Code Completion
 ---------------

@@ -28,6 +28,9 @@ export namespace std {
   using std::is_lvalue_reference;
   using std::is_member_function_pointer;
   using std::is_member_object_pointer;
+#if defined(__cpp_diverging_expressions)
+  using std::is_noreturn;
+#endif
   using std::is_null_pointer;
   using std::is_pointer;
   using std::is_rvalue_reference;
@@ -119,6 +122,12 @@ export namespace std {
 #  if __has_builtin(__reference_converts_from_temporary)
   using std::reference_converts_from_temporary;
 #  endif
+#endif
+
+#if _LIBCPP_STD_VER >= 29 && __has_feature(pattern_matching)
+  // [P2688R6], alternatives of a pattern matching subject
+  using std::alternative_info;
+  using std::alternative_traits;
 #endif
 
   // [meta.unary.prop.query], type property queries
@@ -237,6 +246,9 @@ export namespace std {
   using std::is_lvalue_reference_v;
   using std::is_member_function_pointer_v;
   using std::is_member_object_pointer_v;
+#if defined(__cpp_diverging_expressions)
+  using std::is_noreturn_v;
+#endif
   using std::is_null_pointer_v;
   using std::is_pointer_v;
   using std::is_rvalue_reference_v;

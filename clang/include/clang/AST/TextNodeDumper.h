@@ -215,6 +215,7 @@ public:
   void dumpConceptReference(const ConceptReference *R);
   void dumpTemplateArgument(const TemplateArgument &TA);
   void dumpBareTemplateName(TemplateName TN);
+  void dumpBareConcept(TemplateName TN);
   void dumpTemplateName(TemplateName TN, StringRef Label = {});
 
   void dumpDeclRef(const Decl *D, StringRef Label = {});
@@ -263,6 +264,8 @@ public:
   void VisitGotoStmt(const GotoStmt *Node);
   void VisitCaseStmt(const CaseStmt *Node);
   void VisitReturnStmt(const ReturnStmt *Node);
+  void VisitDoExpr(const DoExpr *Node);
+  void VisitCXXTokenSequenceExpr(const CXXTokenSequenceExpr *Node);
   void VisitCoawaitExpr(const CoawaitExpr *Node);
   void VisitCoreturnStmt(const CoreturnStmt *Node);
   void VisitCompoundStmt(const CompoundStmt *Node);
@@ -435,6 +438,10 @@ public:
   void VisitContractStmt(const ContractStmt *S);
   void VisitAtomicExpr(const AtomicExpr *AE);
   void VisitConvertVectorExpr(const ConvertVectorExpr *S);
+  void VisitMatchTestExpr(const MatchTestExpr *Node);
+  void VisitCaseConditionExpr(const CaseConditionExpr *Node);
+  void VisitMatchSelectExpr(const MatchSelectExpr *Node);
+  void Visit(const MatchPattern *Node);
 };
 
 } // namespace clang

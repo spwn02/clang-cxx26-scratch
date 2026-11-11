@@ -179,7 +179,13 @@ class CollectUnexpandedParameterPacksVisitor
     }
 
     /// Record occurrences of template template parameter packs.
-    bool TraverseTemplateName(TemplateName Template) override {
+    bool TraverseTemplateName(TemplateName Template,
+                              bool TraverseQualifier = true) override {
+
+      if (PackIndexingTemplateStorage *PI =
+              Template.getAsPackIndexingTemplate())
+        return DynamicRecursiveASTVisitor::TraverseStmt(PI->getIndexExpr());
+
       if (auto *TTP = dyn_cast_or_null<TemplateTemplateParmDecl>(
               Template.getAsTemplateDecl())) {
         if (TTP->isParameterPack())
@@ -191,7 +197,8 @@ class CollectUnexpandedParameterPacksVisitor
           (bool)Template.getAsSubstTemplateTemplateParmPack();
 #endif
 
-      return DynamicRecursiveASTVisitor::TraverseTemplateName(Template);
+      return DynamicRecursiveASTVisitor::TraverseTemplateName(
+          Template, TraverseQualifier);
     }
 
     bool
@@ -366,6 +373,20 @@ class CollectUnexpandedParameterPacksVisitor
     /// including all the places where we normally wouldn't look. Within a
     /// lambda, we don't propagate the 'contains unexpanded parameter pack' bit
     /// outside an expression.
+    /// A do-expression carries the 'contains unexpanded parameter pack' bit
+    /// the way a lambda does, and like a lambda its body has to be searched in
+    /// full once the bit is set: the pack can be named by any statement, not
+    /// only by a subexpression that carries the bit itself. Without this, the
+    /// pruning in TraverseStmt stops at the body's first non-expression
+    /// statement and the expansion finds nothing to expand.
+    bool TraverseDoExpr(DoExpr *E) override {
+      if (!E->containsUnexpandedParameterPack())
+        return true;
+
+      SaveAndRestore _(InLambdaOrBlock, true);
+      return DynamicRecursiveASTVisitor::TraverseDoExpr(E);
+    }
+
     bool TraverseLambdaExpr(LambdaExpr *Lambda) override {
       // The ContainsUnexpandedParameterPack bit on a lambda is always correct,
       // even if it's contained within another lambda.
@@ -461,7 +482,54 @@ bool Sema::isUnexpandedParameterPackPermitted() {
   for (auto *SI : FunctionScopes)
     if (isa<sema::LambdaScopeInfo>(SI))
       return true;
-  return false;
+  // A do-expression body defers to the expansion enclosing the do-expression,
+  // exactly as a lambda body does.
+  return !DoExprStack.empty();
+}
+
+/// If the construct being diagnosed sits in the body of a do-expression, and
+/// that body is the innermost thing that could carry the pack outwards, return
+/// the do-expression that should carry it.
+///
+/// P2806 specifies a do-expression as an immediately-invoked lambda, so a pack
+/// named in its body belongs to whatever expansion encloses the do-expression,
+/// not to the body — `f(do { do_return pack * 2; }...)` expands the body once
+/// per element the same way `f([&] { return pack * 2; }()...)` does.
+///
+/// \p CSI is the innermost enclosing lambda or block, if any. A do-expression
+/// only defers when it is nested *inside* that lambda; otherwise the lambda is
+/// innermost and owns the deferral.
+Sema::DoExprStackEntry *
+Sema::getDoExprDeferringPackExpansion(sema::CapturingScopeInfo *CSI) {
+  if (DoExprStack.empty())
+    return nullptr;
+
+  DoExprStackEntry &Top = DoExprStack.back();
+
+  // Find where the enclosing lambda sits in the function-scope stack; the
+  // do-expression only wins if it was entered afterwards.
+  if (CSI) {
+    unsigned LambdaDepth = 0;
+    for (unsigned N = FunctionScopes.size(); N; --N) {
+      if (FunctionScopes[N - 1] == CSI) {
+        LambdaDepth = N;
+        break;
+      }
+    }
+    if (Top.FunctionScopeDepth < LambdaDepth)
+      return nullptr;
+  }
+
+  // A statement-expression cannot be duplicated (it may contain labels), so a
+  // pack cannot be expanded across one even by way of a do-expression. This
+  // mirrors the check the lambda path makes below.
+  for (unsigned N = FunctionScopes.size(); N >= Top.FunctionScopeDepth && N;
+       --N)
+    if (llvm::any_of(FunctionScopes[N - 1]->CompoundScopes,
+                     [](sema::CompoundScopeInfo &CS) { return CS.IsStmtExpr; }))
+      return nullptr;
+
+  return &Top;
 }
 
 /// Diagnose all of the unexpanded parameter packs in the given
@@ -479,7 +547,8 @@ Sema::DiagnoseUnexpandedParameterPacks(SourceLocation Loc,
   // FIXME: Store 'Unexpanded' on the lambda so we don't need to recompute it
   // later.
   SmallVector<UnexpandedParameterPack, 4> ParamPackReferences;
-  if (sema::CapturingScopeInfo *CSI = getEnclosingLambdaOrBlock()) {
+  sema::CapturingScopeInfo *CSI = getEnclosingLambdaOrBlock();
+  if (CSI) {
     for (auto &Pack : Unexpanded) {
       auto DeclaresThisPack = [&](NamedDecl *LocalPack) {
         if (auto *TTPT = Pack.first.dyn_cast<const TemplateTypeParmType *>()) {
@@ -491,7 +560,24 @@ Sema::DiagnoseUnexpandedParameterPacks(SourceLocation Loc,
       if (llvm::any_of(CSI->LocalPacks, DeclaresThisPack))
         ParamPackReferences.push_back(Pack);
     }
+  }
 
+  // If a do-expression body is the innermost construct that can carry these
+  // packs out to the enclosing expansion, it does — see
+  // getDoExprDeferringPackExpansion. An enclosing lambda, if there is one, has
+  // to know as well, because the expansion is outside it too. Packs the lambda
+  // itself declares are excluded: those have no enclosing expansion to reach,
+  // and the lambda path below diagnoses them.
+  if (ParamPackReferences.empty()) {
+    if (DoExprStackEntry *Entry = getDoExprDeferringPackExpansion(CSI)) {
+      Entry->ContainsUnexpandedParameterPack = true;
+      if (CSI)
+        CSI->ContainsUnexpandedParameterPack = true;
+      return false;
+    }
+  }
+
+  if (CSI) {
     if (ParamPackReferences.empty()) {
       // Construct in lambda only references packs declared outside the lambda.
       // That's OK for now, but the lambda itself is considered to contain an
@@ -715,6 +801,13 @@ void Sema::collectUnexpandedParameterPacks(TemplateArgumentLoc Arg,
 void Sema::collectUnexpandedParameterPacks(QualType T,
                    SmallVectorImpl<UnexpandedParameterPack> &Unexpanded) {
   CollectUnexpandedParameterPacksVisitor(Unexpanded).TraverseType(T);
+}
+
+void Sema::collectUnexpandedParameterPacks(
+    TemplateName Template,
+    SmallVectorImpl<UnexpandedParameterPack> &Unexpanded) {
+  CollectUnexpandedParameterPacksVisitor(Unexpanded)
+      .TraverseTemplateName(Template);
 }
 
 void Sema::collectUnexpandedParameterPacks(TypeLoc TL,
@@ -1377,6 +1470,50 @@ ExprResult Sema::ActOnPackIndexingExpr(Scope *S, Expr *PackExpression,
                                        SourceLocation RSquareLoc) {
   bool isParameterPack = ::isParameterPack(PackExpression);
   if (!isParameterPack) {
+    // Check if this is a reference to an expanded function parameter pack.
+    // After template instantiation, pack parameters are expanded into
+    // individual parameters with the same name. When token injection
+    // references these parameters with pack indexing syntax (ts...[I]),
+    // collect all same-named parameters as the expanded pack.
+    if (auto *DRE = dyn_cast<DeclRefExpr>(PackExpression)) {
+      if (auto *PVD = dyn_cast<ParmVarDecl>(DRE->getDecl())) {
+        if (auto *FD = dyn_cast<FunctionDecl>(PVD->getDeclContext())) {
+          // Check if this parameter was originally a pack in the template
+          // pattern. This handles the case where a pack expands to a
+          // single element.
+          bool WasPackParam = false;
+          if (auto *Pattern = FD->getTemplateInstantiationPattern()) {
+            for (auto *PatP : Pattern->parameters()) {
+              if (PatP->isParameterPack() &&
+                  PatP->getIdentifier() == PVD->getIdentifier()) {
+                WasPackParam = true;
+                break;
+              }
+            }
+          }
+
+          if (WasPackParam) {
+            IdentifierInfo *Name = PVD->getIdentifier();
+            SmallVector<Expr *, 4> ExpandedExprs;
+            for (auto *P : FD->parameters()) {
+              if (P->getIdentifier() == Name) {
+                Expr *E = BuildDeclRefExpr(P, P->getType().getNonReferenceType(),
+                                           VK_LValue, PackExpression->getBeginLoc());
+                if (!E) break;
+                ExpandedExprs.push_back(E);
+              }
+            }
+            if (!ExpandedExprs.empty()) {
+              return BuildPackIndexingExpr(PackExpression, EllipsisLoc,
+                                           IndexExpr, RSquareLoc,
+                                           ExpandedExprs,
+                                           /*FullySubstituted=*/true);
+            }
+          }
+        }
+      }
+    }
+
     if (!PackExpression->containsErrors())
       Diag(PackExpression->getBeginLoc(), diag::err_expected_name_of_pack)
           << PackExpression;
@@ -1421,6 +1558,70 @@ ExprResult Sema::BuildPackIndexingExpr(Expr *PackExpression,
   return PackIndexingExpr::Create(getASTContext(), EllipsisLoc, RSquareLoc,
                                   PackExpression, IndexExpr, Index,
                                   ExpandedExprs, FullySubstituted);
+}
+
+TemplateName Sema::ActOnPackIndexingTemplateName(TemplateName Pattern,
+                                                 SourceLocation NameLoc,
+                                                 Expr *IndexExpr) {
+  assert(!Pattern.isNull() && IndexExpr);
+
+  // C++29 [temp.names]p3:
+  //   The simple-template-name P in a pack-index-template-name shall denote a
+  //   pack.
+  bool DenotesPack = Pattern.containsUnexpandedParameterPack();
+  if (!DenotesPack)
+    Diag(NameLoc, diag::err_expected_name_of_pack) << Pattern;
+
+  // P3670R4 is C++29 only: neither an extension nor a warning before it.
+  if (!getLangOpts().CPlusPlus29 && DenotesPack) {
+    Diag(NameLoc, diag::err_pack_indexing_template_cxx29);
+    return TemplateName();
+  }
+
+  return BuildPackIndexingTemplateName(Pattern, IndexExpr);
+}
+
+TemplateName
+Sema::BuildPackIndexingTemplateName(TemplateName Pattern, Expr *IndexExpr,
+                                    bool FullySubstituted,
+                                    ArrayRef<TemplateName> Expansions) {
+  if (!IndexExpr->isInstantiationDependent()) {
+    llvm::APSInt Value(Context.getIntWidth(Context.getSizeType()));
+    ExprResult Res = CheckConvertedConstantExpression(
+        IndexExpr, Context.getSizeType(), Value, CCEKind::ArrayBound);
+    if (!Res.isUsable() || !Value.isRepresentableByInt64())
+      return TemplateName();
+
+    IndexExpr = Res.get();
+    // The array-bound conversion lets a negative value through un-narrowed.
+    if (Value.isSigned() && Value.isNegative()) {
+      Diag(IndexExpr->getBeginLoc(), diag::err_pack_index_negative)
+          << toString(Value, 10) << Context.getSizeType();
+      return TemplateName();
+    }
+    uint64_t V = Value.getZExtValue();
+    if (FullySubstituted && V >= Expansions.size()) {
+      Diag(IndexExpr->getBeginLoc(), diag::err_pack_index_out_of_bound)
+          << V << Pattern << Expansions.size();
+      return TemplateName();
+    }
+  }
+
+  return Context.getPackIndexingTemplateName(Pattern, IndexExpr,
+                                             FullySubstituted, Expansions);
+}
+
+TypeResult Sema::ActOnPackIndexingDeducedTemplateSpecializationType(
+    TemplateName Name, SourceLocation NameLoc) {
+
+  QualType T = Context.getDeducedTemplateSpecializationType(
+      ElaboratedTypeKeyword::None, Name, QualType(), /*IsDependent=*/false);
+  TypeLocBuilder TLB;
+  auto TL = TLB.push<DeducedTemplateSpecializationTypeLoc>(T);
+  TL.setElaboratedKeywordLoc(SourceLocation());
+  TL.setQualifierLoc(NestedNameSpecifierLoc());
+  TL.setNameLoc(NameLoc);
+  return CreateParsedType(T, TLB.getTypeSourceInfo(Context, T));
 }
 
 TemplateArgumentLoc Sema::getTemplateArgumentPackExpansionPattern(

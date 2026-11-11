@@ -35,8 +35,39 @@ def note_constexpr_invalid_function : Note<
 def note_constexpr_invalid_inhctor : Note<
   "constructor inherited from base class %0 cannot be used in a "
   "constant expression; derived class cannot be implicitly initialized">;
+def note_constexpr_macro_operator_not_token : Note<
+  "operator '%0' is not a single token and cannot be interpolated">;
+def note_constexpr_invalid_punctuator : Note<
+  "%0 is not a std::meta::punctuator enumerator">;
+def note_constexpr_id_not_identifier : Note<
+  "std::meta::id produces '%0', which %select{is not an identifier|"
+  "is a keyword}1">;
+// P2758: std::constexpr_print_str / constexpr_warning_str / constexpr_error_str
+// (via __builtin_constexpr_diag). The err/warn/note trio is emitted directly
+// by the constant evaluator when the call is manifestly constant-evaluated;
+// note_constexpr_message additionally serves as the failure note when an
+// expression macro reports an error.
+def note_constexpr_message : Note<"constexpr message: %0">,
+  ShowInSystemHeader;
+def note_constexpr_token_index_out_of_range : Note<
+  "token index %0 is out of range for a token sequence of %1 token%s1">;
+def note_constexpr_message_tag : Note<
+  "constexpr message with tag '%0': %1">, ShowInSystemHeader;
+def warn_constexpr_message : Warning<"constexpr message: %0">,
+  InGroup<ConstexprMessages>, ShowInSystemHeader;
+def warn_constexpr_message_tag : Warning<
+  "constexpr message with tag '%0': %1">,
+  InGroup<ConstexprMessages>, ShowInSystemHeader;
+def err_constexpr_message : Error<"constexpr message: %0">;
+def err_constexpr_message_tag : Error<
+  "constexpr message with tag '%0': %1">;
+def note_constexpr_diag_bad_tag : Note<
+  "tag of a constexpr message may only contain letters, digits, '_', '-', "
+  "and '='">;
 def note_constexpr_no_return : Note<
   "control reached end of constexpr function">;
+def note_constexpr_nonreturning_match_handler_returned : Note<
+  "control returned from a 'not return' match handler">;
 def note_constexpr_virtual_call : Note<
   "cannot evaluate call to virtual function in a constant expression "
   "in C++ standards before C++20">;
@@ -278,6 +309,21 @@ def note_constexpr_alignment_too_big : Note<
   "requested alignment must be %0 or less for type %1; %2 is invalid">;
 def note_constexpr_alignment_compute : Note<
   "cannot constant evaluate whether run-time alignment is at least %0">;
+def note_constexpr_pointer_tag_misuse : Note<
+  "a tagged pointer is an invalid pointer value: it can only be copied, compared for equality, converted to another "
+  "void pointer type or passed to a pointer tag builtin">;
+def note_constexpr_pointer_tag_template_arg : Note<
+  "a tagged pointer is an invalid pointer value and cannot be a template argument or a part of one">;
+def note_constexpr_pointer_tag_alignment : Note<
+  "cannot use %0 pointer tag bit(s): the object the pointer points into is only aligned to %1 byte(s)">;
+def note_constexpr_pointer_tag_unaligned : Note<
+  "cannot tag a pointer that is not aligned to %0 byte(s)">;
+def note_constexpr_pointer_tag_value : Note<
+  "tag value %0 does not fit in %1 bit(s)">;
+def note_constexpr_pointer_tag_past_end : Note<
+  "cannot tag a pointer past the end of an object">;
+def note_constexpr_pointer_tag_bits : Note<
+  "invalid number of pointer tag bits %0">;
 def note_constexpr_alignment_adjust : Note<
   "cannot constant evaluate the result of adjusting alignment to %0">;
 def note_constexpr_destroy_out_of_lifetime : Note<

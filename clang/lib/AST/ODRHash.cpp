@@ -159,6 +159,12 @@ void ODRHash::AddTemplateName(TemplateName Name) {
     AddDependentTemplateName(*Name.getAsDependentTemplateName());
     break;
   }
+  case TemplateName::PackIndexingTemplate: {
+    PackIndexingTemplateStorage *PI = Name.getAsPackIndexingTemplate();
+    AddTemplateName(PI->getPattern());
+    AddStmt(PI->getIndexExpr());
+    break;
+  }
   // TODO: Support these cases.
   case TemplateName::OverloadedTemplate:
   case TemplateName::AssumedTemplate:
@@ -1011,7 +1017,7 @@ public:
     ID.AddInteger((unsigned)T->getKeyword());
     ID.AddInteger(T->isConstrained());
     if (T->isConstrained()) {
-      AddDecl(T->getTypeConstraintConcept());
+      Hash.AddTemplateName(T->getTypeConstraintConcept());
       ID.AddInteger(T->getTypeConstraintArguments().size());
       for (const auto &TA : T->getTypeConstraintArguments())
         Hash.AddTemplateArgument(TA);
@@ -1267,12 +1273,14 @@ void ODRHash::AddStructuralValue(const APValue &Value) {
     const APValue::LValueBase &Base = Value.getLValueBase();
     if (!Base) {
       ID.AddInteger(Value.getLValueOffset().getQuantity());
+      ID.AddInteger(Value.getLValueTag());
       break;
     }
 
     assert(Base.is<const ValueDecl *>());
     AddDecl(Base.get<const ValueDecl *>());
     ID.AddInteger(Value.getLValueOffset().getQuantity());
+    ID.AddInteger(Value.getLValueTag());
 
     bool OnePastTheEnd = Value.isLValueOnePastTheEnd();
     if (Value.hasLValuePath()) {

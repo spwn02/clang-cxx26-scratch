@@ -2572,11 +2572,11 @@ bool Sema::LookupQualifiedName(LookupResult &R, DeclContext *LookupCtx,
 
   // If we're performing qualified name lookup into a dependent class,
   // then we are actually looking into a current instantiation. If we have any
-  // dependent base classes, then we either have to delay lookup until
-  // template instantiation time (at which point all bases will be available)
-  // or we have to fail.
+  // dependent base classes -- or members injected only per specialization --
+  // then we either have to delay lookup until template instantiation time (at
+  // which point all bases and members will be available) or we have to fail.
   if (!InUnqualifiedLookup && LookupRec->isDependentContext() &&
-      LookupRec->hasAnyDependentBases()) {
+      mayHaveMembersFromInstantiation(LookupRec)) {
     R.setNotFoundInCurrentInstantiation();
     return false;
   }
@@ -3344,7 +3344,8 @@ addAssociatedClassesAndNamespaces(AssociatedLookup &Result, QualType Ty) {
     T = Queue.pop_back_val();
   }
 
-  if (T->isReflectionType()) {
+  if (T->isReflectionType() || T->isTokenSequenceType() ||
+      T->isMetaTokenType()) {
     NamespaceDecl *StdMeta = Result.S.lookupStdMetaNamespace();
     if (StdMeta) {
       Result.Namespaces.insert(StdMeta);
@@ -4029,6 +4030,27 @@ void Sema::ArgumentDependentLookup(DeclarationName Name, SourceLocation Loc,
         Result.insert(Underlying);
     }
   }
+}
+
+Sema::UnqualifiedCallCandidateStatus
+Sema::classifyUnqualifiedCallCandidates(Scope *S, IdentifierInfo *Name,
+                                        SourceLocation NameLoc,
+                                        ArrayRef<Expr *> Args) {
+  LookupResult Ordinary(*this, Name, NameLoc, LookupOrdinaryName);
+  LookupName(Ordinary, S);
+  Ordinary.suppressDiagnostics();
+
+  if (!Ordinary.empty() || Ordinary.isAmbiguous())
+    return UnqualifiedCallCandidateStatus::Found;
+  if (Ordinary.wasNotFoundInCurrentInstantiation() ||
+      llvm::any_of(Args,
+                   [](const Expr *Arg) { return Arg->isTypeDependent(); }))
+    return UnqualifiedCallCandidateStatus::Dependent;
+
+  ADLResult ADL;
+  ArgumentDependentLookup(Name, NameLoc, Args, ADL);
+  return ADL.begin() == ADL.end() ? UnqualifiedCallCandidateStatus::None
+                                  : UnqualifiedCallCandidateStatus::Found;
 }
 
 //----------------------------------------------------------------------------
@@ -5213,6 +5235,14 @@ static void AddKeywordsToConsumer(Sema &SemaRef,
         Consumer.addKeywordResult("constexpr");
         Consumer.addKeywordResult("decltype");
         Consumer.addKeywordResult("thread_local");
+      }
+
+      // 'consteval' and 'constinit' are declaration specifiers just like
+      // 'constexpr'; without them a misspelled 'consteval' is "corrected" to
+      // the semantically different 'constexpr'.
+      if (SemaRef.getLangOpts().CPlusPlus20) {
+        Consumer.addKeywordResult("consteval");
+        Consumer.addKeywordResult("constinit");
       }
     }
 

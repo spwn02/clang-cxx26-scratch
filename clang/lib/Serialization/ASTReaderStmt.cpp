@@ -26,6 +26,7 @@
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/ExprObjC.h"
 #include "clang/AST/ExprOpenMP.h"
+#include "clang/AST/MatchPattern.h"
 #include "clang/AST/NestedNameSpecifier.h"
 #include "clang/AST/OpenMPClause.h"
 #include "clang/AST/OperationKinds.h"
@@ -66,6 +67,7 @@ using namespace serialization;
 namespace clang {
 
   class ASTStmtReader : public StmtVisitor<ASTStmtReader> {
+    struct MatchReader;
     ASTRecordReader &Record;
     llvm::BitstreamCursor &DeclsCursor;
 
@@ -485,6 +487,12 @@ void ASTStmtReader::VisitCoreturnStmt(CoreturnStmt *S) {
   S->IsImplicit = Record.readInt() != 0;
 }
 
+void ASTStmtReader::VisitDoReturnStmt(DoReturnStmt *S) {
+  VisitStmt(S);
+  S->setKeywordLoc(readSourceLocation());
+  S->setOperand(Record.readSubExpr());
+}
+
 void ASTStmtReader::VisitCoawaitExpr(CoawaitExpr *E) {
   VisitExpr(E);
   E->KeywordLoc = readSourceLocation();
@@ -517,6 +525,25 @@ void ASTStmtReader::VisitCXXReflectExpr(CXXReflectExpr *E) {
   }
 }
 
+void ASTStmtReader::VisitCXXTokenSequenceExpr(CXXTokenSequenceExpr *E) {
+  VisitExpr(E);
+  unsigned NumInterpolationExprs = Record.readUInt32();
+  assert(NumInterpolationExprs == E->getNumInterpolationExprs() &&
+         "wrong number of token sequence interpolation expressions");
+  E->setOperatorLoc(Record.readSourceLocation());
+  APValue V = Record.readAPValue();
+  E->setTokenSequence(V.getTokenSequence());
+  SmallVector<TokenSequenceParamBinding, 4> Bindings;
+  for (unsigned I = 0, N = Record.readUInt32(); I != N; ++I) {
+    unsigned Index = Record.readUInt32();
+    Bindings.push_back({Index, Record.readDeclAs<NamedDecl>()});
+  }
+  E->setParamBindings(Record.getContext(), Bindings);
+  for (unsigned I = 0; I != NumInterpolationExprs; ++I)
+    E->setInterpolationExpr(I, Record.readSubExpr());
+  E->setOperandRange(Record.readSourceRange());
+}
+
 void ASTStmtReader::VisitCXXMetafunctionExpr(CXXMetafunctionExpr *E) {
   VisitExpr(E);
   E->setKwLoc(Record.readSourceLocation());
@@ -531,6 +558,113 @@ void ASTStmtReader::VisitCXXMetafunctionExpr(CXXMetafunctionExpr *E) {
   for (unsigned k = 0; k < NumArgs; ++k)
     Args[k] = Record.readExpr();
   E->setArgs(Args, NumArgs);
+}
+
+void ASTStmtReader::VisitCXXBuiltinInjectExpr(CXXBuiltinInjectExpr *E) {
+  VisitExpr(E);
+  E->setKwLoc(Record.readSourceLocation());
+  E->setLParenLoc(Record.readSourceLocation());
+  E->setRParenLoc(Record.readSourceLocation());
+  bool HasTargetNS = Record.readInt();
+  E->setOperand(Record.readExpr());
+  if (HasTargetNS)
+    E->setTargetNS(Record.readExpr());
+}
+
+void ASTStmtReader::VisitCXXTokenInterpolationListExpr(
+    CXXTokenInterpolationListExpr *E) {
+  llvm_unreachable("token interpolation lists are not serialized");
+}
+
+void ASTStmtReader::VisitCXXBuiltinReportTokensExpr(
+    CXXBuiltinReportTokensExpr *E) {
+  VisitExpr(E);
+  E->setKwLoc(Record.readSourceLocation());
+  E->setLParenLoc(Record.readSourceLocation());
+  E->setRParenLoc(Record.readSourceLocation());
+  E->setMessage(Record.readExpr());
+  E->setMsgSizeCall(Record.readExpr());
+  E->setMsgDataCall(Record.readExpr());
+  E->setOperand(Record.readExpr());
+}
+
+void ASTStmtReader::VisitCXXBuiltinIdExpr(CXXBuiltinIdExpr *E) {
+  VisitExpr(E);
+  Record.skipInts(1); // the number of arguments (see CreateEmpty)
+  E->setKwLoc(Record.readSourceLocation());
+  E->setLParenLoc(Record.readSourceLocation());
+  E->setRParenLoc(Record.readSourceLocation());
+  for (unsigned I = 0; I < E->getNumArgs(); ++I) {
+    E->setArg(I, Record.readExpr());
+    E->setSizeCall(I, Record.readExpr());
+    E->setDataCall(I, Record.readExpr());
+  }
+}
+
+void ASTStmtReader::VisitCXXBuiltinStrLiteralExpr(CXXBuiltinStrLiteralExpr *E) {
+  VisitExpr(E);
+  Record.skipInts(1); // the number of arguments (see CreateEmpty)
+  E->setKwLoc(Record.readSourceLocation());
+  E->setLParenLoc(Record.readSourceLocation());
+  E->setRParenLoc(Record.readSourceLocation());
+  for (unsigned I = 0; I < E->getNumArgs(); ++I) {
+    E->setArg(I, Record.readExpr());
+    E->setSizeCall(I, Record.readExpr());
+    E->setDataCall(I, Record.readExpr());
+  }
+}
+
+void ASTStmtReader::VisitCXXBuiltinTokenizeExpr(CXXBuiltinTokenizeExpr *E) {
+  VisitExpr(E);
+  Record.skipInts(1); // the number of arguments (see CreateEmpty)
+  E->setKwLoc(Record.readSourceLocation());
+  E->setLParenLoc(Record.readSourceLocation());
+  E->setRParenLoc(Record.readSourceLocation());
+  for (unsigned I = 0; I < E->getNumArgs(); ++I) {
+    E->setArg(I, Record.readExpr());
+    E->setSizeCall(I, Record.readExpr());
+    E->setDataCall(I, Record.readExpr());
+  }
+}
+
+void ASTStmtReader::VisitCXXMacroInvocationExpr(CXXMacroInvocationExpr *E) {
+  VisitExpr(E);
+  unsigned NumArgs = Record.readInt();
+  assert(NumArgs == E->getNumArgs() && "wrong number of arguments");
+  (void)NumArgs;
+  E->setIsArrow(Record.readInt());
+  E->setArgsUnparsed(Record.readInt());
+  E->setMemberNameInfo(Record.readDeclarationNameInfo());
+  E->setOperatorLoc(Record.readSourceLocation());
+  E->setExclaimLoc(Record.readSourceLocation());
+  E->setLParenLoc(Record.readSourceLocation());
+  E->setRParenLoc(Record.readSourceLocation());
+  Decl *UnparsedContext = readDecl();
+  SmallVector<NamedDecl *, 4> UnparsedTemplateParams;
+  for (unsigned I = 0, N = Record.readInt(); I != N; ++I)
+    UnparsedTemplateParams.push_back(readDeclAs<NamedDecl>());
+  if (UnparsedContext || !UnparsedTemplateParams.empty())
+    E->setUnparsedEnvironment(Record.getContext(),
+                              UnparsedContext
+                                  ? Decl::castToDeclContext(UnparsedContext)
+                                  : nullptr,
+                              UnparsedTemplateParams);
+  if (Record.readInt())
+    E->MemberTemplateArgs = Record.readASTTemplateArgumentListInfo();
+  E->setCallee(cast_or_null<UnresolvedLookupExpr>(Record.readSubExpr()));
+  E->setBase(Record.readSubExpr());
+  if (Expr *Expansion = Record.readSubExpr())
+    E->setExpansion(Expansion);
+  for (unsigned I = 0, N = E->getNumArgs(); I != N; ++I)
+    E->setArg(I, Record.readSubExpr());
+}
+
+void ASTStmtReader::VisitCXXBuiltinStringizeExpr(CXXBuiltinStringizeExpr *E) {
+  VisitExpr(E);
+  E->setKwLoc(Record.readSourceLocation());
+  E->setLParenLoc(Record.readSourceLocation());
+  E->setRParenLoc(Record.readSourceLocation());
+  E->setOperand(Record.readExpr());
 }
 
 void ASTStmtReader::VisitCXXSpliceExpr(CXXSpliceExpr *E) {
@@ -1087,10 +1221,12 @@ void ASTStmtReader::VisitRequiresExpr(RequiresExpr *E) {
         std::optional<concepts::ExprRequirement::ReturnTypeRequirement> Req;
         ConceptSpecializationExpr *SubstitutedConstraintExpr = nullptr;
         SourceLocation NoexceptLoc;
+        Expr *NoexceptCond = nullptr;
         if (RK == concepts::Requirement::RK_Simple) {
           Req.emplace();
         } else {
           NoexceptLoc = Record.readSourceLocation();
+          NoexceptCond = Record.readExpr();
           switch (/* returnTypeRequirementKind */Record.readInt()) {
             case 0:
               // No return type requirement.
@@ -1114,11 +1250,12 @@ void ASTStmtReader::VisitRequiresExpr(RequiresExpr *E) {
         if (Expr *Ex = E.dyn_cast<Expr *>())
           R = new (Record.getContext()) concepts::ExprRequirement(
                   Ex, RK == concepts::Requirement::RK_Simple, NoexceptLoc,
-                  std::move(*Req), Status, SubstitutedConstraintExpr);
+                  NoexceptCond, std::move(*Req), Status,
+                  SubstitutedConstraintExpr);
         else
           R = new (Record.getContext()) concepts::ExprRequirement(
               cast<concepts::Requirement::SubstitutionDiagnostic *>(E),
-              RK == concepts::Requirement::RK_Simple, NoexceptLoc,
+              RK == concepts::Requirement::RK_Simple, NoexceptLoc, NoexceptCond,
               std::move(*Req));
       } break;
       case concepts::Requirement::RK_Nested: {
@@ -1569,6 +1706,19 @@ void ASTStmtReader::VisitStmtExpr(StmtExpr *E) {
   E->setRParenLoc(readSourceLocation());
   E->setSubStmt(cast_or_null<CompoundStmt>(Record.readSubStmt()));
   E->StmtExprBits.TemplateDepth = Record.readInt();
+}
+
+void ASTStmtReader::VisitDoExpr(DoExpr *E) {
+  VisitExpr(E);
+  E->setInitStmt(Record.readSubStmt());
+  E->setBody(cast_or_null<CompoundStmt>(Record.readSubStmt()));
+  E->setDoLoc(readSourceLocation());
+  E->setLBraceLoc(readSourceLocation());
+  E->setRBraceLoc(readSourceLocation());
+  bool HasExplicitType = Record.readInt() != 0;
+  E->setExplicitType(HasExplicitType ? Record.readTypeSourceInfo() : nullptr);
+  E->setTemplateDepth(Record.readInt());
+  E->setNRVOCandidate(readDeclAs<VarDecl>());
 }
 
 void ASTStmtReader::VisitChooseExpr(ChooseExpr *E) {
@@ -2599,6 +2749,315 @@ void ASTStmtReader::VisitSEHTryStmt(SEHTryStmt *S) {
   S->TryLoc = readSourceLocation();
   S->Children[SEHTryStmt::TRY] = Record.readSubStmt();
   S->Children[SEHTryStmt::HANDLER] = Record.readSubStmt();
+}
+
+//===----------------------------------------------------------------------===//
+// Pattern Matching
+//===----------------------------------------------------------------------===//
+
+/// Reads what ASTStmtWriter's MatchWriter wrote; see there for the encoding.
+struct ASTStmtReader::MatchReader {
+  ASTRecordReader &R;
+  ASTContext &Ctx;
+  SmallVector<MatchPattern *, 8> Patterns;
+  SmallVector<MatchPatternInstantiation *, 4> Instantiations;
+  SmallVector<MatchProjection *, 4> Projections;
+
+  explicit MatchReader(ASTRecordReader &R) : R(R), Ctx(R.getContext()) {}
+
+  MatchGuard guard() {
+    MatchGuard G;
+    G.Init = R.readSubStmt();
+    G.ConditionVariable = R.readDeclAs<VarDecl>();
+    G.Condition = cast_or_null<Expr>(R.readSubStmt());
+    return G;
+  }
+
+  template <class T> ArrayRef<T> copy(ArrayRef<T> Values) {
+    if (Values.empty())
+      return {};
+    T *Storage = Ctx.Allocate<T>(Values.size());
+    std::uninitialized_copy(Values.begin(), Values.end(), Storage);
+    return ArrayRef<T>(Storage, Values.size());
+  }
+
+  MutableArrayRef<MatchPattern *> patternList() {
+    unsigned N = R.readInt();
+    SmallVector<MatchPattern *, 4> List;
+    for (unsigned I = 0; I != N; ++I)
+      List.push_back(pattern());
+    if (List.empty())
+      return {};
+    MatchPattern **Storage = Ctx.Allocate<MatchPattern *>(N);
+    std::uninitialized_copy(List.begin(), List.end(), Storage);
+    return MutableArrayRef<MatchPattern *>(Storage, N);
+  }
+
+  SmallVector<SourceLocation, 4> locations() {
+    SmallVector<SourceLocation, 4> Locs;
+    for (unsigned I = 0, N = R.readInt(); I != N; ++I)
+      Locs.push_back(R.readSourceLocation());
+    return Locs;
+  }
+
+  MatchPattern *pattern() {
+    unsigned Tag = R.readInt();
+    if (Tag == 0)
+      return nullptr;
+    if (Tag == 1)
+      return Patterns[R.readInt()];
+    auto Class = static_cast<MatchPattern::MatchPatternClass>(Tag - 2);
+    auto Dependence = static_cast<ExprDependence>(R.readInt());
+    MatchPattern *P = nullptr;
+    MatchPattern::SerializedTag T;
+    switch (Class) {
+    case MatchPattern::WildcardPatternClass: {
+      auto *W = new (Ctx) WildcardPattern(T);
+      W->Loc = R.readSourceLocation();
+      W->IsPackExpansion = R.readInt();
+      P = W;
+      break;
+    }
+    case MatchPattern::ExpressionPatternClass: {
+      auto *X = new (Ctx) ExpressionPattern(T);
+      X->E = R.readSubExpr();
+      X->IsPackExpansion = R.readInt();
+      P = X;
+      break;
+    }
+    case MatchPattern::ParenPatternClass: {
+      auto *Paren = new (Ctx) ParenPattern(T);
+      Paren->Parens = R.readSourceRange();
+      Paren->Pattern = pattern();
+      P = Paren;
+      break;
+    }
+    case MatchPattern::DeclarationPatternClass: {
+      auto *D = new (Ctx) DeclarationPattern(T);
+      D->Declaration = R.readDeclAs<VarDecl>();
+      D->PackSourceDeclaration = R.readDeclAs<VarDecl>();
+      D->DeclarationRange = R.readSourceRange();
+      P = D;
+      break;
+    }
+    case MatchPattern::TypePatternClass: {
+      auto *TP = new (Ctx) TypePattern(T);
+      TP->TInfo = R.readTypeSourceInfo();
+      P = TP;
+      break;
+    }
+    case MatchPattern::OrPatternClass: {
+      auto *O = new (Ctx) OrPattern(T);
+      O->Alternatives = patternList();
+      O->OrLocs = copy(ArrayRef<SourceLocation>(locations()));
+      SmallVector<VarDecl *, 4> Bindings;
+      for (unsigned I = 0, N = R.readInt(); I != N; ++I)
+        Bindings.push_back(R.readDeclAs<VarDecl>());
+      O->Bindings = copy(ArrayRef<VarDecl *>(Bindings));
+      P = O;
+      break;
+    }
+    case MatchPattern::AlternativePatternClass: {
+      auto *A = new (Ctx) AlternativePattern(T);
+      A->Kind = static_cast<AlternativePattern::AlternativeKind>(R.readInt());
+      A->DiscriminatorRange = R.readSourceRange();
+      A->Braces = R.readSourceRange();
+      A->Name = R.readIdentifier();
+      A->Selector = pattern();
+      if (R.readInt())
+        A->Constraint = R.readConceptReference();
+      A->ColonLoc = R.readSourceLocation();
+      A->Pattern = pattern();
+      P = A;
+      break;
+    }
+    case MatchPattern::DecompositionPatternClass: {
+      SmallVector<MatchPattern *, 4> Children;
+      for (unsigned I = 0, N = R.readInt(); I != N; ++I)
+        Children.push_back(pattern());
+      SourceRange Squares = R.readSourceRange();
+      auto *D = DecompositionPattern::CreateEmpty(Ctx, Children.size());
+      std::uninitialized_copy(Children.begin(), Children.end(),
+                              D->getPatterns());
+      D->Squares = Squares;
+      P = D;
+      break;
+    }
+    }
+    P->setDependence(Dependence);
+    Patterns.push_back(P);
+    return P;
+  }
+
+  MatchProjection *projection() {
+    unsigned Tag = R.readInt();
+    if (Tag == 0)
+      return nullptr;
+    if (Tag == 1)
+      return Projections[R.readInt()];
+    auto *M = new (Ctx) MatchProjection(
+        static_cast<MatchProjection::ProjectionKind>(R.readInt()));
+    M->setHoldingVar(R.readDeclAs<VarDecl>());
+    M->setIntermediateVar(R.readDeclAs<VarDecl>());
+    M->setConditionVar(R.readDeclAs<VarDecl>());
+    M->setProjectedVar(R.readDeclAs<VarDecl>());
+    M->setDecomposedDecl(R.readDeclAs<DecompositionDecl>());
+    M->setConditionExpr(cast_or_null<Expr>(R.readSubStmt()));
+    M->setProjectedExpr(cast_or_null<Expr>(R.readSubStmt()));
+    Projections.push_back(M);
+    return M;
+  }
+
+  template <class T> ArrayRef<T> bytes() {
+    SmallVector<T, 8> Values;
+    for (unsigned I = 0, N = R.readInt(); I != N; ++I)
+      Values.push_back(static_cast<T>(R.readInt()));
+    return copy(ArrayRef<T>(Values));
+  }
+
+  MatchPatternInfo info() {
+    MatchPatternInfo I;
+    I.Pattern = pattern();
+    I.Condition = cast_or_null<Expr>(R.readSubStmt());
+    I.Projection = projection();
+    I.CheckedSubjectType = R.readType();
+    I.AlternativeTraitsType = R.readType();
+    SmallVector<QualType, 4> Types;
+    for (unsigned N = R.readInt(), K = 0; K != N; ++K)
+      Types.push_back(R.readType());
+    I.AlternativeTypes = copy(ArrayRef<QualType>(Types));
+    I.ProjectableAlternatives = bytes<unsigned char>();
+    I.EmptyAlternatives = bytes<unsigned char>();
+    SmallVector<Expr *, 4> Values;
+    for (unsigned N = R.readInt(), K = 0; K != N; ++K)
+      Values.push_back(cast_or_null<Expr>(R.readSubStmt()));
+    I.AlternativeValues = copy(ArrayRef<Expr *>(Values));
+    I.SelectedAlternatives = bytes<unsigned>();
+    I.ViableOrAlternatives = bytes<unsigned char>();
+    I.ExpandedPatterns = patternList();
+    I.OpenAlternativeType = R.readType();
+    unsigned Flags = R.readInt();
+    I.IsExhaustive = Flags & (1 << 0);
+    I.HasParameterizedIndexName = Flags & (1 << 1);
+    I.IsAlternativeValuePattern = Flags & (1 << 2);
+    I.IsOpenAlternative = Flags & (1 << 3);
+    I.IsOpenAlternativeInitialization = Flags & (1 << 4);
+    I.TypePatternResolved = Flags & (1 << 5);
+    I.TypePatternMatches = Flags & (1 << 6);
+    I.HasExpandedPatterns = Flags & (1 << 7);
+    return I;
+  }
+
+  MatchPatternInstantiation *instantiation() {
+    unsigned Tag = R.readInt();
+    if (Tag == 0)
+      return nullptr;
+    if (Tag == 1)
+      return Instantiations[R.readInt()];
+    MatchPattern *P = pattern();
+    SmallVector<MatchPatternInfo, 4> Infos;
+    for (unsigned N = R.readInt(), K = 0; K != N; ++K)
+      Infos.push_back(info());
+    auto *I = MatchPatternInstantiation::Create(Ctx, P, Infos);
+    Instantiations.push_back(I);
+    return I;
+  }
+
+  MatchTestInstantiation testInstantiation() {
+    MatchTestInstantiation T;
+    T.Pattern = pattern();
+    T.IfLoc = R.readSourceLocation();
+    T.Guard = guard();
+    T.PatternInstantiation = instantiation();
+    T.PatternIsIrrefutable = R.readInt();
+    T.Condition = cast_or_null<Expr>(R.readSubStmt());
+    T.Handler = R.readSubStmt();
+    T.Increment = cast_or_null<Expr>(R.readSubStmt());
+    return T;
+  }
+
+  ArrayRef<const Attr *> attributes() {
+    AttrVec Attrs;
+    R.readAttributes(Attrs);
+    SmallVector<const Attr *, 2> Result(Attrs.begin(), Attrs.end());
+    return copy(ArrayRef<const Attr *>(Result));
+  }
+};
+
+void ASTStmtReader::VisitMatchTestExpr(MatchTestExpr *E) {
+  VisitExpr(E);
+  MatchReader M(Record);
+  E->HoldingVar = Record.readDeclAs<VarDecl>();
+  E->Subject = Record.readSubExpr();
+  E->MatchLoc = readSourceLocation();
+  E->RParenLoc = readSourceLocation();
+  E->Pattern = M.pattern();
+  E->PatternInstantiation = M.instantiation();
+  E->IfLoc = readSourceLocation();
+  E->Guard = M.guard();
+  SmallVector<MatchTestInstantiation, 2> Instantiations;
+  for (unsigned I = 0, N = Record.readInt(); I != N; ++I)
+    Instantiations.push_back(M.testInstantiation());
+  E->Instantiations = M.copy(ArrayRef<MatchTestInstantiation>(Instantiations));
+  E->PatternIsIrrefutable = Record.readInt();
+  E->NeedsCaseInstantiation = Record.readInt();
+  E->HasSemanticInstantiations = Record.readInt();
+  E->HasSubjectProduct = Record.readInt();
+}
+
+void ASTStmtReader::VisitCaseConditionExpr(CaseConditionExpr *E) {
+  VisitMatchTestExpr(E);
+}
+
+void ASTStmtReader::VisitMatchSelectExpr(MatchSelectExpr *E) {
+  VisitExpr(E);
+  MatchReader M(Record);
+  // The counts were read in ReadStmtFromStream.
+  Record.skipInts(3);
+  E->InitStmt = Record.readSubStmt();
+  E->HoldingVar = Record.readDeclAs<VarDecl>();
+  E->Subject = Record.readSubExpr();
+  E->MatchLoc = readSourceLocation();
+  E->IsConstexpr = Record.readInt();
+  E->IsFullyCovered = Record.readInt();
+  E->IsStatement = Record.readInt();
+  E->HasSubjectProduct = Record.readInt();
+  if (Record.readInt()) {
+    QualType Ty = Record.readType();
+    TypeSourceInfo *TInfo = Record.getContext().CreateTypeSourceInfo(Ty);
+    Record.readTypeLoc(TInfo->getTypeLoc());
+    E->OrigResultType = TInfo->getTypeLoc();
+  }
+  E->Braces = Record.readSourceRange();
+  Stmt **Preamble = E->getTrailingObjects<Stmt *>();
+  for (unsigned I = 0; I != E->NumPreambleStatements; ++I)
+    Preamble[I] = Record.readSubStmt();
+  MatchCase *Cases = E->getTrailingObjects<MatchCase>();
+  for (unsigned I = 0; I != E->NumCases; ++I) {
+    MatchCase C;
+    C.Pattern = M.pattern();
+    C.IfLoc = readSourceLocation();
+    C.Guard = M.guard();
+    C.Handler = Record.readSubStmt();
+    C.MaybeUseful = Record.readInt();
+    C.PatternInstantiation = M.instantiation();
+    C.Attributes = M.attributes();
+    C.NotReturnLoc = readSourceLocation();
+    new (&Cases[I]) MatchCase(C);
+  }
+  MatchCaseInstantiation *Insts = E->getTrailingObjects<MatchCaseInstantiation>();
+  for (unsigned I = 0; I != E->NumCaseInstantiations; ++I) {
+    MatchCaseInstantiation C;
+    C.Pattern = M.pattern();
+    C.IfLoc = readSourceLocation();
+    C.Guard = M.guard();
+    C.Handler = Record.readSubStmt();
+    C.CaseIndex = Record.readInt();
+    C.PatternInstantiation = M.instantiation();
+    C.Attributes = M.attributes();
+    C.NotReturnLoc = readSourceLocation();
+    new (&Insts[I]) MatchCaseInstantiation(C);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -4649,6 +5108,29 @@ Stmt *ASTReader::ReadStmtFromStream(ModuleFile &F) {
       S = new (Context) CoreturnStmt(Empty);
       break;
 
+    case STMT_DO_RETURN:
+      S = new (Context) DoReturnStmt(Empty);
+      break;
+
+    case EXPR_DO:
+      S = new (Context) DoExpr(Empty);
+      break;
+
+    case EXPR_MATCH_TEST:
+      S = new (Context) MatchTestExpr(Empty);
+      break;
+
+    case EXPR_CASE_CONDITION:
+      S = new (Context) CaseConditionExpr(Empty);
+      break;
+
+    case EXPR_MATCH_SELECT:
+      S = MatchSelectExpr::CreateEmpty(
+          Context, Record[ASTStmtReader::NumExprFields],
+          Record[ASTStmtReader::NumExprFields + 1],
+          Record[ASTStmtReader::NumExprFields + 2]);
+      break;
+
     case EXPR_COAWAIT:
       S = new (Context) CoawaitExpr(Empty);
       break;
@@ -4761,8 +5243,45 @@ Stmt *ASTReader::ReadStmtFromStream(ModuleFile &F) {
       S = CXXReflectExpr::CreateEmpty(Context);
       break;
     }
+    case EXPR_TOKEN_SEQUENCE: {
+      S = CXXTokenSequenceExpr::CreateEmpty(
+          Context, Record[ASTStmtReader::NumExprFields]);
+      break;
+    }
     case EXPR_METAFUNCTION: {
       S = CXXMetafunctionExpr::CreateEmpty(Context);
+      break;
+    }
+    case EXPR_BUILTIN_INJECT: {
+      S = CXXBuiltinInjectExpr::CreateEmpty(Context);
+      break;
+    }
+    case EXPR_BUILTIN_REPORT_TOKENS: {
+      S = CXXBuiltinReportTokensExpr::CreateEmpty(Context);
+      break;
+    }
+    case EXPR_BUILTIN_ID: {
+      unsigned NumArgs = Record[ASTStmtReader::NumExprFields];
+      S = CXXBuiltinIdExpr::CreateEmpty(Context, NumArgs);
+      break;
+    }
+    case EXPR_BUILTIN_STR_LITERAL: {
+      unsigned NumArgs = Record[ASTStmtReader::NumExprFields];
+      S = CXXBuiltinStrLiteralExpr::CreateEmpty(Context, NumArgs);
+      break;
+    }
+    case EXPR_BUILTIN_TOKENIZE: {
+      unsigned NumArgs = Record[ASTStmtReader::NumExprFields];
+      S = CXXBuiltinTokenizeExpr::CreateEmpty(Context, NumArgs);
+      break;
+    }
+    case EXPR_BUILTIN_STRINGIZE: {
+      S = CXXBuiltinStringizeExpr::CreateEmpty(Context);
+      break;
+    }
+    case EXPR_MACRO_INVOCATION: {
+      S = CXXMacroInvocationExpr::CreateEmpty(
+          Context, Record[ASTStmtReader::NumExprFields]);
       break;
     }
     case EXPR_SPLICE: {

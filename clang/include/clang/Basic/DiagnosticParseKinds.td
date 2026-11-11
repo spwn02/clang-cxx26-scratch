@@ -224,11 +224,30 @@ def ext_c2y_case_range : Extension<
 def err_c2y_labeled_break_continue : Error<
   "named %select{'break'|'continue'}0 is only supported in C2y">;
 
+// P4380: token sequence literals.
+def err_token_sequence_requires_cxx29 : Error<
+  "token sequence literals '^^{ ... }' are only available in C++29; "
+  "use '-std=c++2d'">;
+
+// P2806 ext: do-expressions.
+def err_do_expr_requires_cxx29 : Error<
+  "do-expressions are only available in C++29; "
+  "use '-std=c++2d'">;
+def note_do_expr_init_hoist_not_a_capture : Note<
+  "'do [' introduces an init-hoist, not a lambda capture: it declares a new "
+  "variable and always requires an initializer">;
+
 // Generic errors.
 def err_expected_expression : Error<"expected expression">;
 def err_expected_type : Error<"expected a type">;
 def err_expected_external_declaration : Error<"expected external declaration">;
 def err_extraneous_closing_brace : Error<"extraneous closing brace ('}')">;
+def err_unexpected_token_in_injected_members : Error<
+  "unexpected %0 in injected member declarations">;
+def note_injected_members_here : Note<
+  "in member declarations injected into %0">;
+def err_expected_body_after_decl_spec : Error<
+  "expected '{' or ';' after an interpolated declaration description">;
 def err_expected_semi_declaration : Error<
   "expected ';' at end of declaration">;
 def err_expected_semi_decl_list : Error<
@@ -456,6 +475,16 @@ def err_expected_parentheses_around_typename : Error<
 
 def err_expected_case_before_expression: Error<
   "expected 'case' keyword before expression">;
+def err_expected_case_before_match_pattern: Error<
+  "expected 'case' before pattern">;
+def err_match_preamble_after_case: Error<
+  "match preamble declaration must precede all cases">;
+def note_match_type_name_declaration_ambiguity: Note<
+  "'match' names a type, so this construct is otherwise parsed as a declaration">;
+def err_match_statement_result_type: Error<
+  "match statement cannot have an explicit result type">;
+def err_expected_lbrace_after_match_result_type: Error<
+  "expected '{' after match result type">;
 
 def ext_warn_gnu_final : ExtWarn<
   "__final is a GNU extension, consider using C++11 final">,
@@ -515,6 +544,8 @@ def err_expected_coloncolon_after_super : Error<
 def ext_decomp_decl_empty : ExtWarn<
   "ISO C++17 does not allow a structured binding group to be empty">,
   InGroup<DiagGroup<"empty-decomposition">>;
+def err_decomp_decl_nested_pack : Error<
+  "a nested structured binding cannot be a pack expansion">;
 
 def err_function_parameter_limit_exceeded : Error<
   "too many function parameters; subsequent parameters will be ignored">;
@@ -928,6 +959,9 @@ def err_requires_expr_explicit_object_parameter: Error<
   "a requires expression cannot have an explicit object parameter">;
 def err_expected_semi_requirement : Error<
   "expected ';' at end of requirement">;
+def err_requires_expr_noexcept_condition_cxx29 : Error<
+  "a condition for the 'noexcept' of a compound requirement is only available "
+  "in C++29">;
 def err_requires_expr_missing_arrow : Error<
   "expected '->' before expression type requirement">;
 def err_requires_expr_expected_type_constraint : Error<
@@ -1843,6 +1877,20 @@ def err_mixed_attributes_and_annotations : Error<
   "attribute specifier cannot contain both attributes and annotations">;
 def warn_meant_parenthesize_reflection : Warning<
   "'%0' binds to reflection operand">, InGroup<ReflexingParse>;
+def err_macro_expansion_not_single_expression : Error<
+  "expansion of expression macro must form a single expression">;
+def err_interpolation_escapes_token_sequence : Error<
+  "interpolation with %0 backslashes escapes the enclosing token sequence "
+  "(%1 %plural{1:level|:levels}1 of token sequence enclose it)">;
+def err_dollar_interpolation_escapes_token_sequence : Error<
+  "interpolation with %0 '$' escapes the enclosing token sequence "
+  "(%1 %plural{1:level|:levels}1 of token sequence enclose it)">;
+def err_dollar_interpolation_expected : Error<
+  "expected a name or '{' after '$' in a token sequence">;
+def err_dollar_interpolation_keyword : Error<
+  "'$' interpolates a name, not the keyword '%0'; write '${%0}'">;
+def err_dollar_interpolation_digit : Error<
+  "'$' followed by a digit is reserved in a token sequence">;
 def err_splice_template_argument : Error<
   "unparenthesized splice expression cannot be used as a template argument">;
 }

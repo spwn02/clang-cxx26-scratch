@@ -1704,6 +1704,8 @@ RedeclarableResult ASTDeclReader::VisitVarDeclImpl(VarDecl *VD) {
 
     VD->NonParmVarDeclBits.ObjCForDecl = VarDeclBits.getNextBit();
     VD->NonParmVarDeclBits.IsCXXForRangeImplicitVar = VarDeclBits.getNextBit();
+    VD->NonParmVarDeclBits.IsDoExprInitCapture = VarDeclBits.getNextBit();
+    VD->NonParmVarDeclBits.IsPatternVar = VarDeclBits.getNextBit();
   }
 
   // If this variable has a deduced type, defer reading that type until we are
@@ -1827,6 +1829,7 @@ void ASTDeclReader::VisitDecompositionDecl(DecompositionDecl *DD) {
 void ASTDeclReader::VisitBindingDecl(BindingDecl *BD) {
   VisitValueDecl(BD);
   BD->Binding = Record.readExpr();
+  BD->NestedDecomposition = readDeclAs<DecompositionDecl>();
 }
 
 void ASTDeclReader::VisitFileScopeAsmDecl(FileScopeAsmDecl *AD) {

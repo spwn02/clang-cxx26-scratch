@@ -24,6 +24,10 @@
 #    error "__cpp_lib_simd should not be defined before c++26"
 #  endif
 
+#  ifdef __cpp_lib_simd_bitops
+#    error "__cpp_lib_simd_bitops should not be defined before c++29"
+#  endif
+
 #  ifdef __cpp_lib_simd_complex
 #    error "__cpp_lib_simd_complex should not be defined before c++26"
 #  endif
@@ -36,6 +40,10 @@
 
 #  ifdef __cpp_lib_simd
 #    error "__cpp_lib_simd should not be defined before c++26"
+#  endif
+
+#  ifdef __cpp_lib_simd_bitops
+#    error "__cpp_lib_simd_bitops should not be defined before c++29"
 #  endif
 
 #  ifdef __cpp_lib_simd_complex
@@ -52,6 +60,10 @@
 #    error "__cpp_lib_simd should not be defined before c++26"
 #  endif
 
+#  ifdef __cpp_lib_simd_bitops
+#    error "__cpp_lib_simd_bitops should not be defined before c++29"
+#  endif
+
 #  ifdef __cpp_lib_simd_complex
 #    error "__cpp_lib_simd_complex should not be defined before c++26"
 #  endif
@@ -64,6 +76,10 @@
 
 #  ifdef __cpp_lib_simd
 #    error "__cpp_lib_simd should not be defined before c++26"
+#  endif
+
+#  ifdef __cpp_lib_simd_bitops
+#    error "__cpp_lib_simd_bitops should not be defined before c++29"
 #  endif
 
 #  ifdef __cpp_lib_simd_complex
@@ -80,6 +96,10 @@
 #    error "__cpp_lib_simd should not be defined before c++26"
 #  endif
 
+#  ifdef __cpp_lib_simd_bitops
+#    error "__cpp_lib_simd_bitops should not be defined before c++29"
+#  endif
+
 #  ifdef __cpp_lib_simd_complex
 #    error "__cpp_lib_simd_complex should not be defined before c++26"
 #  endif
@@ -88,13 +108,17 @@
 #    error "__cpp_lib_simd_permutations should not be defined before c++26"
 #  endif
 
-#elif TEST_STD_VER > 23
+#elif TEST_STD_VER == 26
 
 #  ifndef __cpp_lib_simd
 #    error "__cpp_lib_simd should be defined in c++26"
 #  endif
 #  if __cpp_lib_simd != 202603L
 #    error "__cpp_lib_simd should have the value 202603L in c++26"
+#  endif
+
+#  ifdef __cpp_lib_simd_bitops
+#    error "__cpp_lib_simd_bitops should not be defined before c++29"
 #  endif
 
 #  ifndef __cpp_lib_simd_complex
@@ -111,6 +135,36 @@
 #    error "__cpp_lib_simd_permutations should have the value 202506L in c++26"
 #  endif
 
-#endif // TEST_STD_VER > 23
+#elif TEST_STD_VER > 26
+
+#  ifndef __cpp_lib_simd
+#    error "__cpp_lib_simd should be defined in c++29"
+#  endif
+#  if __cpp_lib_simd != 202606L
+#    error "__cpp_lib_simd should have the value 202606L in c++29"
+#  endif
+
+#  ifndef __cpp_lib_simd_bitops
+#    error "__cpp_lib_simd_bitops should be defined in c++29"
+#  endif
+#  if __cpp_lib_simd_bitops != 202607L
+#    error "__cpp_lib_simd_bitops should have the value 202607L in c++29"
+#  endif
+
+#  ifndef __cpp_lib_simd_complex
+#    error "__cpp_lib_simd_complex should be defined in c++29"
+#  endif
+#  if __cpp_lib_simd_complex != 202502L
+#    error "__cpp_lib_simd_complex should have the value 202502L in c++29"
+#  endif
+
+#  ifndef __cpp_lib_simd_permutations
+#    error "__cpp_lib_simd_permutations should be defined in c++29"
+#  endif
+#  if __cpp_lib_simd_permutations != 202506L
+#    error "__cpp_lib_simd_permutations should have the value 202506L in c++29"
+#  endif
+
+#endif // TEST_STD_VER > 26
 
 // clang-format on

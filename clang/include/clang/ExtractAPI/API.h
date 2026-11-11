@@ -20,6 +20,8 @@
 
 #include "clang/AST/Availability.h"
 #include "clang/AST/DeclBase.h"
+#include "clang/AST/PrettyPrinter.h"
+#include "clang/AST/TemplateName.h"
 #include "clang/AST/RawCommentList.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/ExtractAPI/DeclarationFragments.h"
@@ -27,6 +29,7 @@
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 #include <cstddef>
 #include <iterator>
@@ -36,6 +39,23 @@
 
 namespace clang {
 namespace extractapi {
+
+/// The spelling of the concept named by a type-constraint: the concept's name,
+/// or 'CC...[0]' for a pack-index-template-name (P3670R4).
+inline std::string getConceptNameSpelling(TemplateName Concept) {
+  if (const TemplateDecl *TD = Concept.getAsTemplateDecl())
+    return TD->getName().str();
+  std::string Spelling;
+  llvm::raw_string_ostream OS(Spelling);
+  Concept.print(OS, PrintingPolicy(LangOptions()));
+  return Spelling;
+}
+
+inline std::string getTypeConstraintSpelling(const TypeConstraint *TC,
+                                             const ASTContext &Context) {
+  (void)Context;
+  return getConceptNameSpelling(TC->getNamedConcept());
+}
 
 class Template {
   struct TemplateParameter {
@@ -70,8 +90,8 @@ public:
       if (!Param) // some params are null
         continue;
       std::string Type;
-      if (Param->hasTypeConstraint())
-        Type = Param->getTypeConstraint()->getNamedConcept()->getName().str();
+      if (Param->getTypeConstraint())
+        Type = getConceptNameSpelling(Param->getTypeConstraint()->getNamedConcept());
       else if (Param->wasDeclaredWithTypename())
         Type = "typename";
       else
@@ -88,8 +108,8 @@ public:
       if (!Param) // some params are null
         continue;
       std::string Type;
-      if (Param->hasTypeConstraint())
-        Type = Param->getTypeConstraint()->getNamedConcept()->getName().str();
+      if (Param->getTypeConstraint())
+        Type = getConceptNameSpelling(Param->getTypeConstraint()->getNamedConcept());
       else if (Param->wasDeclaredWithTypename())
         Type = "typename";
       else
@@ -106,8 +126,8 @@ public:
       if (!Param) // some params are null
         continue;
       std::string Type;
-      if (Param->hasTypeConstraint())
-        Type = Param->getTypeConstraint()->getNamedConcept()->getName().str();
+      if (Param->getTypeConstraint())
+        Type = getConceptNameSpelling(Param->getTypeConstraint()->getNamedConcept());
       else if (Param->wasDeclaredWithTypename())
         Type = "typename";
       else

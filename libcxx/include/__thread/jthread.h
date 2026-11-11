@@ -25,6 +25,12 @@
 #include <__utility/move.h>
 #include <__utility/swap.h>
 
+#if _LIBCPP_STD_VER >= 29
+#  include <__concepts/same_as.h>
+#  include <__utility/integer_sequence.h>
+#  include <tuple>
+#endif
+
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header
 #endif
@@ -42,9 +48,16 @@ public:
   using id                 = thread::id;
   using native_handle_type = thread::native_handle_type;
 
+#  if _LIBCPP_STD_VER >= 29
+  template <class _Tp>
+  using name_hint       = thread::name_hint<_Tp>;
+  using stack_size_hint = thread::stack_size_hint;
+#  endif
+
   // [thread.jthread.cons], constructors, move, and assignment
   _LIBCPP_HIDE_FROM_ABI jthread() noexcept : __stop_source_(std::nostopstate) {}
 
+#  if _LIBCPP_STD_VER < 29
   template <class _Fun, class... _Args>
   _LIBCPP_HIDE_FROM_ABI explicit jthread(_Fun&& __fun, _Args&&... __args)
     requires(!std::is_same_v<remove_cvref_t<_Fun>, jthread>)
@@ -55,6 +68,19 @@ public:
     static_assert(is_invocable_v<decay_t<_Fun>, decay_t<_Args>...> ||
                   is_invocable_v<decay_t<_Fun>, stop_token, decay_t<_Args>...>);
   }
+#  else
+  // [thread.jthread.cons]: jthread(attrs..., f, fargs...), see thread
+  template <class... _Args>
+    requires(sizeof...(_Args) != 0 && !same_as<remove_cvref_t<_Args...[0]>, jthread>)
+  _LIBCPP_HIDE_FROM_ABI explicit jthread(_Args&&... __args)
+      : __stop_source_(),
+        __thread_(__init_thread<__first_non_attribute_index<decay_t<_Args>...>()>(
+            __stop_source_,
+            __make_index_sequence<__first_non_attribute_index<decay_t<_Args>...>()>(),
+            __make_index_sequence<sizeof...(_Args) - __first_non_attribute_index<decay_t<_Args>...>() -
+                                  (__first_non_attribute_index<decay_t<_Args>...>() < sizeof...(_Args) ? 1 : 0)>(),
+            tuple<_Args&&...>(std::forward<_Args>(__args)...))) {}
+#  endif
 
   _LIBCPP_HIDE_FROM_ABI ~jthread() {
     if (joinable()) {
@@ -114,6 +140,43 @@ public:
   }
 
 private:
+#  if _LIBCPP_STD_VER >= 29
+  template <class... _Ts>
+  _LIBCPP_HIDE_FROM_ABI static consteval size_t __first_non_attribute_index() {
+    constexpr bool __is_function_arg[] = {!__is_thread_attribute_v<_Ts>..., true};
+    size_t __i                     = 0;
+    while (!__is_function_arg[__i])
+      ++__i;
+    return __i;
+  }
+
+  template <size_t _Idx, size_t... _Ai, size_t... _Fi, class... _Ts>
+  _LIBCPP_HIDE_FROM_ABI static thread
+  __init_thread(const stop_source& __ss, __index_sequence<_Ai...>, __index_sequence<_Fi...>, tuple<_Ts...>&& __all) {
+    static_assert(_Idx < sizeof...(_Ts), "Mandates: a function to invoke follows the thread attributes");
+    if constexpr (_Idx < sizeof...(_Ts)) {
+      using _Types = tuple<_Ts...>; // the elements are the (possibly reference) argument types
+      using _Fun   = tuple_element_t<_Idx, _Types>;
+      static_assert(is_constructible_v<decay_t<_Fun>, _Fun>);
+      static_assert((is_constructible_v<decay_t<tuple_element_t<_Idx + 1 + _Fi, _Types>>, tuple_element_t<_Idx + 1 + _Fi, _Types>> &&
+                     ...));
+      static_assert(is_invocable_v<decay_t<_Fun>, decay_t<tuple_element_t<_Idx + 1 + _Fi, _Types>>...> ||
+                    is_invocable_v<decay_t<_Fun>, stop_token, decay_t<tuple_element_t<_Idx + 1 + _Fi, _Types>>...>);
+      if constexpr (is_invocable_v<decay_t<_Fun>, stop_token, decay_t<tuple_element_t<_Idx + 1 + _Fi, _Types>>...>) {
+        return thread(std::forward<tuple_element_t<_Ai, _Types>>(std::get<_Ai>(std::move(__all)))...,
+                      std::forward<_Fun>(std::get<_Idx>(std::move(__all))),
+                      __ss.get_token(),
+                      std::forward<tuple_element_t<_Idx + 1 + _Fi, _Types>>(std::get<_Idx + 1 + _Fi>(std::move(__all)))...);
+      } else {
+        return thread(std::forward<tuple_element_t<_Ai, _Types>>(std::get<_Ai>(std::move(__all)))...,
+                      std::forward<_Fun>(std::get<_Idx>(std::move(__all))),
+                      std::forward<tuple_element_t<_Idx + 1 + _Fi, _Types>>(std::get<_Idx + 1 + _Fi>(std::move(__all)))...);
+      }
+    } else {
+      return thread(); // diagnosed by the static_assert above
+    }
+  }
+#  else
   template <class _Fun, class... _Args>
   _LIBCPP_HIDE_FROM_ABI static thread __init_thread(const stop_source& __ss, _Fun&& __fun, _Args&&... __args) {
     if constexpr (is_invocable_v<decay_t<_Fun>, stop_token, decay_t<_Args>...>) {
@@ -122,6 +185,7 @@ private:
       return thread(std::forward<_Fun>(__fun), std::forward<_Args>(__args)...);
     }
   }
+#  endif
 
   stop_source __stop_source_;
   thread __thread_;

@@ -263,7 +263,8 @@ public:
   /// appropriate method.
   ///
   /// \returns false if the visitation was terminated early, true otherwise.
-  bool TraverseTemplateName(TemplateName Template);
+  bool TraverseTemplateName(TemplateName Template,
+                            bool TraverseQualifier = true);
 
   /// Recursively visit a template argument and dispatch to the
   /// appropriate method for the argument type.
@@ -324,6 +325,9 @@ public:
   ///
   /// \returns false if the visitation was terminated early, true otherwise.
   bool TraverseConceptReference(ConceptReference *CR);
+
+  /// Recursively visit the source components of a match pattern.
+  bool TraverseMatchPattern(MatchPattern *P);
 
   // Visit concept reference.
   bool VisitConceptReference(ConceptReference *CR) { return true; }
@@ -597,6 +601,8 @@ bool RecursiveASTVisitor<Derived>::TraverseConceptExprRequirement(
     concepts::ExprRequirement *R) {
   if (!R->isExprSubstitutionFailure())
     TRY_TO(TraverseStmt(R->getExpr()));
+  if (R->getNoexceptCondition())
+    TRY_TO(TraverseStmt(R->getNoexceptCondition()));
   auto &RetReq = R->getReturnTypeRequirement();
   if (RetReq.isTypeConstraint()) {
     if (getDerived().shouldVisitImplicitCode()) {
@@ -889,14 +895,20 @@ bool RecursiveASTVisitor<Derived>::TraverseDeclarationNameInfo(
 }
 
 template <typename Derived>
-bool RecursiveASTVisitor<Derived>::TraverseTemplateName(TemplateName Template) {
+bool RecursiveASTVisitor<Derived>::TraverseTemplateName(
+    TemplateName Template, bool TraverseQualifier) {
   if (DependentTemplateName *DTN = Template.getAsDependentTemplateName()) {
-    TRY_TO(TraverseNestedNameSpecifier(DTN->getQualifier()));
+    if (TraverseQualifier)
+      TRY_TO(TraverseNestedNameSpecifier(DTN->getQualifier()));
   } else if (QualifiedTemplateName *QTN =
                  Template.getAsQualifiedTemplateName()) {
-    if (QTN->getQualifier()) {
+    if (TraverseQualifier && QTN->getQualifier()) {
       TRY_TO(TraverseNestedNameSpecifier(QTN->getQualifier()));
     }
+  } else if (PackIndexingTemplateStorage *PI =
+                 Template.getAsPackIndexingTemplate()) {
+    TRY_TO(TraverseTemplateName(PI->getPattern(), TraverseQualifier));
+    TRY_TO(TraverseStmt(PI->getIndexExpr()));
   }
 
   return true;
@@ -1225,24 +1237,12 @@ DEF_TRAVERSE_TYPE(DependentNameType, {
 })
 
 DEF_TRAVERSE_TYPE(TemplateSpecializationType, {
-  if (TraverseQualifier) {
-    TRY_TO(TraverseTemplateName(T->getTemplateName()));
-  } else {
-    // FIXME: Try to preserve the rest of the template name.
-    TRY_TO(TraverseTemplateName(TemplateName(
-        T->getTemplateName().getAsTemplateDecl(/*IgnoreDeduced=*/true))));
-  }
+  TRY_TO(TraverseTemplateName(T->getTemplateName(), TraverseQualifier));
   TRY_TO(TraverseTemplateArguments(T->template_arguments()));
 })
 
 DEF_TRAVERSE_TYPE(DeducedTemplateSpecializationType, {
-  if (TraverseQualifier) {
-    TRY_TO(TraverseTemplateName(T->getTemplateName()));
-  } else {
-    // FIXME: Try to preserve the rest of the template name.
-    TRY_TO(TraverseTemplateName(TemplateName(
-        T->getTemplateName().getAsTemplateDecl(/*IgnoreDeduced=*/true))));
-  }
+  TRY_TO(TraverseTemplateName(T->getTemplateName(), TraverseQualifier));
   TRY_TO(TraverseType(T->getDeducedType()));
 })
 
@@ -1579,10 +1579,8 @@ DEF_TRAVERSE_TYPELOC(TemplateSpecializationType, {
   if (TraverseQualifier)
     TRY_TO(TraverseNestedNameSpecifierLoc(TL.getQualifierLoc()));
 
-  // FIXME: Try to preserve the rest of the template name.
-  TRY_TO(TraverseTemplateName(
-      TemplateName(TL.getTypePtr()->getTemplateName().getAsTemplateDecl(
-          /*IgnoreDeduced=*/true))));
+  TRY_TO(TraverseTemplateName(TL.getTypePtr()->getTemplateName(),
+                              /*TraverseQualifier=*/false));
 
   for (unsigned I = 0, E = TL.getNumArgs(); I != E; ++I) {
     TRY_TO(TraverseTemplateArgumentLoc(TL.getArgLoc(I)));
@@ -1594,10 +1592,8 @@ DEF_TRAVERSE_TYPELOC(DeducedTemplateSpecializationType, {
     TRY_TO(TraverseNestedNameSpecifierLoc(TL.getQualifierLoc()));
 
   const auto *T = TL.getTypePtr();
-  // FIXME: Try to preserve the rest of the template name.
-  TRY_TO(
-      TraverseTemplateName(TemplateName(T->getTemplateName().getAsTemplateDecl(
-          /*IgnoreDeduced=*/true))));
+  TRY_TO(TraverseTemplateName(T->getTemplateName(),
+                              /*TraverseQualifier=*/false));
 
   TRY_TO(TraverseType(T->getDeducedType()));
 })
@@ -2324,6 +2320,8 @@ DEF_TRAVERSE_DECL(DecompositionDecl, {
 })
 
 DEF_TRAVERSE_DECL(BindingDecl, {
+  if (auto *Nested = D->getNestedDecomposition())
+    TRY_TO(TraverseDecl(Nested));
   if (getDerived().shouldVisitImplicitCode()) {
     TRY_TO(TraverseStmt(D->getBinding()));
     if (const auto HoldingVar = D->getHoldingVar())
@@ -2681,6 +2679,7 @@ DEF_TRAVERSE_STMT(CXXDependentScopeMemberExpr, {
 
 DEF_TRAVERSE_STMT(DependentTemplateIdExpr, {
   TRY_TO(TraverseDeclarationNameInfo(S->getNameInfo()));
+  TRY_TO(TraverseTemplateName(S->getTemplateName()));
   TRY_TO(TraverseTemplateArgumentLocsHelper(S->template_arguments().data(),
                                             S->getNumTemplateArgs()));
 })
@@ -3075,6 +3074,11 @@ DEF_TRAVERSE_STMT(PredefinedExpr, {})
 DEF_TRAVERSE_STMT(ShuffleVectorExpr, {})
 DEF_TRAVERSE_STMT(ConvertVectorExpr, {})
 DEF_TRAVERSE_STMT(StmtExpr, {})
+DEF_TRAVERSE_STMT(DoExpr, {
+  if (S->hasExplicitType())
+    TRY_TO(TraverseTypeLoc(S->getExplicitType()->getTypeLoc()));
+})
+DEF_TRAVERSE_STMT(DoReturnStmt, {})
 DEF_TRAVERSE_STMT(SourceLocExpr, {})
 DEF_TRAVERSE_STMT(EmbedExpr, {
   for (IntegerLiteral *IL : S->underlying_data_elements()) {
@@ -3189,38 +3193,36 @@ DEF_TRAVERSE_STMT(CXXReflectExpr, {
     case ReflectionKind::Namespace:
     case ReflectionKind::BaseSpecifier:
     case ReflectionKind::DataMemberSpec:
+    case ReflectionKind::DeclarationSpec:
+    case ReflectionKind::Expression:
       break;
     }
   }
 })
+DEF_TRAVERSE_STMT(CXXTokenSequenceExpr, {})
 DEF_TRAVERSE_STMT(CXXMetafunctionExpr, {})
+DEF_TRAVERSE_STMT(CXXBuiltinInjectExpr, {})
+DEF_TRAVERSE_STMT(CXXBuiltinReportTokensExpr, {})
+DEF_TRAVERSE_STMT(CXXTokenInterpolationListExpr, {})
+DEF_TRAVERSE_STMT(CXXBuiltinIdExpr, {})
+DEF_TRAVERSE_STMT(CXXBuiltinStrLiteralExpr, {})
+DEF_TRAVERSE_STMT(CXXBuiltinTokenizeExpr, {})
+DEF_TRAVERSE_STMT(CXXBuiltinStringizeExpr, {})
+DEF_TRAVERSE_STMT(CXXMacroInvocationExpr, {})
 DEF_TRAVERSE_STMT(CXXSpliceExpr, {
   TRY_TO(TraverseSpliceSpecifier(S->getSplice()));
 })
-DEF_TRAVERSE_STMT(CXXDependentMemberSpliceExpr, {
-  TRY_TO(TraverseStmt(S->getBase()));
-  TRY_TO(TraverseStmt(S->getRHS()));
-})
-DEF_TRAVERSE_STMT(CXXExpansionInitListExpr, {
-  for (Expr *SubExpr : S->getSubExprs())
-    TRY_TO(TraverseStmt(SubExpr));
-})
-DEF_TRAVERSE_STMT(CXXIndeterminateExpansionSelectExpr, {
-  TRY_TO(TraverseStmt(S->getRangeExpr()));
-  TRY_TO(TraverseStmt(S->getIdxExpr()));
-})
+// (The sub-expressions are children: they are visited once, as such.)
+DEF_TRAVERSE_STMT(CXXDependentMemberSpliceExpr, {})
+DEF_TRAVERSE_STMT(CXXExpansionInitListExpr, {})
+DEF_TRAVERSE_STMT(CXXIndeterminateExpansionSelectExpr, {})
 DEF_TRAVERSE_STMT(CXXIterableExpansionSelectExpr, {
   TRY_TO(TraverseDecl(S->getRangeVar()));
-  TRY_TO(TraverseStmt(S->getImplExpr()));
 })
 DEF_TRAVERSE_STMT(CXXDestructurableExpansionSelectExpr, {
   TRY_TO(TraverseDecl(S->getDecompositionDecl()));
-  TRY_TO(TraverseStmt(S->getIdxExpr()));
 })
-DEF_TRAVERSE_STMT(CXXExpansionInitListSelectExpr, {
-  TRY_TO(TraverseStmt(S->getRangeExpr()));
-  TRY_TO(TraverseStmt(S->getIdxExpr()));
-})
+DEF_TRAVERSE_STMT(CXXExpansionInitListSelectExpr, {})
 DEF_TRAVERSE_STMT(StackLocationExpr, {})
 DEF_TRAVERSE_STMT(ExtractLValueExpr, {
   TRY_TO(TraverseDecl(S->getValueDecl()));
@@ -3319,6 +3321,91 @@ DEF_TRAVERSE_STMT(RequiresExpr, {
     TRY_TO(TraverseDecl(Parm));
   for (concepts::Requirement *Req : S->getRequirements())
     TRY_TO(TraverseConceptRequirement(Req));
+})
+
+template <typename Derived>
+bool RecursiveASTVisitor<Derived>::TraverseMatchPattern(MatchPattern *P) {
+  if (!P)
+    return true;
+  switch (P->getMatchPatternClass()) {
+  case MatchPattern::WildcardPatternClass:
+    return true;
+  case MatchPattern::ExpressionPatternClass:
+    return getDerived().TraverseStmt(
+        static_cast<ExpressionPattern *>(P)->getExpr());
+  case MatchPattern::ParenPatternClass:
+    return getDerived().TraverseMatchPattern(
+        static_cast<ParenPattern *>(P)->getSubPattern());
+  case MatchPattern::DeclarationPatternClass:
+    return getDerived().TraverseDecl(
+        static_cast<DeclarationPattern *>(P)->getDeclaration());
+  case MatchPattern::TypePatternClass:
+    return getDerived().TraverseTypeLoc(
+        static_cast<TypePattern *>(P)->getTypeSourceInfo()->getTypeLoc());
+  case MatchPattern::OrPatternClass:
+    for (VarDecl *Binding : static_cast<OrPattern *>(P)->bindings())
+      TRY_TO(getDerived().TraverseDecl(Binding));
+    for (MatchPattern *Child : P->children())
+      TRY_TO(getDerived().TraverseMatchPattern(Child));
+    return true;
+  case MatchPattern::AlternativePatternClass: {
+    auto *Alternative = static_cast<AlternativePattern *>(P);
+    if (Alternative->getTypeConstraintSelector())
+      TRY_TO(getDerived().TraverseConceptReference(
+          Alternative->getTypeConstraintSelector()));
+    else if (Alternative->getSelector())
+      TRY_TO(getDerived().TraverseMatchPattern(Alternative->getSelector()));
+    for (MatchPattern *Child : P->children())
+      TRY_TO(getDerived().TraverseMatchPattern(Child));
+    return true;
+  }
+  case MatchPattern::DecompositionPatternClass:
+    for (MatchPattern *Child : P->children())
+      TRY_TO(getDerived().TraverseMatchPattern(Child));
+    return true;
+  }
+  llvm_unreachable("unknown match pattern kind");
+}
+
+DEF_TRAVERSE_STMT(MatchTestExpr, {
+  TRY_TO_TRAVERSE_OR_ENQUEUE_STMT(S->getHoldingVar() &&
+                                          S->getHoldingVar()->getInit()
+                                      ? S->getHoldingVar()->getInit()
+                                      : S->getSubject());
+  TRY_TO(TraverseMatchPattern(S->getPattern()));
+  const MatchGuard &Guard = S->getGuard();
+  if (Guard.hasGuard()) {
+    TRY_TO_TRAVERSE_OR_ENQUEUE_STMT(Guard.Init);
+    TRY_TO(TraverseDecl(Guard.ConditionVariable));
+    TRY_TO_TRAVERSE_OR_ENQUEUE_STMT(Guard.Condition);
+  }
+})
+DEF_TRAVERSE_STMT(CaseConditionExpr, {
+  TRY_TO_TRAVERSE_OR_ENQUEUE_STMT(S->getHoldingVar() &&
+                                          S->getHoldingVar()->getInit()
+                                      ? S->getHoldingVar()->getInit()
+                                      : S->getSubject());
+  TRY_TO(TraverseMatchPattern(S->getPattern()));
+})
+DEF_TRAVERSE_STMT(MatchSelectExpr, {
+  TRY_TO_TRAVERSE_OR_ENQUEUE_STMT(S->getInitStmt());
+  TRY_TO_TRAVERSE_OR_ENQUEUE_STMT(S->getHoldingVar() &&
+                                          S->getHoldingVar()->getInit()
+                                      ? S->getHoldingVar()->getInit()
+                                      : S->getSubject());
+  for (Stmt *Statement : S->getPreamble())
+    TRY_TO_TRAVERSE_OR_ENQUEUE_STMT(Statement);
+  for (const MatchCase &Case : S->getCases()) {
+    for (const Attr *Attribute : Case.Attributes)
+      TRY_TO(getDerived().TraverseAttr(const_cast<Attr *>(Attribute)));
+    TRY_TO(TraverseMatchPattern(Case.Pattern));
+    if (Case.Guard.hasGuard()) {
+      TRY_TO_TRAVERSE_OR_ENQUEUE_STMT(Case.Guard.Init);
+      TRY_TO(TraverseDecl(Case.Guard.ConditionVariable));
+      TRY_TO_TRAVERSE_OR_ENQUEUE_STMT(Case.Guard.Condition);
+    }
+    TRY_TO_TRAVERSE_OR_ENQUEUE_STMT(Case.Handler);
+  }
 })
 
 // These literals (all of them) do not need any action.

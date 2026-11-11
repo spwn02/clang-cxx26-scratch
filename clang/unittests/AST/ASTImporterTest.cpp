@@ -12,6 +12,7 @@
 
 #include "clang/AST/ExprConcepts.h"
 #include "clang/AST/RecordLayout.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/ASTMatchers/ASTMatchers.h"
 #include "clang/Testing/CommandLineArgs.h"
 #include "llvm/Support/SmallVectorMemoryBuffer.h"
@@ -3606,6 +3607,245 @@ TEST_P(ASTImporterOptionSpecificTestBase, ImportBitfields) {
   ASSERT_EQ(BuiltinType::Int, FromBT->getKind());
   EXPECT_TRUE(ToBT);
   EXPECT_EQ(BuiltinType::Int, ToBT->getKind());
+}
+
+struct ImportCxx29 : ASTImporterOptionSpecificTestBase {};
+
+namespace {
+struct Cxx29Nodes : RecursiveASTVisitor<Cxx29Nodes> {
+  std::vector<concepts::ExprRequirement *> Reqs;
+  std::vector<DesignatedInitExpr *> Designated;
+  std::vector<CXXThrowExpr *> Throws;
+  std::vector<ImplicitCastExpr *> NoReturnCasts;
+  std::vector<TemplateSpecializationTypeLoc> PackIndexedTSTs;
+  bool shouldVisitTemplateInstantiations() const { return true; }
+  bool VisitRequiresExpr(RequiresExpr *E) {
+    for (concepts::Requirement *R : E->getRequirements())
+      if (auto *ER = dyn_cast<concepts::ExprRequirement>(R))
+        Reqs.push_back(ER);
+    return true;
+  }
+  bool VisitCXXThrowExpr(CXXThrowExpr *E) {
+    Throws.push_back(E);
+    return true;
+  }
+  bool VisitImplicitCastExpr(ImplicitCastExpr *E) {
+    if (E->getCastKind() == CK_NoReturnToAny)
+      NoReturnCasts.push_back(E);
+    return true;
+  }
+  bool VisitDesignatedInitExpr(DesignatedInitExpr *E) {
+    Designated.push_back(E);
+    return true;
+  }
+  bool VisitTemplateSpecializationType(TemplateSpecializationType *T) {
+    if (T->getTemplateName().getAsPackIndexingTemplate())
+      PackIndexedTSTs.push_back({});
+    return true;
+  }
+};
+} // namespace
+
+// P3822R2: { E } noexcept(constant-expression)
+TEST_P(ImportCxx29, ImportCompoundRequirementNoexceptCondition) {
+  Decl *From, *To;
+  std::tie(From, To) = getImportedDecl(R"(
+      template <typename T, bool B>
+      constexpr bool declToImport = requires(T t) { { t } noexcept(B); };
+      )",
+                                       Lang_CXX26, "", Lang_CXX26);
+  ASSERT_TRUE(To);
+  Cxx29Nodes F, T;
+  F.TraverseDecl(From);
+  T.TraverseDecl(To);
+  ASSERT_EQ(F.Reqs.size(), 1u);
+  ASSERT_EQ(T.Reqs.size(), 1u);
+  ASSERT_TRUE(F.Reqs[0]->getNoexceptCondition());
+  ASSERT_TRUE(T.Reqs[0]->getNoexceptCondition());
+  EXPECT_NE(T.Reqs[0]->getNoexceptCondition(), F.Reqs[0]->getNoexceptCondition());
+  EXPECT_TRUE(T.Reqs[0]->hasNoexceptRequirement());
+}
+
+// P2287R6: a designator naming a member of an aggregate base class.
+TEST_P(ImportCxx29, ImportDesignatedInitOfBaseMember) {
+  Decl *From, *To;
+  std::tie(From, To) = getImportedDecl(R"(
+      struct A { int x; int y; };
+      struct B : A { int z; };
+      B declToImport{.x = 1, .y = 2, .z = 3};
+      )",
+                                       Lang_CXX26, "", Lang_CXX26);
+  ASSERT_TRUE(To);
+  Cxx29Nodes F, T;
+  F.TraverseDecl(From);
+  T.TraverseDecl(To);
+  ASSERT_EQ(T.Designated.size(), F.Designated.size());
+  ASSERT_EQ(T.Designated.size(), 3u);
+  // The traversal visits the syntactic form (the designator holds the name);
+  // the semantic form is reached through the InitListExpr, whose initializers
+  // for the base live in a nested list of the imported base.
+  EXPECT_EQ(T.Designated[0]->getDesignator(0)->getFieldName()->getName(), "x");
+  EXPECT_EQ(T.Designated[2]->getDesignator(0)->getFieldName()->getName(), "z");
+  auto *ToVar = cast<VarDecl>(To);
+  auto *Sem = cast<InitListExpr>(ToVar->getInit()->IgnoreImplicit());
+  if (InitListExpr *SynOrSem = Sem->isSemanticForm() ? Sem : Sem->getSemanticForm()) {
+    ASSERT_EQ(SynOrSem->getNumInits(), 2u);
+    // B{A{.x, .y}, .z}: the first initializer is the imported base A.
+    auto *BaseList = dyn_cast<InitListExpr>(SynOrSem->getInit(0));
+    ASSERT_TRUE(BaseList);
+    EXPECT_EQ(BaseList->getType()->getAsCXXRecordDecl()->getName(), "A");
+    EXPECT_EQ(BaseList->getType()->getAsCXXRecordDecl(),
+              cast<CXXRecordDecl>(
+                  cast<VarDecl>(To)->getType()->getAsCXXRecordDecl()
+                      ->bases_begin()->getType()->getAsCXXRecordDecl()));
+  }
+}
+
+// P3670R4: a pack-index-template-name as a type-constraint and in 'CC...[N] auto'.
+TEST_P(ImportCxx29, ImportPackIndexedConcept) {
+  Decl *From, *To;
+  std::tie(From, To) = getImportedDecl(R"(
+      template <template <class> concept... CC>
+      struct declToImport {
+        template <CC...[0] T> void f(T);
+        void g(CC...[1] auto);
+      };
+      )",
+                                       Lang_CXX26, "", Lang_CXX26);
+  ASSERT_TRUE(To);
+  auto *Class = cast<ClassTemplateDecl>(To)->getTemplatedDecl();
+  // Both member function templates ('template <CC...[0] T> f' and the
+  // abbreviated 'g(CC...[1] auto)', whose invented parameter carries the
+  // constraint) keep a pack-index-template-name as the constraint's concept.
+  unsigned Seen = 0;
+  for (Decl *D : Class->decls()) {
+    auto *Tmpl = dyn_cast<FunctionTemplateDecl>(D);
+    if (!Tmpl)
+      continue;
+    auto *P = cast<TemplateTypeParmDecl>(Tmpl->getTemplateParameters()->getParam(0));
+    const TypeConstraint *TC = P->getTypeConstraint();
+    ASSERT_TRUE(TC);
+    PackIndexingTemplateStorage *PI =
+        TC->getNamedConcept().getAsPackIndexingTemplate();
+    ASSERT_TRUE(PI);
+    EXPECT_EQ(PI->getPattern().getAsTemplateDecl()->getName(), "CC");
+    ++Seen;
+  }
+  EXPECT_EQ(Seen, 2u);
+}
+
+// P3549R1: the bottom type of a throw-expression and the cast out of it.
+TEST_P(ImportCxx29, ImportDivergingThrowInConditional) {
+  Decl *From, *To;
+  std::tie(From, To) = getImportedDecl(R"(
+      int declToImport(bool b) { return b ? 1 : throw 0; }
+      )",
+                                       Lang_CXX26, "", Lang_CXX26);
+  ASSERT_TRUE(To);
+  Cxx29Nodes F, T;
+  F.TraverseDecl(From);
+  T.TraverseDecl(To);
+  ASSERT_EQ(T.Throws.size(), 1u);
+  EXPECT_TRUE(T.Throws[0]->getType()->isNoReturnType());
+  EXPECT_NE(T.Throws[0], F.Throws[0]);
+  EXPECT_EQ(T.NoReturnCasts.size(), F.NoReturnCasts.size());
+}
+
+// P3670R4: pack-index-template-name.
+TEST_P(ImportCxx29, ImportPackIndexedTemplateName) {
+  Decl *From, *To;
+  std::tie(From, To) = getImportedDecl(R"(
+      template <typename> struct A {};
+      template <typename> struct B {};
+      template <template <typename> class... TT>
+      using declToImport = TT...[1]<int>;
+      )",
+                                       Lang_CXX26, "", Lang_CXX26);
+  ASSERT_TRUE(To);
+  Cxx29Nodes F, T;
+  F.TraverseDecl(From);
+  T.TraverseDecl(To);
+  EXPECT_EQ(T.PackIndexedTSTs.size(), F.PackIndexedTSTs.size());
+  EXPECT_GE(T.PackIndexedTSTs.size(), 1u);
+  auto *Alias = cast<TypeAliasTemplateDecl>(To);
+  auto *Pattern = Alias->getTemplatedDecl()->getUnderlyingType()
+                      ->getAs<TemplateSpecializationType>();
+  ASSERT_TRUE(Pattern);
+  PackIndexingTemplateStorage *PI =
+      Pattern->getTemplateName().getAsPackIndexingTemplate();
+  ASSERT_TRUE(PI);
+  // The pattern is the imported template template parameter pack.
+  EXPECT_EQ(PI->getPattern().getAsTemplateDecl()->getName(), "TT");
+  EXPECT_EQ(PI->getPattern().getAsTemplateDecl()->getDeclContext(),
+            Alias->getTemplatedDecl()->getDeclContext());
+}
+
+struct ImportDoExpr : ASTImporterOptionSpecificTestBase {};
+
+namespace {
+struct DoNodes : RecursiveASTVisitor<DoNodes> {
+  std::vector<DoExpr *> Exprs;
+  std::vector<DoReturnStmt *> Returns;
+  bool VisitDoExpr(DoExpr *E) {
+    Exprs.push_back(E);
+    return true;
+  }
+  bool VisitDoReturnStmt(DoReturnStmt *S) {
+    Returns.push_back(S);
+    return true;
+  }
+};
+} // namespace
+
+TEST_P(ImportDoExpr, ImportDoExpressionWithCapturesAndExplicitType) {
+  Decl *From, *To;
+  std::tie(From, To) = getImportedDecl(R"(
+      int declToImport(bool b) {
+        return do [k = 1] -> long {
+          if (b)
+            do_return k;
+          int local = k + 1;
+          do_return local;
+        };
+      })",
+                                       Lang_CXX26, "", Lang_CXX26);
+  ASSERT_TRUE(To);
+  DoNodes F, T;
+  F.TraverseDecl(From);
+  T.TraverseDecl(To);
+  ASSERT_EQ(T.Exprs.size(), 1u);
+  ASSERT_EQ(T.Returns.size(), 2u);
+  DoExpr *E = T.Exprs[0];
+  EXPECT_NE(E, F.Exprs[0]);
+  EXPECT_TRUE(E->hasInitStmt());
+  EXPECT_TRUE(E->hasExplicitType());
+  EXPECT_EQ(E->getType().getAsString(), "long");
+  EXPECT_NE(E->getExplicitType(), F.Exprs[0]->getExplicitType());
+  // The do_return operands live in the destination context.
+  EXPECT_NE(T.Returns[0]->getOperand(), F.Returns[0]->getOperand());
+  EXPECT_EQ(T.Returns[0]->getKeywordLoc().isValid(), true);
+}
+
+TEST_P(ImportDoExpr, ImportNestedDoExpressionWithNRVOCandidate) {
+  Decl *From, *To;
+  std::tie(From, To) = getImportedDecl(R"(
+      struct S { S(); S(const S &); };
+      S declToImport() {
+        return do { S s; do_return s; };
+      }
+      int outer() {
+        return do { int y = do { do_return 5; }; do_return y; };
+      })",
+                                       Lang_CXX26, "", Lang_CXX26);
+  ASSERT_TRUE(To);
+  DoNodes T;
+  T.TraverseDecl(To);
+  ASSERT_EQ(T.Exprs.size(), 1u);
+  ASSERT_EQ(T.Returns.size(), 1u);
+  const VarDecl *Cand = T.Exprs[0]->getNRVOCandidate();
+  ASSERT_TRUE(Cand);
+  EXPECT_EQ(Cand->getName(), "s");
+  EXPECT_EQ(&Cand->getASTContext(), &To->getASTContext());
 }
 
 struct ImportBlock : ASTImporterOptionSpecificTestBase {};
@@ -10847,6 +11087,16 @@ INSTANTIATE_TEST_SUITE_P(ParameterizedTests, ImportFixedPointExpr,
                          ExtendWithOptions(DefaultTestArrayForRunOptions,
                                            std::vector<std::string>{
                                                "-ffixed-point"}));
+
+INSTANTIATE_TEST_SUITE_P(ParameterizedTests, ImportCxx29,
+                         ExtendWithOptions(DefaultTestArrayForRunOptions,
+                                           std::vector<std::string>{
+                                               "-std=c++29"}));
+
+INSTANTIATE_TEST_SUITE_P(ParameterizedTests, ImportDoExpr,
+                         ExtendWithOptions(DefaultTestArrayForRunOptions,
+                                           std::vector<std::string>{
+                                               "-std=c++29"}));
 
 INSTANTIATE_TEST_SUITE_P(ParameterizedTests, ImportBlock,
                          ExtendWithOptions(DefaultTestArrayForRunOptions,

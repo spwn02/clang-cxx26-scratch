@@ -93,8 +93,11 @@ ConceptReference *
 ConceptReference::Create(const ASTContext &C, NestedNameSpecifierLoc NNS,
                          SourceLocation TemplateKWLoc,
                          DeclarationNameInfo ConceptNameInfo,
-                         NamedDecl *FoundDecl, TemplateDecl *NamedConcept,
+                         NamedDecl *FoundDecl, TemplateName NamedConcept,
                          const ASTTemplateArgumentListInfo *ArgsAsWritten) {
+
+  assert(!NamedConcept.isNull() && "a concept reference names a concept");
+
   return new (C) ConceptReference(NNS, TemplateKWLoc, ConceptNameInfo,
                                   FoundDecl, NamedConcept, ArgsAsWritten);
 }
@@ -109,7 +112,10 @@ SourceLocation ConceptReference::getBeginLoc() const {
 void ConceptReference::print(llvm::raw_ostream &OS,
                              const PrintingPolicy &Policy) const {
   NestedNameSpec.getNestedNameSpecifier().print(OS, Policy);
-  ConceptName.printName(OS, Policy);
+  if (NamedConcept.getAsPackIndexingTemplate())
+    NamedConcept.print(OS, Policy); // P3670R4: 'CC...[N]'
+  else
+    ConceptName.printName(OS, Policy);
   if (hasExplicitTemplateArgs()) {
     OS << "<";
     llvm::ListSeparator Sep(", ");
@@ -136,15 +142,18 @@ const StreamingDiagnostic &clang::operator<<(const StreamingDiagnostic &DB,
 }
 
 concepts::ExprRequirement::ExprRequirement(
-    Expr *E, bool IsSimple, SourceLocation NoexceptLoc,
+    Expr *E, bool IsSimple, SourceLocation NoexceptLoc, Expr *NoexceptCond,
     ReturnTypeRequirement Req, SatisfactionStatus Status,
     ConceptSpecializationExpr *SubstitutedConstraintExpr)
     : Requirement(IsSimple ? RK_Simple : RK_Compound, Status == SS_Dependent,
                   Status == SS_Dependent &&
                       (E->containsUnexpandedParameterPack() ||
+                       (NoexceptCond &&
+                        NoexceptCond->containsUnexpandedParameterPack()) ||
                        Req.containsUnexpandedParameterPack()),
                   Status == SS_Satisfied),
-      Value(E), NoexceptLoc(NoexceptLoc), TypeReq(Req),
+      Value(E), NoexceptLoc(NoexceptLoc), NoexceptCondition(NoexceptCond),
+      TypeReq(Req),
       SubstitutedConstraintExpr(SubstitutedConstraintExpr), Status(Status) {
   assert((!IsSimple || (Req.isEmpty() && NoexceptLoc.isInvalid())) &&
          "Simple requirement must not have a return type requirement or a "
@@ -155,10 +164,11 @@ concepts::ExprRequirement::ExprRequirement(
 
 concepts::ExprRequirement::ExprRequirement(
     SubstitutionDiagnostic *ExprSubstDiag, bool IsSimple,
-    SourceLocation NoexceptLoc, ReturnTypeRequirement Req)
+    SourceLocation NoexceptLoc, Expr *NoexceptCond, ReturnTypeRequirement Req)
     : Requirement(IsSimple ? RK_Simple : RK_Compound, Req.isDependent(),
                   Req.containsUnexpandedParameterPack(), /*IsSatisfied=*/false),
-      Value(ExprSubstDiag), NoexceptLoc(NoexceptLoc), TypeReq(Req),
+      Value(ExprSubstDiag), NoexceptLoc(NoexceptLoc),
+      NoexceptCondition(NoexceptCond), TypeReq(Req),
       Status(SS_ExprSubstitutionFailure) {
   assert((!IsSimple || (Req.isEmpty() && NoexceptLoc.isInvalid())) &&
          "Simple requirement must not have a return type requirement or a "
@@ -173,12 +183,16 @@ concepts::ExprRequirement::ReturnTypeRequirement::ReturnTypeRequirement(
       cast<TemplateTypeParmDecl>(TPL->getParam(0))->getTypeConstraint();
   assert(TC &&
          "TPL must have a template type parameter with a type constraint");
+  // A concept named through a template template parameter or a
+  // pack-index-template-name (P3670R4) has a dependent id-expression as its
+  // immediately-declared constraint, not a ConceptSpecializationExpr.
   auto *Constraint =
-      cast<ConceptSpecializationExpr>(TC->getImmediatelyDeclaredConstraint());
+      dyn_cast<ConceptSpecializationExpr>(TC->getImmediatelyDeclaredConstraint());
   bool Dependent =
-      Constraint->getTemplateArgsAsWritten() &&
-      TemplateSpecializationType::anyInstantiationDependentTemplateArguments(
-          Constraint->getTemplateArgsAsWritten()->arguments().drop_front(1));
+      !Constraint ||
+      (Constraint->getTemplateArgsAsWritten() &&
+       TemplateSpecializationType::anyInstantiationDependentTemplateArguments(
+           Constraint->getTemplateArgsAsWritten()->arguments().drop_front(1)));
   TypeConstraintInfo.setInt(Dependent ? true : false);
 }
 

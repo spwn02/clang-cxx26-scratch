@@ -23,6 +23,7 @@
 #include "clang/AST/LocInfoType.h"
 #include "clang/AST/Reflection.h"
 #include "clang/AST/Type.h"
+#include "clang/Lex/Token.h"
 #include "clang/Sema/ParsedAttr.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
@@ -176,6 +177,8 @@ namespace {
     unsigned PathLength;
     bool IsNullPtr : 1;
     bool IsOnePastTheEnd : 1;
+    // The pointer tag of P3125R6; at most 16 bits.
+    unsigned short PtrTag = 0;
   };
 }
 
@@ -357,6 +360,7 @@ APValue::APValue(const APValue &RHS)
     else
       setLValue(RHS.getLValueBase(), RHS.getLValueOffset(), NoLValuePath(),
                 RHS.isNullPointer());
+    setLValueTag(RHS.getLValueTag());
     break;
   case Array:
     MakeArray(RHS.getArrayInitializedElts(), RHS.getArraySize());
@@ -389,6 +393,10 @@ APValue::APValue(const APValue &RHS)
     MakeReflection();
     setReflection(((const ReflectionData *)(const char *)&RHS.Data)->Kind,
                   RHS.getOpaqueReflectionData());
+    break;
+  case TokenSequence:
+    MakeTokenSequence();
+    setTokenSequence(RHS.getTokenSequence());
     break;
   }
   ReflectionDepth = RHS.ReflectionDepth;
@@ -460,6 +468,7 @@ bool APValue::needsCleanup() const {
   case Indeterminate:
   case AddrLabelDiff:
   case Reflection:
+  case TokenSequence:
     return false;
   case Struct:
   case Union:
@@ -575,6 +584,7 @@ static void profileReflection(llvm::FoldingSetNodeID &ID, APValue V) {
     return;
   case ReflectionKind::BaseSpecifier:
   case ReflectionKind::Annotation:
+  case ReflectionKind::Expression:
     ID.AddPointer(V.getOpaqueReflectionData());
     return;
   case ReflectionKind::DataMemberSpec: {
@@ -594,6 +604,18 @@ static void profileReflection(llvm::FoldingSetNodeID &ID, APValue V) {
     ID.AddInteger(TDMS->Annotations.size());
     for (const APValue *Annotation : TDMS->Annotations)
       Annotation->Profile(ID);
+    return;
+  }
+  case ReflectionKind::DeclarationSpec: {
+    FunctionDeclSpec *FDS = V.getReflectedFunctionDeclSpec();
+    ID.AddPointer(FDS->Source);
+    ID.AddBoolean(FDS->Name.has_value());
+    if (FDS->Name)
+      ID.AddString(*FDS->Name);
+    ID.AddString(FDS->TemplateParameterPrefix);
+    ID.AddString(FDS->ParameterPrefix);
+    ID.AddBoolean(FDS->MarkOverride);
+    ID.AddBoolean(FDS->MarkNoexcept);
     return;
   }
   case ReflectionKind::Object:
@@ -727,6 +749,7 @@ void APValue::Profile(llvm::FoldingSetNodeID &ID) const {
   case LValue:
     getLValueBase().Profile(ID);
     ID.AddInteger(getLValueOffset().getQuantity());
+    ID.AddInteger(getLValueTag());
     ID.AddInteger((isNullPointer() ? 1 : 0) |
                   (isLValueOnePastTheEnd() ? 2 : 0) |
                   (hasLValuePath() ? 4 : 0));
@@ -749,6 +772,39 @@ void APValue::Profile(llvm::FoldingSetNodeID &ID) const {
   case Reflection:
     profileReflection(ID, *this);
     return;
+
+  case TokenSequence: {
+    TokenSequenceData TSD = getTokenSequence();
+    ID.AddInteger(TSD.size());
+    for (const Token &Tok : TSD) {
+      ID.AddInteger(Tok.getKind());
+      if (Tok.is(tok::annot_typename))
+        QualType::getFromOpaquePtr(Tok.getAnnotationValue()).Profile(ID);
+      else if (Tok.is(tok::annot_template_name))
+        ID.AddPointer(Tok.getAnnotationValue());
+      else if (Tok.is(tok::annot_token_seq_expr)) {
+        // The annotation value is a ConstantExpr containing the evaluated
+        // APValue. Profile the value itself for structural comparison.
+        if (auto *CE = dyn_cast_or_null<ConstantExpr>(
+                static_cast<Expr *>(Tok.getAnnotationValue()))) {
+          if (CE->hasAPValueResult())
+            CE->getAPValueResult().Profile(ID);
+          else
+            ID.AddPointer(CE);
+        } else {
+          ID.AddPointer(Tok.getAnnotationValue());
+        }
+      } else if (Tok.isAnnotation())
+        // Other annotation tokens (annot_decl_spec, annot_primary_expr, ...)
+        // compare by annotation identity.
+        ID.AddPointer(Tok.getAnnotationValue());
+      else if (const auto *II = Tok.getIdentifierInfo())
+        ID.AddString(II->getName());
+      else if (Tok.isLiteral() && Tok.getLiteralData())
+        ID.AddString(StringRef(Tok.getLiteralData(), Tok.getLength()));
+    }
+    return;
+  }
   }
 
   llvm_unreachable("Unknown APValue kind!");
@@ -967,6 +1023,13 @@ CXXBaseSpecifier *APValue::getReflectedBaseSpecifier() const {
           const_cast<void *>(getOpaqueReflectionData()));
 }
 
+FunctionDeclSpec *APValue::getReflectedFunctionDeclSpec() const {
+  assert(getReflectionKind() == ReflectionKind::DeclarationSpec &&
+         "not a reflection of a declaration description");
+  return reinterpret_cast<FunctionDeclSpec *>(
+      const_cast<void *>(getOpaqueReflectionData()));
+}
+
 TagDataMemberSpec *APValue::getReflectedDataMemberSpec() const {
   assert(getReflectionKind() == ReflectionKind::DataMemberSpec &&
          "not a reflection of a description of a data member");
@@ -988,6 +1051,13 @@ const Attr *APValue::getReflectedAnnotationAsAttr() const {
 APValue APValue::MakeAnnotationReflection(const Attr *A) {
   return APValue(ReflectionKind::Annotation,
                  static_cast<const void *>(cast<CXX26AnnotationAttr>(A)));
+}
+
+Expr *APValue::getReflectedExpression() const {
+  assert(getReflectionKind() == ReflectionKind::Expression &&
+         "not a reflection of an expression");
+  return reinterpret_cast<Expr *>(
+          const_cast<void *>(getOpaqueReflectionData()));
 }
 
 static double GetApproxValue(const llvm::APFloat &F) {
@@ -1310,7 +1380,10 @@ void APValue::printPretty(raw_ostream &Out, const PrintingPolicy &Policy,
     Out << " - ";
     Out << "&&" << getAddrLabelDiffRHS()->getLabel()->getName();
     return;
-  case APValue::Reflection:
+  case APValue::TokenSequence:
+    Out << "^^(token-sequence)";
+    return;
+  case APValue::Reflection: {
     std::string Repr("unknown-reflection");
     switch (getReflectionKind()) {
     case ReflectionKind::Null:
@@ -1343,12 +1416,19 @@ void APValue::printPretty(raw_ostream &Out, const PrintingPolicy &Policy,
     case ReflectionKind::DataMemberSpec:
       Repr = "data-member-spec";
       break;
+    case ReflectionKind::DeclarationSpec:
+      Repr = "declaration-spec";
+      break;
     case ReflectionKind::Annotation:
       Repr = "annotation";
+      break;
+    case ReflectionKind::Expression:
+      Repr = "expression";
       break;
     }
     Out << "^^(" << Repr << ")";
     return;
+  }
   }
   llvm_unreachable("Unknown APValue kind!");
 }
@@ -1421,6 +1501,17 @@ bool APValue::isNullPointer() const {
   return ((const LV *)(const char *)&Data)->IsNullPtr;
 }
 
+unsigned APValue::getLValueTag() const {
+  assert(Kind == LValue && "Invalid usage");
+  return ((const LV *)(const char *)&Data)->PtrTag;
+}
+
+void APValue::setLValueTag(unsigned Tag) {
+  assert(Kind == LValue && "Invalid usage");
+  assert(Tag <= 0xFFFF && "pointer tag too wide");
+  ((LV *)(char *)&Data)->PtrTag = static_cast<unsigned short>(Tag);
+}
+
 void APValue::setLValue(LValueBase B, const CharUnits &O, NoLValuePath,
                         bool IsNullPtr) {
   assert(isLValue() && "Invalid accessor");
@@ -1430,6 +1521,7 @@ void APValue::setLValue(LValueBase B, const CharUnits &O, NoLValuePath,
   LVal.Offset = O;
   LVal.resizePath((unsigned)-1);
   LVal.IsNullPtr = IsNullPtr;
+  LVal.PtrTag = 0;
 }
 
 MutableArrayRef<APValue::LValuePathEntry>
@@ -1441,6 +1533,7 @@ APValue::setLValueUninit(LValueBase B, const CharUnits &O, unsigned Size,
   LVal.IsOnePastTheEnd = IsOnePastTheEnd;
   LVal.Offset = O;
   LVal.IsNullPtr = IsNullPtr;
+  LVal.PtrTag = 0;
   LVal.resizePath(Size);
   return {LVal.getPath(), Size};
 }
@@ -1539,6 +1632,7 @@ LinkageInfo LinkageComputer::getLVForValue(const APValue &V,
   case APValue::ComplexInt:
   case APValue::ComplexFloat:
   case APValue::Vector:
+  case APValue::TokenSequence:
     break;
 
   case APValue::AddrLabelDiff:
@@ -1742,7 +1836,9 @@ void APValue::setReflection(ReflectionKind RK, const void *Ptr) {
   case ReflectionKind::Parameter:
   case ReflectionKind::BaseSpecifier:
   case ReflectionKind::DataMemberSpec:
+  case ReflectionKind::DeclarationSpec:
   case ReflectionKind::Annotation:
+  case ReflectionKind::Expression:
     SelfData.Kind = RK;
     SelfData.Data = Ptr;
     return;

@@ -40,6 +40,7 @@
 #include "ExprConstShared.h"
 #include "clang/AST/APValue.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/SpliceSpecifier.h"
 #include "clang/AST/ASTLambda.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/CXXInheritance.h"
@@ -49,22 +50,31 @@
 #include "clang/AST/Expr.h"
 #include "clang/AST/InferAlloc.h"
 #include "clang/AST/MetaActions.h"
+#include "clang/AST/ExprCXX.h"
+#include "clang/AST/Metafunction.h"
 #include "clang/AST/OSLog.h"
 #include "clang/AST/OptionalDiagnostic.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/ReflectionEvaluationContext.h"
+#include "clang/AST/Reflection.h"
 #include "clang/AST/StmtVisitor.h"
 #include "clang/AST/Type.h"
 #include "clang/AST/TypeLoc.h"
 #include "clang/Basic/Builtins.h"
+#include "clang/Basic/DiagnosticMetafn.h"
+#include "clang/Basic/SourceManager.h"
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Basic/TargetBuiltins.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/Lex/Token.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Config/config.h"
 #include "llvm/ADT/APFixedPoint.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
@@ -599,6 +609,13 @@ namespace {
     /// key and this value as the version.
     CallRef Arguments;
 
+    /// Where a `return` in this function puts its value, and the result
+    /// object it constructs in place (if known). A do-expression body
+    /// evaluates with the do-expression's own result, so a `return` reached
+    /// inside one is routed here.
+    APValue *FunctionReturnValue = nullptr;
+    const LValue *FunctionReturnSlot = nullptr;
+
     /// Source location information about the default argument or default
     /// initializer expression we're evaluating, if any.
     CurrentSourceLocExprScope CurSourceLocExprScope;
@@ -689,6 +706,10 @@ namespace {
 
     /// Allocate storage for a parameter of a function call made in this frame.
     APValue &createParam(CallRef Args, const ParmVarDecl *PVD, LValue &LV);
+    /// A macro body's parameter slot, of type \p SlotTy (what the parameter
+    /// names in the body) rather than the parameter's declared type.
+    APValue &createMacroParam(CallRef Args, const ParmVarDecl *PVD,
+                              QualType SlotTy);
 
     void describe(llvm::raw_ostream &OS) const override;
 
@@ -774,11 +795,12 @@ namespace {
     llvm::PointerIntPair<APValue*, 2, ScopeKind> Value;
     APValue::LValueBase Base;
     QualType T;
+    uint64_t Sequence;
 
   public:
-    Cleanup(APValue *Val, APValue::LValueBase Base, QualType T,
-            ScopeKind Scope)
-        : Value(Val, Scope), Base(Base), T(T) {}
+    Cleanup(APValue *Val, APValue::LValueBase Base, QualType T, ScopeKind Scope,
+            uint64_t Sequence)
+        : Value(Val, Scope), Base(Base), T(T), Sequence(Sequence) {}
 
     /// Determine whether this cleanup should be performed at the end of the
     /// given kind of scope.
@@ -789,6 +811,10 @@ namespace {
     bool manages(const Expr *E) const {
       return Base.dyn_cast<const Expr *>() == E;
     }
+    APValue::LValueBase getBase() const { return Base; }
+    const APValue *getValuePtr() const { return Value.getPointer(); }
+    uint64_t getSequence() const { return Sequence; }
+    void setDestroyedAtEndOf(ScopeKind K) { Value.setInt(K); }
     bool endLifetime(EvalInfo &Info, bool RunDestructors) {
       if (RunDestructors) {
         SourceLocation Loc;
@@ -943,6 +969,7 @@ namespace {
     /// A stack of values whose lifetimes end at the end of some surrounding
     /// evaluation frame.
     llvm::SmallVector<Cleanup, 16> CleanupStack;
+    uint64_t NextCleanupSequence = 0;
 
     /// EvaluatingDecl - This is the declaration whose initializer is being
     /// evaluated, if any.
@@ -952,6 +979,13 @@ namespace {
     /// under evaluation appears. Used to verify rules around injected
     /// declarations that may be produced by plainly constant evaluations.
     Decl *ContainingDecl;
+
+    /// MacroExpansionContext - When evaluating an expression macro's body,
+    /// the function, class, or namespace the expansion lands in (i.e. the
+    /// context of the invocation, not of the macro's definition). Only
+    /// metafunctions that ask for it observe this; see
+    /// Metafunction::wantsMacroExpansionContext.
+    Decl *MacroExpansionContext = nullptr;
 
     enum class EvaluatingDeclKind {
       None,
@@ -1020,6 +1054,61 @@ namespace {
     /// from PendingException: a caught exception is no longer propagating,
     /// but remains the operand of a permitted `throw;` rethrow.
     SmallVector<PendingExceptionInfo, 4> ActiveExceptions;
+    /// When a do-expression body terminates via `return`/`break`/`continue`
+    /// (i.e., outer-scope control flow), VisitDoExpr stashes the resulting
+    /// EvalStmtResult here so the enclosing EvaluateStmt can propagate it up
+    /// the statement-evaluation chain. Stored as unsigned since
+    /// EvalStmtResult is declared later in this translation unit. 0
+    /// (ESR_Failed) means "no pending flow".
+    unsigned PendingExprControlFlow = 0;
+
+    /// Value returned by an outer-scope `return` seen while evaluating a
+    /// do-expression body. This is consumed when the pending control-flow is
+    /// translated back to ESR_Returned. (Only used when the body evaluated
+    /// without a function frame; otherwise `return` writes the function's
+    /// result directly.)
+    std::optional<APValue> PendingExprControlFlowValue;
+
+    /// The do-expressions being evaluated, innermost last: where `do_return`
+    /// puts its value, and the result object it constructs in place when the
+    /// evaluator knows it (a class-type result). Evaluating a class value
+    /// anywhere else -- a frame temporary -- would leave the yielded value
+    /// pointing at storage the statement's scope then destroys.
+    struct DoExprTarget {
+      APValue *Value;
+      const LValue *Slot;
+    };
+    SmallVector<DoExprTarget, 4> DoExprTargets;
+
+    /// Namespace-scope do-expression bodies are parsed without a real function
+    /// DeclContext, so declarations inside their compound statement don't have
+    /// local storage according to the VarDecl. During constant evaluation we
+    /// still need to model them as block locals of the synthetic expression
+    /// frame.
+    llvm::SmallPtrSet<const VarDecl *, 8> DoExprLocalVarDecls;
+
+    /// Declarations from a do-expression init statement. Their lifetime is the
+    /// enclosing full-expression, not the do-expression body scope.
+    llvm::SmallPtrSet<const VarDecl *, 8> DoExprInitVarDecls;
+    bool EvaluatingSyntheticDoExprFrame = false;
+
+    /// Whether this evaluation is of an expression macro's body. A
+    /// std::constexpr_error_str reached here fails the evaluation (so the
+    /// invocation produces no expansion, making the macro invocation an
+    /// invalid expression) instead of emitting the error directly.
+    bool EvaluatingMacroBody = false;
+
+    /// Whether a parameter of the macro whose body is being evaluated holds a
+    /// reflection of a value-dependent expression (an argument in a template
+    /// that does not depend on it for its type). Asking what such an
+    /// expression evaluates to means the expansion must wait for
+    /// instantiation.
+    bool MacroArgsValueDependent = false;
+
+    /// Pattern matching introduces semantic declarations that are evaluated
+    /// as part of a match expression, even when constant expression checking
+    /// starts without a function call frame.
+    llvm::SmallPtrSet<const VarDecl *, 16> MatchExprLocalVarDecls;
 
     struct EvaluatingConstructorRAII {
       EvalInfo &EI;
@@ -1352,6 +1441,15 @@ namespace {
     /// Note that we have had a side-effect, and determine whether we should
     /// keep evaluating.
     bool noteSideEffect() override {
+      // While unwinding an expression because outer-scope control flow
+      // (`break`/`continue`/`return`) is escaping a do-expression, a failed
+      // subexpression is not a skipped side effect: the abandoned operand
+      // simply never runs, exactly as at runtime. Don't mark the
+      // (otherwise constant) full-expression as having side effects, and stop
+      // evaluating so the pending control flow is handled at the enclosing
+      // statement boundary.
+      if (PendingExprControlFlow != 0)
+        return false;
       EvalStatus.HasSideEffects = true;
       return keepEvaluatingAfterSideEffect();
     }
@@ -1409,6 +1507,12 @@ namespace {
     /// (Foo() || true) // use noteSideEffect
     /// Foo() + 1       // use noteFailure
     [[nodiscard]] bool noteFailure() {
+      // See noteSideEffect(): a subexpression abandoned because outer-scope
+      // control flow is escaping an expression is not a real failure with a
+      // skipped side effect. Stop evaluating without marking side effects so
+      // the pending control flow is handled at the enclosing statement.
+      if (PendingExprControlFlow != 0)
+        return false;
       // Failure when evaluating some expression often means there is some
       // subexpression whose evaluation was skipped. Therefore, (because we
       // don't track whether we skipped an expression when unwinding after an
@@ -1527,21 +1631,30 @@ namespace {
   template<ScopeKind Kind>
   class ScopeRAII {
     EvalInfo &Info;
-    unsigned OldStackSize;
+    uint64_t FirstCleanup;
+
   public:
     ScopeRAII(EvalInfo &Info)
-        : Info(Info), OldStackSize(Info.CleanupStack.size()) {
+        : Info(Info), FirstCleanup(Info.NextCleanupSequence) {
       // Push a new temporary version. This is needed to distinguish between
       // temporaries created in different iterations of a loop.
       Info.CurrentCall->pushTempVersion();
     }
     bool destroy(bool RunDestructors = true) {
-      bool OK = cleanup(Info, RunDestructors, OldStackSize);
-      OldStackSize = std::numeric_limits<unsigned>::max();
+      bool OK = cleanup(Info, RunDestructors, FirstCleanup);
+      FirstCleanup = std::numeric_limits<uint64_t>::max();
       return OK;
     }
+    void extendToFullExpression() {
+      static_assert(Kind == ScopeKind::Block);
+      // Transfer this scope's objects to the surrounding full-expression.
+      for (Cleanup &C : llvm::drop_begin(Info.CleanupStack,
+                                         getStartIndex(Info, FirstCleanup)))
+        C.setDestroyedAtEndOf(ScopeKind::FullExpression);
+      FirstCleanup = std::numeric_limits<uint64_t>::max();
+    }
     ~ScopeRAII() {
-      if (OldStackSize != std::numeric_limits<unsigned>::max())
+      if (FirstCleanup != std::numeric_limits<uint64_t>::max())
         // An exception unwinding through this scope (P3068R6) is a real
         // stack-unwind, unlike an ordinary hard-error abandonment of
         // evaluation, so scope destructors must still run in that case.
@@ -1551,10 +1664,21 @@ namespace {
       Info.CurrentCall->popTempVersion();
     }
   private:
+    static unsigned getStartIndex(EvalInfo &Info, uint64_t FirstCleanup) {
+      assert(FirstCleanup <= Info.NextCleanupSequence &&
+             "scope cleanup already completed");
+      // Full-expression cleanup can compact the stack while a surrounding
+      // pattern-condition scope still retains its bindings.
+      return llvm::partition_point(Info.CleanupStack,
+                                   [FirstCleanup](const Cleanup &C) {
+                                     return C.getSequence() < FirstCleanup;
+                                   }) -
+             Info.CleanupStack.begin();
+    }
+
     static bool cleanup(EvalInfo &Info, bool RunDestructors,
-                        unsigned OldStackSize) {
-      assert(OldStackSize <= Info.CleanupStack.size() &&
-             "running cleanups out of order?");
+                        uint64_t FirstCleanup) {
+      unsigned OldStackSize = getStartIndex(Info, FirstCleanup);
 
       // Run all cleanups for a block scope, and non-lifetime-extended cleanups
       // for a full-expression scope.
@@ -1749,6 +1873,12 @@ namespace {
     bool InvalidBase : 1;
     // P2280R4 track if we have an unknown reference or pointer.
     bool AllowConstexprUnknown = false;
+    // The tag of a tagged pointer (P3125R6), beside Offset and Designator, which are those of the untagged pointer.
+    // A tagged pointer is an invalid pointer value: it cannot be used to access an object.
+    unsigned PtrTag = 0;
+
+    bool isTagged() const { return PtrTag != 0; }
+    bool checkNotTagged(EvalInfo &Info, const Expr *E) const;
 
     const APValue::LValueBase getLValueBase() const { return Base; }
     bool allowConstexprUnknown() const { return AllowConstexprUnknown; }
@@ -1771,6 +1901,7 @@ namespace {
       }
       if (AllowConstexprUnknown)
         V.setConstexprUnknown();
+      V.setLValueTag(PtrTag);
     }
     void setFrom(const ASTContext &Ctx, const APValue &V) {
       assert(V.isLValue() && "Setting LValue from a non-LValue?");
@@ -1780,6 +1911,7 @@ namespace {
       Designator = SubobjectDesignator(Ctx, V);
       IsNullPtr = V.isNullPointer();
       AllowConstexprUnknown = V.allowConstexprUnknown();
+      PtrTag = V.getLValueTag();
     }
 
     void set(APValue::LValueBase B, bool BInvalid = false) {
@@ -1798,6 +1930,7 @@ namespace {
       Designator = SubobjectDesignator(getType(B));
       IsNullPtr = false;
       AllowConstexprUnknown = false;
+      PtrTag = 0;
     }
 
     void setNull(ASTContext &Ctx, QualType PointerTy) {
@@ -1808,6 +1941,7 @@ namespace {
       Designator = SubobjectDesignator(PointerTy->getPointeeType());
       IsNullPtr = true;
       AllowConstexprUnknown = false;
+      PtrTag = 0;
     }
 
     void setInvalid(APValue::LValueBase B, unsigned I = 0) {
@@ -2067,6 +2201,8 @@ void SubobjectDesignator::adjustIndex(EvalInfo &Info, const Expr *E, APSInt N,
 }
 
 static bool Evaluate(APValue &Result, EvalInfo &Info, const Expr *E);
+static bool EvaluateOperandAsRValue(EvalInfo &Info, const Expr *SubExpr,
+                                    APValue &Result);
 static bool EvaluateInPlace(APValue &Result, EvalInfo &Info,
                             const LValue &This, const Expr *E,
                             bool AllowNonLiteralTypes = false);
@@ -2097,6 +2233,28 @@ static bool EvaluateFixedPointOrInteger(const Expr *E, APFixedPoint &Result,
 static bool EvaluateFixedPoint(const Expr *E, APFixedPoint &Result,
                                EvalInfo &Info);
 
+struct MatchProjectionEvaluationCache {
+  llvm::SmallPtrSet<const MatchProjection *, 8> Conditions;
+  llvm::SmallPtrSet<const MatchProjection *, 8> Values;
+  llvm::SmallPtrSet<const VarDecl *, 16> Declarations;
+};
+
+static bool
+EvaluateMatchPattern(const MatchPattern *E,
+                     const MatchPatternInstantiation *Instantiation,
+                     bool &Result, EvalInfo &Info,
+                     MatchProjectionEvaluationCache *ProjectionCache = nullptr,
+                     std::optional<BlockScopeRAII> *DeclarationScope = nullptr);
+static bool EvaluatePatternDeclarations(
+    const MatchPattern *Pattern, const MatchPatternInstantiation *Instantiation,
+    EvalInfo &Info, MatchProjectionEvaluationCache &ProjectionCache);
+static bool EvaluateSharedDeclarationProjections(
+    const MatchPattern *Pattern, const MatchPatternInstantiation *Instantiation,
+    EvalInfo &Info, MatchProjectionEvaluationCache &ProjectionCache);
+static bool
+hasMatchPatternDeclarations(const MatchPattern *Pattern,
+                            const MatchPatternInstantiation *Instantiation);
+
 //===----------------------------------------------------------------------===//
 // Misc utilities
 //===----------------------------------------------------------------------===//
@@ -2121,6 +2279,13 @@ APValue &CallStackFrame::createTemporary(const KeyT *Key, QualType T,
 }
 
 /// Allocate storage for a parameter of a function call made in this frame.
+APValue &CallStackFrame::createMacroParam(CallRef Args,
+                                          const ParmVarDecl *PVD,
+                                          QualType SlotTy) {
+  APValue::LValueBase Base(PVD, Args.CallIndex, Args.Version);
+  return createLocal(Base, PVD, SlotTy, ScopeKind::Call);
+}
+
 APValue &CallStackFrame::createParam(CallRef Args, const ParmVarDecl *PVD,
                                      LValue &LV) {
   assert(Args.CallIndex == Index && "creating parameter in wrong frame");
@@ -2147,7 +2312,8 @@ APValue &CallStackFrame::createLocal(APValue::LValueBase Base, const void *Key,
     if (T.isDestructedType())
       Info.noteSideEffect();
   } else {
-    Info.CleanupStack.push_back(Cleanup(&Result, Base, T, Scope));
+    Info.CleanupStack.emplace_back(&Result, Base, T, Scope,
+                                   Info.NextCleanupSequence++);
   }
   return Result;
 }
@@ -2169,6 +2335,12 @@ APValue *EvalInfo::createHeapAlloc(const Expr *E, QualType T, LValue &LV) {
 
 /// Produce a string describing the given constexpr call.
 void CallStackFrame::describe(raw_ostream &Out) const {
+  if (!Callee) {
+    // Synthetic frame (e.g. a namespace-scope do-expression body): no
+    // function to describe.
+    Out << "<expression body>";
+    return;
+  }
   unsigned ArgIndex = 0;
   bool IsMemberCall =
       isa<CXXMethodDecl>(Callee) && !isa<CXXConstructorDecl>(Callee) &&
@@ -2573,6 +2745,14 @@ static bool CheckLValueConstantExpression(EvalInfo &Info, SourceLocation Loc,
 
   const Expr *BaseE = Base.dyn_cast<const Expr *>();
   const ValueDecl *BaseVD = Base.dyn_cast<const ValueDecl*>();
+
+  // A tagged pointer (P3125R6) is an invalid pointer value, whose mangling and identity are not defined: it cannot
+  // be a template argument, nor a part of one (this check runs for every pointer inside a class value too), nor
+  // the value std::meta::reflect_constant makes a template parameter object of.
+  if (isTemplateArgument(Kind) && LVal.isTagged()) {
+    Info.FFDiag(Loc, diag::note_constexpr_pointer_tag_template_arg);
+    return false;
+  }
 
   // Additional restrictions apply in a template argument. We only enforce the
   // C++20 restrictions here; additional syntactic and semantic restrictions
@@ -3171,7 +3351,8 @@ static bool EvalPointerValueAsBool(const APValue &Value, bool &Result) {
   // evaluatable, and they are false unless the offset is zero.
   if (!Value.getLValueBase()) {
     // TODO: Should a non-null pointer with an offset of zero evaluate to true?
-    Result = !Value.getLValueOffset().isZero();
+    // A tagged null pointer (P3125R6) is not null: its tag is a part of the address.
+    Result = !Value.getLValueOffset().isZero() || Value.getLValueTag() != 0;
     return true;
   }
 
@@ -3219,6 +3400,7 @@ static bool HandleConversionToBool(const APValue &Val, bool &Result) {
   case APValue::Union:
   case APValue::AddrLabelDiff:
   case APValue::Reflection:
+  case APValue::TokenSequence:
     return false;
   }
 
@@ -3760,6 +3942,13 @@ static bool CastToDerivedClass(EvalInfo &Info, const Expr *E, LValue &Result,
   return true;
 }
 
+bool LValue::checkNotTagged(EvalInfo &Info, const Expr *E) const {
+  if (!PtrTag)
+    return true;
+  Info.FFDiag(E, diag::note_constexpr_pointer_tag_misuse);
+  return false;
+}
+
 static bool HandleLValueDirectBase(EvalInfo &Info, const Expr *E, LValue &Obj,
                                    const CXXRecordDecl *Derived,
                                    const CXXRecordDecl *Base,
@@ -3769,6 +3958,8 @@ static bool HandleLValueDirectBase(EvalInfo &Info, const Expr *E, LValue &Obj,
     RL = &Info.Ctx.getASTRecordLayout(Derived);
   }
 
+  if (!Obj.checkNotTagged(Info, E))
+    return false;
   Obj.addDecl(Info, E, Base, /*Virtual*/ false);
   Obj.getLValueOffset() += RL->getBaseClassOffset(Base);
   return true;
@@ -3777,6 +3968,8 @@ static bool HandleLValueDirectBase(EvalInfo &Info, const Expr *E, LValue &Obj,
 static bool HandleLValueBase(EvalInfo &Info, const Expr *E, LValue &Obj,
                              const CXXRecordDecl *DerivedDecl,
                              const CXXBaseSpecifier *Base) {
+  if (!Obj.checkNotTagged(Info, E))
+    return false;
   const CXXRecordDecl *BaseDecl = Base->getType()->getAsCXXRecordDecl();
 
   if (!Base->isVirtual())
@@ -3841,6 +4034,8 @@ static bool HandleLValueMember(EvalInfo &Info, const Expr *E, LValue &LVal,
     RL = &Info.Ctx.getASTRecordLayout(FD->getParent());
   }
 
+  if (!LVal.checkNotTagged(Info, E))
+    return false;
   unsigned I = FD->getFieldIndex();
   LVal.addDecl(Info, E, FD);
   LVal.adjustOffset(Info.Ctx.toCharUnitsFromBits(RL->getFieldOffset(I)));
@@ -3903,6 +4098,8 @@ static bool HandleLValueArrayAdjustment(EvalInfo &Info, const Expr *E,
   CharUnits SizeOfPointee;
   if (!HandleSizeof(Info, E->getExprLoc(), EltTy, SizeOfPointee))
     return false;
+  if (!LVal.checkNotTagged(Info, E))
+    return false;
 
   LVal.adjustOffsetAndIndex(Info, E, Adjustment, SizeOfPointee);
   return true;
@@ -3951,6 +4148,10 @@ static const DeclContext *skipExpansionStmts(const DeclContext *DC) {
     DC = DC->getParent();
 
   return DC;
+}
+
+static bool isSyntheticDoExprDeclContext(const DeclContext *DC) {
+  return isDoExprBodyContext(skipExpansionStmts(DC));
 }
 
 // For a declaration-time read in a lambda body, there is no live call frame
@@ -5219,6 +5420,10 @@ static CompleteObject findCompleteObject(EvalInfo &Info, const Expr *E,
     return CompleteObject();
   }
 
+  // A tagged pointer is an invalid pointer value: indirection through it is undefined.
+  if (!LVal.checkNotTagged(Info, E))
+    return CompleteObject();
+
   if (!LVal.Base) {
     if (AK == AccessKinds::AK_Dereference)
       Info.FFDiag(E, diag::note_constexpr_dereferencing_null);
@@ -5699,6 +5904,8 @@ struct CompoundAssignSubobjectHandler {
       return foundPointer(Subobj, SubobjType);
     case APValue::Vector:
       return foundVector(Subobj, SubobjType);
+    case APValue::TokenSequence:
+      return foundTokenSequence(Subobj, SubobjType);
     case APValue::Indeterminate:
       Info.FFDiag(E, diag::note_constexpr_access_uninit)
           << /*read of=*/0 << /*uninitialized object=*/1
@@ -5784,6 +5991,26 @@ struct CompoundAssignSubobjectHandler {
     if (!HandleLValueArrayAdjustment(Info, E, LVal, PointeeType, Offset))
       return false;
     LVal.moveInto(Subobj);
+    return true;
+  }
+
+  bool foundTokenSequence(APValue &Subobj, QualType SubobjType) {
+    if (!checkConst(SubobjType))
+      return false;
+
+    if (!SubobjType->isTokenSequenceType() || Opcode != BO_Add) {
+      Info.FFDiag(E);
+      return false;
+    }
+
+    if (!RHS.isTokenSequence() || !Subobj.isTokenSequence()) {
+      Info.FFDiag(E);
+      return false;
+    }
+
+    TokenSequenceData NewTSD =
+        CreateTokenSequenceData(Info.Ctx, Subobj.getTokenSequence(), RHS.getTokenSequence());
+    Subobj = APValue(NewTSD);
     return true;
   }
 };
@@ -6130,6 +6357,8 @@ static const ValueDecl *HandleMemberPointerAccess(EvalInfo &Info,
 static bool HandleBaseToDerivedCast(EvalInfo &Info, const CastExpr *E,
                                     LValue &Result) {
   SubobjectDesignator &D = Result.Designator;
+  if (!Result.checkNotTagged(Info, E))
+    return false;
   if (D.Invalid || !Result.checkNullPointer(Info, E, CSK_Derived))
     return false;
 
@@ -6267,7 +6496,10 @@ enum EvalStmtResult {
   /// Hit a 'break' statement.
   ESR_Break,
   /// Still scanning for 'case' or 'default' statement.
-  ESR_CaseNotFound
+  ESR_CaseNotFound,
+  /// Hit a 'do_return' statement, yielding a value to the enclosing
+  /// do-expression.
+  ESR_DoReturn
 };
 }
 /// Evaluates the initializer of a reference.
@@ -6297,13 +6529,22 @@ static bool EvaluateInitForDeclOfReferenceType(EvalInfo &Info,
 static bool EvaluateVarDecl(EvalInfo &Info, const VarDecl *VD) {
   if (VD->isInvalidDecl())
     return false;
+  bool TreatAsDoExprLocal =
+      Info.DoExprLocalVarDecls.contains(VD) ||
+      (!VD->hasLocalStorage() && Info.EvaluatingSyntheticDoExprFrame &&
+       Info.CurrentCall && !Info.CurrentCall->Callee &&
+       isSyntheticDoExprDeclContext(VD->getDeclContext()));
+  bool TreatAsMatchExprLocal = Info.MatchExprLocalVarDecls.contains(VD);
   // We don't need to evaluate the initializer for a static local.
-  if (!VD->hasLocalStorage())
+  if (!VD->hasLocalStorage() && !TreatAsDoExprLocal && !TreatAsMatchExprLocal)
     return true;
 
   LValue Result;
   APValue &Val = Info.CurrentCall->createTemporary(VD, VD->getType(),
                                                    ScopeKind::Block, Result);
+  // Note: DoExprLocalVarDecls may have already been set by caller
+  if (TreatAsDoExprLocal)
+    Info.DoExprLocalVarDecls.insert(VD);
 
   const Expr *InitE = VD->getInit();
   if (!InitE) {
@@ -6362,9 +6603,12 @@ static bool EvaluateDecl(EvalInfo &Info, const Decl *D,
 static bool EvaluateDecompositionDeclInit(EvalInfo &Info,
                                           const DecompositionDecl *DD) {
   bool OK = true;
-  for (auto *BD : DD->flat_bindings())
-    if (auto *VD = BD->getHoldingVar())
+  for (auto *BD : DD->all_bindings())
+    if (auto *VD = BD->getHoldingVar()) {
+      if (Info.MatchExprLocalVarDecls.contains(DD))
+        Info.MatchExprLocalVarDecls.insert(VD);
       OK &= EvaluateDecl(Info, VD, /*EvaluateConditionDecl=*/true);
+    }
 
   return OK;
 }
@@ -6395,7 +6639,11 @@ static bool EvaluateCond(EvalInfo &Info, const VarDecl *CondDecl,
   FullExpressionRAII Scope(Info);
   if (CondDecl && !EvaluateDecl(Info, CondDecl))
     return false;
-  if (!EvaluateAsBooleanCondition(Cond, Result, Info))
+  const Expr *EvaluatedCond = Cond;
+  if (const auto *Constant = dyn_cast<ConstantExpr>(Cond->IgnoreParens());
+      Constant && MatchTestExpr::containsCaseCondition(Constant->getSubExpr()))
+    EvaluatedCond = Constant->getSubExpr();
+  if (!EvaluateAsBooleanCondition(EvaluatedCond, Result, Info))
     return false;
   if (!MaybeEvaluateDeferredVarDeclInit(Info, CondDecl))
     return false;
@@ -6426,9 +6674,32 @@ struct TempVersionRAII {
 
 }
 
+static EvalStmtResult EvaluateStmtImpl(StmtResult &Result, EvalInfo &Info,
+                                       const Stmt *S,
+                                       const SwitchCase *SC = nullptr);
+
+/// Evaluate a statement, then propagate any pending control flow from a
+/// statement embedded in an expression by translating the result to the
+/// stashed control-flow value. This wins over noteFailure-style recovery,
+/// which would otherwise swallow break/continue and let execution fall
+/// through to the next statement using uninitialized state.
 static EvalStmtResult EvaluateStmt(StmtResult &Result, EvalInfo &Info,
                                    const Stmt *S,
-                                   const SwitchCase *SC = nullptr);
+                                   const SwitchCase *SC = nullptr) {
+  EvalStmtResult ESR = EvaluateStmtImpl(Result, Info, S, SC);
+  if (Info.PendingExprControlFlow != 0) {
+    EvalStmtResult Pending =
+        static_cast<EvalStmtResult>(Info.PendingExprControlFlow);
+    Info.PendingExprControlFlow = 0;
+    if ((Pending == ESR_Returned || Pending == ESR_DoReturn) &&
+        Info.PendingExprControlFlowValue) {
+      Result.Value = std::move(*Info.PendingExprControlFlowValue);
+      Info.PendingExprControlFlowValue.reset();
+    }
+    return Pending;
+  }
+  return ESR;
+}
 
 /// Helper to implement named break/continue. Returns 'true' if the evaluation
 /// result should be propagated up. Otherwise, it sets the evaluation result
@@ -6478,6 +6749,180 @@ static EvalStmtResult EvaluateLoopBody(StmtResult &Result, EvalInfo &Info,
   if (ESR != ESR_Failed && ESR != ESR_CaseNotFound && !Scope.destroy())
     ESR = ESR_Failed;
 
+  return ESR;
+}
+
+/// Evaluate a case-condition chain and invoke \p OnSuccess while all pattern
+/// scopes selected along the chain are still active.
+static EvalStmtResult EvaluateCaseConditionChain(
+    EvalInfo &Info, const Expr *Condition,
+    llvm::function_ref<EvalStmtResult(const MatchTestInstantiation *)>
+        OnSuccess,
+    bool &Matched) {
+  Condition = MatchTestExpr::getConditionSubExpr(Condition);
+
+  if (const auto *And = dyn_cast<BinaryOperator>(Condition);
+      And && And->getOpcode() == BO_LAnd) {
+    bool LeftMatched = false;
+    EvalStmtResult ESR = EvaluateCaseConditionChain(
+        Info, And->getLHS(),
+        [&](const MatchTestInstantiation *LeftInstantiation) {
+          bool RightMatched = false;
+          EvalStmtResult RightESR = EvaluateCaseConditionChain(
+              Info, And->getRHS(),
+              [&](const MatchTestInstantiation *RightInstantiation) {
+                return OnSuccess(RightInstantiation ? RightInstantiation
+                                                    : LeftInstantiation);
+              },
+              RightMatched);
+          Matched = RightMatched;
+          return RightESR;
+        },
+        LeftMatched);
+    if (!LeftMatched)
+      Matched = false;
+    return ESR;
+  }
+
+  const auto *Match = dyn_cast<CaseConditionExpr>(Condition);
+  if (!Match) {
+    bool ConditionValue;
+    if (!EvaluateAsBooleanCondition(Condition, ConditionValue, Info))
+      return ESR_Failed;
+    Matched = ConditionValue;
+    return ConditionValue ? OnSuccess(nullptr) : ESR_Succeeded;
+  }
+
+  if (const VarDecl *HoldingVar = Match->getHoldingVar()) {
+    if (!EvaluateDecl(Info, HoldingVar))
+      return ESR_Failed;
+  } else if (Match->getSubject()->getType()->isVoidType() &&
+             !EvaluateIgnoredValue(Info, Match->getSubject())) {
+    return ESR_Failed;
+  }
+
+  MatchProjectionEvaluationCache ProjectionCache;
+  auto EvaluateCandidate =
+      [&](const MatchPattern *Pattern,
+          const MatchPatternInstantiation *PatternInstantiation,
+          const MatchGuard &Guard, const MatchTestInstantiation *Instantiation)
+      -> std::optional<EvalStmtResult> {
+    std::optional<BlockScopeRAII> CaseScope;
+    bool PatternMatched;
+    if (!EvaluateMatchPattern(Pattern, PatternInstantiation, PatternMatched,
+                              Info, &ProjectionCache, &CaseScope))
+      return ESR_Failed;
+    bool PatternSelected = PatternMatched;
+    if (PatternMatched &&
+        !EvaluateSharedDeclarationProjections(Pattern, PatternInstantiation,
+                                              Info, ProjectionCache))
+      return ESR_Failed;
+
+    if (PatternMatched && !CaseScope)
+      CaseScope.emplace(Info);
+    if (PatternMatched &&
+        !EvaluatePatternDeclarations(Pattern, PatternInstantiation, Info,
+                                     ProjectionCache))
+      return ESR_Failed;
+    if (PatternMatched && Guard.Init) {
+      APValue InitValue;
+      StmtResult InitResult = {InitValue, nullptr};
+      if (EvaluateStmt(InitResult, Info, Guard.Init) != ESR_Succeeded)
+        return ESR_Failed;
+    }
+    if (PatternMatched && Guard.Condition &&
+        !EvaluateCond(Info, Guard.ConditionVariable, Guard.Condition,
+                      PatternMatched))
+      return ESR_Failed;
+
+    EvalStmtResult ESR = ESR_Succeeded;
+    bool CandidateMatched = false;
+    if (PatternMatched && Instantiation && Instantiation->Condition) {
+      ESR = EvaluateCaseConditionChain(
+          Info, Instantiation->Condition,
+          [&](const MatchTestInstantiation *NestedInstantiation) {
+            return OnSuccess(NestedInstantiation ? NestedInstantiation
+                                                 : Instantiation);
+          },
+          CandidateMatched);
+    } else if (PatternMatched &&
+               !(Instantiation && Match->hasSemanticInstantiations() &&
+                 !Instantiation->Handler)) {
+      CandidateMatched = true;
+      ESR = OnSuccess(Instantiation);
+    }
+
+    if (ESR != ESR_Failed && CaseScope && !CaseScope->destroy())
+      ESR = ESR_Failed;
+    Matched = CandidateMatched;
+    if (ESR != ESR_Succeeded || CandidateMatched)
+      return ESR;
+    if (PatternSelected)
+      return ESR_Succeeded;
+    return std::nullopt;
+  };
+
+  if (!Match->getInstantiations().empty()) {
+    for (const MatchTestInstantiation &Instantiation :
+         Match->getInstantiations()) {
+      std::optional<EvalStmtResult> ESR = EvaluateCandidate(
+          Instantiation.Pattern, Instantiation.PatternInstantiation,
+          Instantiation.Guard, &Instantiation);
+      if (ESR)
+        return *ESR;
+    }
+  } else if (!Match->hasSemanticInstantiations()) {
+    std::optional<EvalStmtResult> ESR =
+        EvaluateCandidate(Match->getPattern(), Match->getPatternInstantiation(),
+                          Match->getGuard(), nullptr);
+    if (ESR)
+      return *ESR;
+  }
+
+  Matched = false;
+  return ESR_Succeeded;
+}
+
+/// Select and evaluate one semantic instantiation of a match-test condition.
+/// Pattern declarations remain alive through the selected controlled statement
+/// and, for a for-loop, its increment.
+static EvalStmtResult
+EvaluateMatchTestCondition(StmtResult &Result, EvalInfo &Info,
+                           const Expr *Condition, const Stmt *DefaultHandler,
+                           const Expr *DefaultIncrement, bool IsLoop,
+                           bool EvaluateIncrement, bool &Matched) {
+  FullExpressionRAII ConditionScope(Info);
+  bool ConditionScopeDestroyed = false;
+  EvalStmtResult ESR = EvaluateCaseConditionChain(
+      Info, Condition,
+      [&](const MatchTestInstantiation *Instantiation) {
+        Matched = true;
+        if (!ConditionScope.destroy())
+          return ESR_Failed;
+        ConditionScopeDestroyed = true;
+
+        const Stmt *Handler = Instantiation && Instantiation->Handler
+                                  ? Instantiation->Handler
+                                  : DefaultHandler;
+        const Expr *Increment = Instantiation && Instantiation->Increment
+                                    ? Instantiation->Increment
+                                    : DefaultIncrement;
+        assert(Handler && "matched condition requires a handler");
+        EvalStmtResult HandlerResult =
+            IsLoop ? EvaluateLoopBody(Result, Info, Handler)
+                   : EvaluateStmt(Result, Info, Handler);
+        if (EvaluateIncrement &&
+            (HandlerResult == ESR_Succeeded || HandlerResult == ESR_Continue) &&
+            Increment) {
+          FullExpressionRAII IncScope(Info);
+          if (!EvaluateIgnoredValue(Info, Increment) || !IncScope.destroy())
+            HandlerResult = ESR_Failed;
+        }
+        return HandlerResult;
+      },
+      Matched);
+  if (!ConditionScopeDestroyed && !ConditionScope.destroy())
+    return ESR_Failed;
   return ESR;
 }
 
@@ -6557,6 +7002,7 @@ static EvalStmtResult EvaluateSwitch(StmtResult &Result, EvalInfo &Info,
   case ESR_Continue:
   case ESR_Failed:
   case ESR_Returned:
+  case ESR_DoReturn:
     return ESR;
   case ESR_CaseNotFound:
     // This can only happen if the switch case is nested within a statement
@@ -6607,8 +7053,8 @@ static bool EvaluateContract(const ContractStmt *S, EvalInfo &Info) {
 }
 
 // Evaluate a statement.
-static EvalStmtResult EvaluateStmt(StmtResult &Result, EvalInfo &Info,
-                                   const Stmt *S, const SwitchCase *Case) {
+static EvalStmtResult EvaluateStmtImpl(StmtResult &Result, EvalInfo &Info,
+                                       const Stmt *S, const SwitchCase *Case) {
   if (!Info.nextStep(S))
     return ESR_Failed;
 
@@ -6801,6 +7247,26 @@ static EvalStmtResult EvaluateStmt(StmtResult &Result, EvalInfo &Info,
     return Scope.destroy() ? ESR_Returned : ESR_Failed;
   }
 
+  case Stmt::DoReturnStmtClass: {
+    const Expr *RetExpr = cast<DoReturnStmt>(S)->getOperand();
+    FullExpressionRAII Scope(Info);
+    if (RetExpr && RetExpr->isValueDependent()) {
+      EvaluateDependentExpr(RetExpr, Info);
+      return ESR_Failed;
+    }
+    // The value goes to the innermost do-expression's result -- in place
+    // when its result object is known -- not to `Result`, which is the
+    // enclosing function's (for a `return` in the body).
+    assert(!Info.DoExprTargets.empty() && "do_return outside a do-expression");
+    EvalInfo::DoExprTarget Target = Info.DoExprTargets.back();
+    if (RetExpr &&
+        !(Target.Slot ? EvaluateInPlace(*Target.Value, Info, *Target.Slot,
+                                        RetExpr)
+                      : Evaluate(*Target.Value, Info, RetExpr)))
+      return ESR_Failed;
+    return Scope.destroy() ? ESR_DoReturn : ESR_Failed;
+  }
+
   case Stmt::CompoundStmtClass: {
     BlockScopeRAII Scope(Info);
 
@@ -6833,6 +7299,30 @@ static EvalStmtResult EvaluateStmt(StmtResult &Result, EvalInfo &Info,
         return ESR;
       }
     }
+    if (const auto *Match = MatchTestExpr::findInCondition(IS->getCond());
+        MatchTestExpr::containsCaseCondition(IS->getCond()) ||
+        (Match && Match->hasConditionInstantiations())) {
+      bool Matched;
+      EvalStmtResult ESR = EvaluateMatchTestCondition(
+          Result, Info, IS->getCond(), IS->getThen(),
+          /*DefaultIncrement=*/nullptr, /*IsLoop=*/false,
+          /*EvaluateIncrement=*/false, Matched);
+      if (ESR != ESR_Succeeded) {
+        if (ESR != ESR_Failed && !Scope.destroy())
+          return ESR_Failed;
+        return ESR;
+      }
+      if (!Matched && IS->getElse()) {
+        ESR = EvaluateStmt(Result, Info, IS->getElse());
+        if (ESR != ESR_Succeeded) {
+          if (ESR != ESR_Failed && !Scope.destroy())
+            return ESR_Failed;
+          return ESR;
+        }
+      }
+      return Scope.destroy() ? ESR_Succeeded : ESR_Failed;
+    }
+
     bool Cond;
     if (IS->isConsteval()) {
       Cond = IS->isNonNegatedConsteval();
@@ -6867,6 +7357,31 @@ static EvalStmtResult EvaluateStmt(StmtResult &Result, EvalInfo &Info,
     const WhileStmt *WS = cast<WhileStmt>(S);
     while (true) {
       BlockScopeRAII Scope(Info);
+      if (const auto *Match = MatchTestExpr::findInCondition(WS->getCond());
+          MatchTestExpr::containsCaseCondition(WS->getCond()) ||
+          (Match && Match->hasConditionInstantiations())) {
+        bool Matched;
+        EvalStmtResult ESR = EvaluateMatchTestCondition(
+            Result, Info, WS->getCond(), WS->getBody(),
+            /*DefaultIncrement=*/nullptr, /*IsLoop=*/true,
+            /*EvaluateIncrement=*/false, Matched);
+        if (!Matched) {
+          if (!Scope.destroy())
+            return ESR_Failed;
+          break;
+        }
+        if (ShouldPropagateBreakContinue(Info, WS, &Scope, ESR))
+          return ESR;
+        if (ESR != ESR_Continue) {
+          if (ESR != ESR_Failed && !Scope.destroy())
+            return ESR_Failed;
+          return ESR;
+        }
+        if (!Scope.destroy())
+          return ESR_Failed;
+        continue;
+      }
+
       bool Continue;
       if (!EvaluateCond(Info, WS->getConditionVariable(), WS->getCond(),
                         Continue))
@@ -6926,6 +7441,32 @@ static EvalStmtResult EvaluateStmt(StmtResult &Result, EvalInfo &Info,
     }
     while (true) {
       BlockScopeRAII IterScope(Info);
+      if (const auto *Match = MatchTestExpr::findInCondition(FS->getCond());
+          MatchTestExpr::containsCaseCondition(FS->getCond()) ||
+          (Match && Match->hasConditionInstantiations())) {
+        bool Matched;
+        EvalStmtResult ESR = EvaluateMatchTestCondition(
+            Result, Info, FS->getCond(), FS->getBody(), FS->getInc(),
+            /*IsLoop=*/true, /*EvaluateIncrement=*/true, Matched);
+        if (!Matched) {
+          if (!IterScope.destroy())
+            return ESR_Failed;
+          break;
+        }
+        if (ShouldPropagateBreakContinue(Info, FS, {&IterScope, &ForScope},
+                                         ESR))
+          return ESR;
+        if (ESR != ESR_Continue) {
+          if (ESR != ESR_Failed &&
+              (!IterScope.destroy() || !ForScope.destroy()))
+            return ESR_Failed;
+          return ESR;
+        }
+        if (!IterScope.destroy())
+          return ESR_Failed;
+        continue;
+      }
+
       bool Continue = true;
       if (FS->getCond() && !EvaluateCond(Info, FS->getConditionVariable(),
                                          FS->getCond(), Continue))
@@ -7293,6 +7834,7 @@ static EvalStmtResult EvaluateStmt(StmtResult &Result, EvalInfo &Info,
         case ESR_Failed:
         case ESR_Returned:
         case ESR_CaseNotFound:
+        case ESR_DoReturn:
           return ESR;
         case ESR_Succeeded:
         case ESR_Continue:
@@ -8177,6 +8719,8 @@ static bool HandleFunctionCall(SourceLocation CallLoc,
     return false;
 
   StmtResult Ret = {Result, ResultSlot};
+  Info.CurrentCall->FunctionReturnValue = &Result;
+  Info.CurrentCall->FunctionReturnSlot = ResultSlot;
   EvalStmtResult ESR = EvaluateStmt(Ret, Info, Body);
 
   if (ESR == ESR_Succeeded) {
@@ -8299,6 +8843,7 @@ static bool HandleConstructorCall(const Expr *E, const LValue &This,
   // wasteful.
   APValue RetVal;
   StmtResult Ret = {RetVal, nullptr};
+  Info.CurrentCall->FunctionReturnValue = &RetVal;
 
   // The preconditions are checked before the member initializers run.
   if (Definition->getContracts() && !EvaluatePreContracts(Info, Definition, &Frame))
@@ -8669,12 +9214,25 @@ static bool HandleDestructionImpl(EvalInfo &Info, SourceRange CallRange,
   // wasteful.
   APValue RetVal;
   StmtResult Ret = {RetVal, nullptr};
+  Info.CurrentCall->FunctionReturnValue = &RetVal;
+
+  // [expr.call]: the precondition assertions of a destructor are evaluated
+  // before its body, its postcondition assertions after the destructor (the
+  // body and the destruction of the members and bases) has completed.
+  if (Definition->getContracts() &&
+      !EvaluatePreContracts(Info, Definition, &Frame))
+    return false;
+  auto EvaluateDtorPostContracts = [&] {
+    return !Definition->getContracts() ||
+           EvaluatePostContracts(Info, Definition, RetVal, nullptr);
+  };
+
   if (EvaluateStmt(Ret, Info, Definition->getBody()) == ESR_Failed)
     return false;
 
   // A union destructor does not implicitly destroy its members.
   if (RD->isUnion())
-    return true;
+    return EvaluateDtorPostContracts();
 
   const ASTRecordLayout &Layout = Info.Ctx.getASTRecordLayout(RD);
 
@@ -8742,6 +9300,9 @@ static bool HandleDestructionImpl(EvalInfo &Info, SourceRange CallRange,
         return false;
     }
   }
+
+  if (!EvaluateDtorPostContracts())
+    return false;
 
   // The period of destruction ends now. The object is gone.
   Value = APValue();
@@ -8962,6 +9523,8 @@ static bool HandleOperatorDeleteCall(EvalInfo &Info, const CallExpr *E) {
   for (unsigned I = 1, N = E->getNumArgs(); I != N; ++I)
     EvaluateIgnoredValue(Info, E->getArg(I));
 
+  if (!Pointer.checkNotTagged(Info, E))
+    return false;
   if (Pointer.Designator.Invalid)
     return false;
 
@@ -8983,6 +9546,14 @@ static bool HandleOperatorDeleteCall(EvalInfo &Info, const CallExpr *E) {
 // Generic Evaluation
 //===----------------------------------------------------------------------===//
 namespace {
+static bool TryNativeTokenOperator(EvalInfo &Info, const CallExpr *E,
+                                   const FunctionDecl *FD, APValue &Result,
+                                   bool &Done);
+static bool TryNativeTokenSequenceMember(EvalInfo &Info, const CallExpr *E,
+                                         const FunctionDecl *FD,
+                                         const LValue &This,
+                                         ArrayRef<const Expr *> Args,
+                                         APValue &Result, bool &Done);
 
 class BitCastBuffer {
   // FIXME: We're going to need bit-level granularity when we support
@@ -9080,6 +9651,7 @@ class APValueToBufferConverter {
       // FIXME: We should support these.
 
     case APValue::Reflection:
+    case APValue::TokenSequence:
     case APValue::Union:
     case APValue::MemberPointer:
     case APValue::AddrLabelDiff: {
@@ -9868,6 +10440,10 @@ public:
     { return StmtVisitorTy::Visit(E->getResultExpr()); }
   bool VisitSubstNonTypeTemplateParmExpr(const SubstNonTypeTemplateParmExpr *E)
     { return StmtVisitorTy::Visit(E->getReplacement()); }
+  bool VisitCXXMacroInvocationExpr(const CXXMacroInvocationExpr *E) {
+    // (An unresolved invocation is dependent and never evaluated.)
+    return E->isResolved() && StmtVisitorTy::Visit(E->getExpansion());
+  }
   bool VisitCXXDefaultArgExpr(const CXXDefaultArgExpr *E) {
     TempVersionRAII RAII(*Info.CurrentCall);
     SourceLocExprScopeGuard Guard(E, Info.CurrentCall->CurSourceLocExprScope);
@@ -9915,6 +10491,11 @@ public:
 
     case BO_Comma:
       if (!VisitIgnoredValue(E->getLHS()))
+        return false;
+      // If outer-scope control flow (`break`/`continue`/`return`) escaped a
+      // do-expression in the discarded left operand, abandon the comma without
+      // evaluating the right operand, exactly as at runtime.
+      if (Info.PendingExprControlFlow != 0)
         return false;
       return StmtVisitorTy::Visit(E->getRHS());
 
@@ -10054,6 +10635,13 @@ public:
     LValue *This = nullptr, ObjectArg;
     auto Args = ArrayRef(E->getArgs(), E->getNumArgs());
     bool HasQualifier = false;
+    // P3097R3 ([expr.call]): the call names its function by a class member
+    // access (not '.*' or '->*').
+    bool IsClassMemberAccess = false;
+    // The statically chosen function of a virtual call, when its assertions
+    // surround those of the final overrider, and the object it is called on.
+    const CXXMethodDecl *StaticContractMD = nullptr;
+    LValue StaticThis;
 
     CallRef Call;
 
@@ -10075,6 +10663,7 @@ public:
           return Error(Callee);
         This = &ObjectArg;
         HasQualifier = ME->hasQualifier();
+        IsClassMemberAccess = true;
       } else if (const BinaryOperator *BE = dyn_cast<BinaryOperator>(Callee)) {
         // Indirect bound member calls ('.*' or '->*').
         const ValueDecl *D =
@@ -10114,6 +10703,15 @@ public:
       if (!Info.Ctx.hasSameFunctionTypeIgnoringExceptionSpec(
         CalleeType->getPointeeType(), FD->getType())) {
         return Error(E);
+      }
+
+      // std::meta's token operators (+=, ==), natively.
+      if (isa<CXXOperatorCallExpr>(E)) {
+        bool Done = false;
+        if (!TryNativeTokenOperator(Info, E, FD, Result, Done))
+          return false;
+        if (Done)
+          return true;
       }
 
       // For an (overloaded) assignment expression, evaluate the RHS before the
@@ -10205,6 +10803,15 @@ public:
       }
     } else
       return Error(E);
+
+    // std::meta::token_sequence's accessors, natively.
+    if (This && !Call) {
+      bool Done = false;
+      if (!TryNativeTokenSequenceMember(Info, E, FD, *This, Args, Result, Done))
+        return false;
+      if (Done)
+        return true;
+    }
 
     // Evaluate the arguments now if we've not already done so. The exception
     // handle hooks need the exact APValue produced for their pointer argument;
@@ -10325,10 +10932,25 @@ public:
       auto *NamedMember = dyn_cast<CXXMethodDecl>(FD);
       if (NamedMember && NamedMember->isVirtual() && !HasQualifier) {
         // Perform virtual dispatch, if necessary.
+        LValue ThisBeforeDispatch = *This;
         FD = HandleVirtualDispatch(Info, E, *This, NamedMember,
                                    CovariantAdjustmentPath);
         if (!FD)
           return false;
+        // P3097R3: the assertions of the statically chosen function precede
+        // and follow those of the function actually called. (The operator
+        // notation is a call of the member function, [over.match.oper].)
+        if (IsClassMemberAccess || isa<CXXOperatorCallExpr>(E)) {
+          const CXXMethodDecl *Static = NamedMember;
+          if (!Static->hasContracts())
+            Static = cast<CXXMethodDecl>(Static->getFirstDecl());
+          if (Static->hasContracts() &&
+              FD->getCanonicalDecl() != NamedMember->getCanonicalDecl() &&
+              !isa<CXXDestructorDecl>(FD)) {
+            StaticContractMD = Static;
+            StaticThis = ThisBeforeDispatch;
+          }
+        }
       } else if (NamedMember && NamedMember->isImplicitObjectMemberFunction()) {
         // Check that the 'this' pointer points to an object of the right type.
         // FIXME: If this is an assignment operator call, we may need to change
@@ -10355,6 +10977,15 @@ public:
     if (FD->hasCXXExplicitFunctionObjectParameter())
       This = &ObjectArg;
 
+    // The assertions of the statically chosen function see the parameters of
+    // this call and the object as the static type.
+    if (StaticContractMD) {
+      CallStackFrame StaticFrame(Info, E->getSourceRange(), StaticContractMD,
+                                 &StaticThis, E, Call);
+      if (!EvaluatePreContracts(Info, StaticContractMD, &StaticFrame))
+        return false;
+    }
+
     if (!CheckConstexprFunction(Info, Loc, FD, Definition, Body) ||
         !HandleFunctionCall(Loc, Definition, This, E, Args, Call, Body, Info,
                             Result, ResultSlot))
@@ -10364,6 +10995,13 @@ public:
         !HandleCovariantReturnAdjustment(Info, E, Result,
                                          CovariantAdjustmentPath))
       return false;
+
+    if (StaticContractMD) {
+      CallStackFrame StaticFrame(Info, E->getSourceRange(), StaticContractMD,
+                                 &StaticThis, E, Call);
+      if (!EvaluatePostContracts(Info, StaticContractMD, Result, ResultSlot))
+        return false;
+    }
 
     return CallScope.destroy();
   }
@@ -10448,6 +11086,14 @@ public:
     switch (E->getCastKind()) {
     default:
       break;
+
+    case CK_NoReturnToAny: {
+      // The operand diverges, so there is never a value to convert: evaluate
+      // it for its diagnostic.
+      if (!EvaluateIgnoredValue(Info, E->getSubExpr()))
+        return false;
+      return Error(E);
+    }
 
     case CK_AtomicToNonAtomic: {
       APValue AtomicVal;
@@ -10574,8 +11220,298 @@ public:
     llvm_unreachable("Return from function from the loop above.");
   }
 
+  bool VisitDoExpr(const DoExpr *E) {
+    APValue Result;
+    if (!handleDoExpr(E, Result, nullptr))
+      return false;
+    return DerivedSuccess(Result, E);
+  }
+
+  /// Evaluate a do-expression, yielding into \p Result -- constructed in
+  /// place at \p ResultSlot when the derived evaluator knows the result
+  /// object (RecordExprEvaluator), as handleCallExpr does for a call.
+  bool handleDoExpr(const DoExpr *E, APValue &Result,
+                    const LValue *ResultSlot) {
+    llvm::SaveAndRestore NotCheckingForUB(Info.CheckingForUndefinedBehavior,
+                                          false);
+
+    // `do_return` yields into this do-expression's result (see the
+    // DoReturnStmt case).
+    Info.DoExprTargets.push_back({&Result, ResultSlot});
+    auto PopTarget =
+        llvm::make_scope_exit([&] { Info.DoExprTargets.pop_back(); });
+
+    // At namespace scope (e.g. evaluating a constexpr variable initializer),
+    // there is no real call frame on the stack — only the BottomFrame.
+    // The body is given a synthetic CallStackFrame so its evaluation has a
+    // valid call context (used by error diagnostics, the cleanup machinery,
+    // and so on).
+    //
+    // The flag is set here, but the frame itself is pushed further down,
+    // *after* the init-statement has been evaluated. Init-hoist declarations
+    // outlive the body -- their lifetime runs to the end of the enclosing
+    // full-expression -- so their storage must not be created in a frame that
+    // is popped as soon as the body ends. The flag still has to be in effect
+    // while the init-statement runs, because at namespace scope those
+    // declarations have static storage and EvaluateVarDecl only evaluates them
+    // when it can see they belong to a do-expression.
+    const bool NeedsSyntheticFrame = Info.CurrentCall == &Info.BottomFrame;
+    std::optional<llvm::SaveAndRestore<bool>> SyntheticDoExprFrame;
+    if (NeedsSyntheticFrame)
+      SyntheticDoExprFrame.emplace(Info.EvaluatingSyntheticDoExprFrame, true);
+
+
+    // A plain `return` in the body returns from the enclosing function, so
+    // the body's statement result is the function's own: its value lands in
+    // the function's result object, in place. Only a body evaluated without
+    // a function frame (a namespace-scope constant) falls back to a scratch
+    // value.
+    APValue Scratch;
+    StmtResult Body = Info.CurrentCall->FunctionReturnValue
+                          ? StmtResult{*Info.CurrentCall->FunctionReturnValue,
+                                       Info.CurrentCall->FunctionReturnSlot}
+                          : StmtResult{Scratch, nullptr};
+
+    if (const Stmt *Init = E->getInitStmt()) {
+      unsigned OldCleanupStackSize = Info.CleanupStack.size();
+      auto RegisterInitDecls = [&](const Stmt *S, auto &Self) -> void {
+        if (!S)
+          return;
+        if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+          for (const Decl *D : DS->decls())
+            if (const auto *VD = dyn_cast<VarDecl>(D))
+              Info.DoExprInitVarDecls.insert(VD);
+          return;
+        }
+        for (const Stmt *Sub : S->children())
+          Self(Sub, Self);
+      };
+      RegisterInitDecls(Init, RegisterInitDecls);
+
+      auto EvaluateInitDeclStmt = [&](const DeclStmt *DS) -> bool {
+        for (const Decl *D : DS->decls()) {
+          const VarDecl *VD = dyn_cast_or_null<VarDecl>(D);
+          if (VD && !CheckLocalVariableDeclaration(Info, VD))
+            return false;
+
+          if (const ExpansionStmtDecl *ESD = dyn_cast<ExpansionStmtDecl>(D))
+            return EvaluateStmt(Body, Info, ESD->getStmt()) == ESR_Succeeded;
+
+          if (!EvaluateDecl(Info, D, /*EvaluateConditionDecl=*/true) &&
+              !Info.noteFailure())
+            return false;
+        }
+        return true;
+      };
+
+      if (const auto *CS = dyn_cast<CompoundStmt>(Init)) {
+        for (const Stmt *S : CS->body()) {
+          const auto *DS = dyn_cast<DeclStmt>(S);
+          if (!DS || !EvaluateInitDeclStmt(DS))
+            return false;
+        }
+      } else {
+        const auto *DS = dyn_cast<DeclStmt>(Init);
+        if (!DS || !EvaluateInitDeclStmt(DS))
+          return false;
+      }
+
+      for (unsigned I = OldCleanupStackSize, End = Info.CleanupStack.size();
+           I != End; ++I) {
+        APValue::LValueBase Base = Info.CleanupStack[I].getBase();
+        bool IsDoExprInitCleanup = false;
+        if (const auto *VD =
+                dyn_cast_or_null<VarDecl>(Base.dyn_cast<const ValueDecl *>())) {
+          IsDoExprInitCleanup = Info.DoExprInitVarDecls.contains(VD);
+        } else if (const auto *E = Base.dyn_cast<const Expr *>()) {
+          if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(E))
+            if (const auto *VD =
+                    dyn_cast_or_null<VarDecl>(MTE->getExtendingDecl()))
+              IsDoExprInitCleanup = Info.DoExprInitVarDecls.contains(VD);
+        }
+
+        if (IsDoExprInitCleanup)
+          Info.CleanupStack[I].setDestroyedAtEndOf(ScopeKind::FullExpression);
+      }
+    }
+
+    // Now that the init-hoist declarations are safely in the enclosing frame,
+    // push the body's own.
+    std::optional<CallStackFrame> SyntheticFrame;
+    if (NeedsSyntheticFrame) {
+      // Inherit `this` rather than starting from none. The synthetic frame is
+      // scaffolding for the body, not a call: it stands in for the frame it is
+      // pushed on top of, so the body sees the same object that frame did. A
+      // default member initializer is where this shows: the evaluator sets
+      // `This` on the current frame for the duration of the initializer (see
+      // ThisOverrideRAII), and a do-expression in that initializer would
+      // otherwise lose it and reject `do { do_return a + 10; }` for naming a
+      // non-static member.
+      SyntheticFrame.emplace(Info, E->getSourceRange(),
+                             /*Callee=*/nullptr,
+                             /*This=*/Info.CurrentCall->This,
+                             /*CallExpr=*/E, CallRef());
+
+      // Name the body's own variables, so the two places that ask "is this a
+      // do-expression body local" can answer yes for them.
+      //
+      // Those places recognise one by its DeclContext being the synthetic one
+      // Sema builds for the body -- which Sema only builds when the
+      // do-expression is *not* already inside a function. In
+      //
+      //   void f() { constexpr B b = do { B x{6}; x &= B{3}; do_return x; }; }
+      //
+      // `x` belongs to `f`, the synthetic frame has no callee to match it
+      // against, and the lookup gave up: no frame, so `x` looked like an
+      // object that exists outside the expression and could be read but not
+      // modified. The same body at namespace scope, and the same mutation
+      // through a lambda, both worked.
+      auto RegisterBodyLocals = [&](const Stmt *S, auto &Self) -> void {
+        if (!S)
+          return;
+        // Not into anything with a scope of its own; its locals are not ours.
+        if (isa<LambdaExpr>(S))
+          return;
+        if (const auto *DS = dyn_cast<DeclStmt>(S))
+          for (const Decl *D : DS->decls())
+            if (const auto *VD = dyn_cast<VarDecl>(D))
+              if (VD->hasLocalStorage())
+                Info.DoExprLocalVarDecls.insert(VD);
+        for (const Stmt *Sub : S->children())
+          Self(Sub, Self);
+      };
+      RegisterBodyLocals(E->getBody(), RegisterBodyLocals);
+    }
+
+    BlockScopeRAII Scope(Info);
+    EvalStmtResult ESR = EvaluateStmt(Body, Info, E->getBody());
+
+    if (ESR == ESR_DoReturn)
+      return Scope.destroy();
+    if (ESR == ESR_Failed)
+      return false;
+    if (ESR == ESR_Break || ESR == ESR_Continue || ESR == ESR_Returned) {
+      // Outer-scope control flow (`break`/`continue`/`return`) is escaping the
+      // do-expression body. Stash it so the enclosing EvaluateStmt translates
+      // it into the proper EvalStmtResult and propagates it to the enclosing
+      // loop/function, then return false (without a diagnostic) so evaluation
+      // of the rest of the enclosing full-expression is abandoned immediately.
+      // Returning a value here instead would let sibling subexpressions
+      // observably execute before the control transfer, diverging from runtime
+      // semantics. The pending flag is what distinguishes this from a real
+      // evaluation failure: EvaluateStmt checks it regardless of the returned
+      // EvalStmtResult.
+      if (!Scope.destroy())
+        return false;
+      Info.PendingExprControlFlow = static_cast<unsigned>(ESR);
+      if (ESR == ESR_Returned && &Body.Value == &Scratch && Scratch.hasValue())
+        Info.PendingExprControlFlowValue = std::move(Scratch);
+      return false;
+    }
+    if (ESR == ESR_Succeeded && E->getType()->isVoidType()) {
+      // Void do-expression: falling off the end is a valid termination.
+      return Scope.destroy();
+    }
+    // ESR_Succeeded with a non-void result type (no do_return reached) and
+    // any other statement-evaluation result are not supported in constant
+    // evaluation through a do-expression.
+    Info.FFDiag(E->getBeginLoc(), diag::note_constexpr_stmt_expr_unsupported);
+    return false;
+  }
+
   bool VisitPackIndexingExpr(const PackIndexingExpr *E) {
     return StmtVisitorTy::Visit(E->getSelectedExpr());
+  }
+
+  bool VisitMatchSelectExpr(const MatchSelectExpr *E) {
+    BlockScopeRAII MatchScope(Info);
+    if (const Stmt *Init = E->getInitStmt()) {
+      APValue InitValue;
+      StmtResult InitResult = {InitValue, nullptr};
+      if (EvaluateStmt(InitResult, Info, Init) != ESR_Succeeded)
+        return false;
+    }
+    if (E->getHoldingVar() && !EvaluateDecl(Info, E->getHoldingVar()))
+      return false;
+    if (!E->getHoldingVar() && E->getSubject()->getType()->isVoidType() &&
+        !EvaluateIgnoredValue(Info, E->getSubject()))
+      return false;
+
+    MatchProjectionEvaluationCache ProjectionCache;
+
+    bool Result;
+    std::optional<unsigned> RejectedCase;
+    for (const MatchCaseInstantiation &Case : E->getCaseInstantiations()) {
+      if (RejectedCase && *RejectedCase == Case.CaseIndex)
+        continue;
+      std::optional<BlockScopeRAII> Scope;
+      if (!EvaluateMatchPattern(Case.Pattern, Case.PatternInstantiation, Result,
+                                Info, &ProjectionCache, &Scope))
+        return false;
+      bool PatternSelected = Result;
+      if (Result &&
+          !EvaluateSharedDeclarationProjections(
+              Case.Pattern, Case.PatternInstantiation, Info, ProjectionCache))
+        return false;
+      if (Result && !Scope)
+        Scope.emplace(Info);
+      if (Result &&
+          !EvaluatePatternDeclarations(Case.Pattern, Case.PatternInstantiation,
+                                       Info, ProjectionCache))
+        return false;
+      if (Result && Case.Guard.Init) {
+        APValue InitValue;
+        StmtResult InitResult = {InitValue, nullptr};
+        if (EvaluateStmt(InitResult, Info, Case.Guard.Init) != ESR_Succeeded)
+          return false;
+      }
+      if (Result && Case.Guard.Condition) {
+        if (!EvaluateCond(Info, Case.Guard.ConditionVariable,
+                          Case.Guard.Condition, Result))
+          return false;
+      }
+      if (Result) {
+        if (const auto *HandlerExpr = dyn_cast<Expr>(Case.Handler);
+            HandlerExpr && !E->isStatement() && !Case.isNonReturning()) {
+          if (!this->Visit(HandlerExpr))
+            return false;
+        } else {
+          APValue HandlerValue;
+          StmtResult HandlerResult = {HandlerValue, nullptr};
+          EvalStmtResult ESR = EvaluateStmt(HandlerResult, Info, Case.Handler);
+          if (ESR == ESR_Failed)
+            return false;
+          if (ESR == ESR_Succeeded && Case.isNonReturning()) {
+            Info.CCEDiag(
+                Case.NotReturnLoc,
+                diag::note_constexpr_nonreturning_match_handler_returned);
+            return false;
+          }
+          if (ESR != ESR_Succeeded) {
+            if ((Scope && !Scope->destroy()) || !MatchScope.destroy())
+              return false;
+            Info.PendingExprControlFlow = static_cast<unsigned>(ESR);
+            if ((ESR == ESR_Returned || ESR == ESR_DoReturn) &&
+                HandlerValue.hasValue())
+              Info.PendingExprControlFlowValue = std::move(HandlerValue);
+            return false;
+          }
+        }
+        if (Scope && !Scope->destroy())
+          return false;
+        MatchScope.extendToFullExpression();
+        return true;
+      }
+      if (Scope && !Scope->destroy())
+        return false;
+      if (PatternSelected)
+        RejectedCase = Case.CaseIndex;
+    }
+    if (E->getType()->isVoidType()) {
+      MatchScope.extendToFullExpression();
+      return true;
+    }
+    return Error(E);
   }
 
   /// Visit a value which is evaluated, but whose value is ignored. Returns
@@ -10616,6 +11552,327 @@ bool ExprEvaluatorBase<Derived>::VisitAtomicExpr(const AtomicExpr *E) {
   if (!EvaluateAtomicBuiltin(this->Info, E, Result))
     return false;
   return DerivedSuccess(Result, E);
+}
+
+/// The concatenation of \p N tokens (std::meta::token, or single-token
+/// sequences) starting at \p Ptr: for storage made by MaterializeTokens, a
+/// slice of the token array it was made from (the array itself if whole);
+/// otherwise read element by element.
+static bool ReadTokenArray(EvalInfo &Info, const Expr *E, LValue Ptr,
+                           QualType ElemTy, uint64_t N,
+                           TokenSequenceData &Out) {
+  if (N == 0) {
+    Out = CreateEmptyTokenSequenceData(Info.Ctx);
+    return true;
+  }
+  if (const auto *D = Ptr.Base.dyn_cast<const ValueDecl *>())
+    if (std::optional<TokenSequenceData> TSOpt =
+            getMaterializedTokens(Info.Ctx, D)) {
+      const TokenSequenceData *TSD = &*TSOpt;
+      ArrayRef<APValue::LValuePathEntry> Path = Ptr.Designator.Entries;
+      uint64_t Idx = Path.size() == 1 ? Path[0].getAsArrayIndex() : 0;
+      if (Path.size() <= 1 && Idx + N <= TSD->size()) {
+        Out = (Idx == 0 && N == TSD->size())
+                  ? *TSD
+                  : CreateTokenSequenceData(Info.Ctx, TSD->slice(Idx, N));
+        return true;
+      }
+    }
+  // Elements of a heap allocation (a token_sequence's buffer): copied out of
+  // the allocation's array in one pass, rather than read one by one through
+  // the full lvalue machinery.
+  if (auto DA = Ptr.Base.dyn_cast<DynamicAllocLValue>()) {
+    ArrayRef<APValue::LValuePathEntry> Path = Ptr.Designator.Entries;
+    if (std::optional<DynAlloc *> Alloc = Info.lookupDynamicAlloc(DA);
+        Alloc && Path.size() == 1 && (*Alloc)->Value.isArray()) {
+      const APValue &Arr = (*Alloc)->Value;
+      uint64_t Idx = Path[0].getAsArrayIndex();
+      if (Idx + N <= Arr.getArrayInitializedElts()) {
+        SmallVector<Token, 64> Toks;
+        Toks.reserve(N);
+        bool AllTokens = true;
+        for (uint64_t I = 0; I != N && AllTokens; ++I) {
+          const APValue &V = Arr.getArrayInitializedElt(Idx + I);
+          if (!V.isTokenSequence()) {
+            AllTokens = false;
+            break;
+          }
+          TokenSequenceData One = V.getTokenSequence();
+          Toks.append(One.begin(), One.end());
+        }
+        if (AllTokens) {
+          Out = CreateTokenSequenceData(Info.Ctx, Toks);
+          return true;
+        }
+      }
+    }
+  }
+  SmallVector<Token, 64> Toks;
+  for (uint64_t I = 0; I != N; ++I) {
+    if (I && !HandleLValueArrayAdjustment(Info, E, Ptr, ElemTy, 1))
+      return false;
+    APValue V;
+    if (!handleLValueToRValueConversion(Info, E, ElemTy, Ptr, V))
+      return false;
+    if (!V.isTokenSequence())
+      return false;
+    TokenSequenceData One = V.getTokenSequence();
+    Toks.append(One.begin(), One.end());
+  }
+  Out = CreateTokenSequenceData(Info.Ctx, Toks);
+  return true;
+}
+
+/// A std::meta::token_sequence's tokens, given its value.
+static bool ReadTokenSequenceObject(EvalInfo &Info, const Expr *E,
+                                    const APValue &Obj, QualType ElemTy,
+                                    TokenSequenceData &Out) {
+  // One field: the token array the compiler gave it.
+  if (!Obj.isStruct() || Obj.getStructNumFields() != 1 ||
+      !Obj.getStructField(0).isTokenSequence())
+    return false;
+  Out = Obj.getStructField(0).getTokenSequence();
+  return true;
+}
+
+/// The tokens of an operand of a std::meta token operator: a token or a
+/// token_sequence.
+static bool ReadTokenOperand(EvalInfo &Info, const Expr *Arg,
+                             TokenSequenceData &Out) {
+  QualType T = Arg->getType().getNonReferenceType();
+  APValue V;
+  if (Arg->isGLValue()) {
+    LValue LV;
+    if (!EvaluateLValue(Arg, LV, Info) ||
+        !handleLValueToRValueConversion(Info, Arg, T, LV, V))
+      return false;
+  } else if (T->isRecordType()) {
+    // A prvalue view or sequence: evaluated into a temporary.
+    LValue LV;
+    APValue &Tmp = Info.CurrentCall->createTemporary(
+        Arg, T, ScopeKind::FullExpression, LV);
+    if (!EvaluateInPlace(Tmp, Info, LV, Arg))
+      return false;
+    V = Tmp;
+  } else if (!Evaluate(V, Info, Arg)) {
+    return false;
+  }
+  QualType ElemTy = Info.Ctx.MetaTokenTy.withConst();
+  if (V.isTokenSequence()) {
+    Out = V.getTokenSequence();
+    return true;
+  }
+  if (T->isStdMetaTokenSequenceType())
+    return ReadTokenSequenceObject(Info, Arg, V, ElemTy, Out);
+  return false;
+}
+
+/// A std::meta::token_sequence of class type \p T holding \p TSD.
+static bool MakeTokenSequenceValue(EvalInfo &Info, QualType T,
+                                   TokenSequenceData TSD, APValue &Out) {
+  const CXXRecordDecl *RD = T->getAsCXXRecordDecl();
+  if (!RD || RD->getNumBases() ||
+      std::distance(RD->field_begin(), RD->field_end()) != 1 ||
+      !RD->field_begin()->getType()->isTokenSequenceType())
+    return false;
+  Out = APValue(APValue::UninitStruct(), 0, 1);
+  Out.getStructField(0) = APValue(TSD);
+  return true;
+}
+
+/// std::meta's operators on token sequences -- += and + (with a token or a
+/// token_sequence), and == between tokens and sequences -- natively.
+/// \p Done stays false for anything else.
+static bool TryNativeTokenOperator(EvalInfo &Info, const CallExpr *E,
+                                   const FunctionDecl *FD, APValue &Result,
+                                   bool &Done) {
+  Done = false;
+  auto *OCE = dyn_cast<CXXOperatorCallExpr>(E);
+  if (!OCE || OCE->getNumArgs() != 2 || isa<CXXMethodDecl>(FD))
+    return true;
+  const DeclContext *DC = FD->getDeclContext();
+  while (DC && DC->isInlineNamespace())
+    DC = DC->getParent();
+  const auto *NS = dyn_cast_or_null<NamespaceDecl>(DC);
+  if (!NS || !NS->getIdentifier() || NS->getName() != "meta" ||
+      !NS->isInStdNamespace())
+    return true;
+  const Expr *L = OCE->getArg(0), *R = OCE->getArg(1);
+  auto IsTokenish = [](QualType T) {
+    T = T.getNonReferenceType();
+    return T->isMetaTokenType() || T->isStdMetaTokenSequenceType();
+  };
+  if (!IsTokenish(L->getType()) || !IsTokenish(R->getType()))
+    return true;
+  switch (OCE->getOperator()) {
+  case OO_PlusEqual: {
+    QualType LT = L->getType().getNonReferenceType();
+    if (!L->isGLValue() || !LT->isStdMetaTokenSequenceType())
+      return true;
+    // The right operand first, as for any compound assignment.
+    TokenSequenceData Toks;
+    if (!ReadTokenOperand(Info, R, Toks))
+      return false;
+    LValue Obj;
+    APValue Cur, New;
+    TokenSequenceData Old;
+    if (!EvaluateLValue(L, Obj, Info) ||
+        !handleLValueToRValueConversion(Info, L, LT, Obj, Cur) ||
+        !ReadTokenSequenceObject(Info, L, Cur, Info.Ctx.MetaTokenTy.withConst(),
+                                 Old) ||
+        !MakeTokenSequenceValue(
+            Info, LT, AppendTokenSequenceData(Info.Ctx, Old, Toks), New) ||
+        !handleAssignment(Info, E, Obj, LT, New))
+      return false;
+    Obj.moveInto(Result);
+    Done = true;
+    return true;
+  }
+  case OO_Plus: {
+    QualType RT = E->getType();
+    if (!RT->isStdMetaTokenSequenceType())
+      return true;
+    TokenSequenceData A, B;
+    if (!ReadTokenOperand(Info, L, A) || !ReadTokenOperand(Info, R, B) ||
+        !MakeTokenSequenceValue(
+            Info, RT, AppendTokenSequenceData(Info.Ctx, A, B), Result))
+      return false;
+    Done = true;
+    return true;
+  }
+  case OO_EqualEqual: {
+    TokenSequenceData A, B;
+    if (!ReadTokenOperand(Info, L, A) || !ReadTokenOperand(Info, R, B))
+      return false;
+    llvm::FoldingSetNodeID AID, BID;
+    APValue(A).Profile(AID);
+    APValue(B).Profile(BID);
+    Result = APValue(Info.Ctx.MakeIntValue(AID == BID, E->getType()));
+    Done = true;
+    return true;
+  }
+  default:
+    return true;
+  }
+}
+
+/// std::meta::token_sequence's accessors -- size, empty, data, begin, end,
+/// operator[], and subseq -- natively: the same results as the functions,
+/// without interpreting them. \p Done stays false (before anything is
+/// evaluated) for any other function, or an object not of the expected shape.
+static bool TryNativeTokenSequenceMember(EvalInfo &Info, const CallExpr *E,
+                                         const FunctionDecl *FD,
+                                         const LValue &This,
+                                         ArrayRef<const Expr *> Args,
+                                         APValue &Result, bool &Done) {
+  Done = false;
+  const auto *MD = dyn_cast<CXXMethodDecl>(FD);
+  if (!MD || !MD->isImplicitObjectMemberFunction())
+    return true;
+  QualType ClassTy = Info.Ctx.getCanonicalTagType(MD->getParent());
+  if (!ClassTy->isStdMetaTokenSequenceType())
+    return true;
+  enum { Size, Empty, Data, Begin, End, Subscript, Subseq, Other } Kind = Other;
+  if (MD->getOverloadedOperator() == OO_Subscript)
+    Kind = Subscript;
+  else if (const IdentifierInfo *II = MD->getIdentifier()) {
+    StringRef N = II->getName();
+    Kind = N == "size"                     ? Size
+           : N == "empty"                  ? Empty
+           : N == "data"                   ? Data
+           : N == "begin" || N == "cbegin" ? Begin
+           : N == "end" || N == "cend"     ? End
+           : N == "subseq"                 ? Subseq
+                                           : Other;
+  }
+  if (Kind == Other)
+    return true;
+  APValue Obj;
+  if (!handleLValueToRValueConversion(Info, E, ClassTy, This, Obj))
+    return false;
+  if (!Obj.isStruct() || Obj.getStructNumFields() != 1 ||
+      !Obj.getStructField(0).isTokenSequence())
+    return true;
+  TokenSequenceData TSD = Obj.getStructField(0).getTokenSequence();
+
+  auto ReadSize = [&](const Expr *A, uint64_t &V) {
+    APValue X;
+    if (!Evaluate(X, Info, A))
+      return false;
+    if (A->isGLValue()) {
+      LValue LV;
+      LV.setFrom(Info.Ctx, X);
+      if (!handleLValueToRValueConversion(Info, A, A->getType(), LV, X))
+        return false;
+    }
+    if (!X.isInt())
+      return false;
+    V = X.getInt().getZExtValue();
+    return true;
+  };
+  QualType ElemTy = Info.Ctx.MetaTokenTy.withConst();
+  QualType PtrTy = Info.Ctx.getPointerType(ElemTy);
+  // A pointer to element I of the tokens' array (made once per array).
+  auto ElementPtr = [&](uint64_t I, APValue &Out) {
+    Out = MaterializeTokens(Info.Ctx, TSD, PtrTy);
+    if (I == 0)
+      return true;
+    LValue P;
+    P.setFrom(Info.Ctx, Out);
+    if (!HandleLValueArrayAdjustment(Info, E, P, ElemTy, I))
+      return false;
+    P.moveInto(Out);
+    return true;
+  };
+
+  switch (Kind) {
+  case Size:
+    Result = APValue(Info.Ctx.MakeIntValue(TSD.size(), E->getType()));
+    break;
+  case Empty:
+    Result = APValue(Info.Ctx.MakeIntValue(TSD.empty(), E->getType()));
+    break;
+  case Data:
+  case Begin:
+    if (!ElementPtr(0, Result))
+      return false;
+    break;
+  case End:
+    if (!ElementPtr(TSD.size(), Result))
+      return false;
+    break;
+  case Subscript: {
+    uint64_t I;
+    if (Args.size() != 1 || !ReadSize(Args[0], I))
+      return false;
+    if (I >= TSD.size()) {
+      Info.FFDiag(E, diag::note_constexpr_access_past_end) << AK_Read;
+      return false;
+    }
+    if (!ElementPtr(I, Result))
+      return false;
+    break;
+  }
+  case Subseq: {
+    uint64_t Pos, N;
+    if (Args.size() != 2 || !ReadSize(Args[0], Pos) || !ReadSize(Args[1], N))
+      return false;
+    if (Pos > TSD.size()) {
+      Info.FFDiag(E, diag::note_constexpr_access_past_end) << AK_Read;
+      return false;
+    }
+    N = std::min<uint64_t>(N, TSD.size() - Pos);
+    if (!MakeTokenSequenceValue(
+            Info, E->getType(),
+            TokenSequenceData(N ? TSD.data() + Pos : nullptr, N), Result))
+      return false;
+    break;
+  }
+  case Other:
+    llvm_unreachable("handled above");
+  }
+  Done = true;
+  return true;
 }
 
 /// EvaluateAsRValue - Try to evaluate this expression, performing an implicit
@@ -10730,12 +11987,144 @@ bool ExprEvaluatorBase<Derived>::VisitCXXMetafunctionExpr(
       (Info.EvalMode ==
        EvaluationMode::ConstantExpressionPlainlyConstantEvaluated);
 
+  const Metafunction *Metafn = nullptr;
+  if (Metafunction::Lookup(E->getMetaFnID(), Metafn))
+    Metafn = nullptr;
+
+  // A metafunction that asks about the macro expansion context gets that
+  // instead of the declaration being evaluated; the two are unrelated, and
+  // ContainingDecl carries the injection target the others rely on.
+  Decl *ContextDecl = Info.ContainingDecl;
+  if (Metafn && Metafn->wantsMacroExpansionContext())
+    ContextDecl = Info.MacroExpansionContext;
+
+  // In a macro body whose arguments include value-dependent expressions, a
+  // question about what such an expression evaluates to has no answer until
+  // instantiation: the expansion waits for it, as
+  // std::meta::expand_at_instantiation() would ask.
+  if (Info.MacroArgsValueDependent && Metafn &&
+      !Metafn->isSafeOnValueDependentExpressions()) {
+    for (Expr *Arg : Args) {
+      if (!Arg->getType()->isReflectionType())
+        continue;
+      APValue RV;
+      if (Evaluator(RV, Arg, true) && RV.isReflectedExpression() &&
+          RV.getReflectedExpression()->isValueDependent()) {
+        Info.FFDiag(E, diag::metafn_expand_at_instantiation);
+        return false;
+      }
+    }
+  }
+
+  // EXPERIMENTAL: the token-array metafunctions, done natively on the array,
+  // as __builtin_memcpy is (one element at a time, but without interpreting
+  // anything).
+  if (Metafn && Metafn->getTokenArrayOp() != Metafunction::TokenArrayOp::None) {
+    // The arguments are as written (often lvalues, e.g. a parameter); read
+    // their values. (Not via Evaluator above: it insists on a constant
+    // expression, which a pointer into a transient allocation is not.)
+    auto ReadArg = [&](const Expr *Arg, APValue &V) {
+      if (!::Evaluate(V, Info, Arg))
+        return false;
+      if (Arg->isGLValue()) {
+        LValue LV;
+        LV.setFrom(Info.Ctx, V);
+        return handleLValueToRValueConversion(Info, Arg, Arg->getType(), LV, V);
+      }
+      return true;
+    };
+    APValue PtrVal;
+    if (!ReadArg(Args[0], PtrVal))
+      return false;
+    LValue Ptr;
+    Ptr.setFrom(Info.Ctx, PtrVal);
+    QualType ElemTy = Args[0]->getType()->getPointeeType().getUnqualifiedType();
+
+    if (Metafn->getTokenArrayOp() == Metafunction::TokenArrayOp::Join) {
+      // tokens_join(const token_sequence* p, size_t n): their concatenation.
+      APValue NVal;
+      if (!ReadArg(Args[1], NVal))
+        return false;
+      TokenSequenceData Joined;
+      if (!ReadTokenArray(Info, E, Ptr, ElemTy, NVal.getInt().getZExtValue(),
+                          Joined))
+        return Error(E);
+      return DerivedSuccess(APValue(Joined), E);
+    }
+
+    // tokens_fill(token_sequence* p, token_sequence ts): write each token of
+    // ts, as a single-token sequence, to p[0], p[1], ...; the count written.
+    APValue TS;
+    if (!ReadArg(Args[1], TS) || !TS.isTokenSequence())
+      return false;
+    TokenSequenceData TSD = TS.getTokenSequence();
+    for (size_t I = 0; I != TSD.size(); ++I) {
+      if (I && !HandleLValueArrayAdjustment(Info, E, Ptr, ElemTy, 1))
+        return false;
+      // (Refers to its slot in the token array: no storage of its own.)
+      APValue Elem(TokenSequenceData(TSD.data() + I, 1));
+      if (!handleAssignment(Info, E, Ptr, ElemTy, Elem))
+        return false;
+    }
+    llvm::APSInt Count(llvm::APInt(Info.Ctx.getTypeSize(E->getType()),
+                                   TSD.size()),
+                       /*isUnsigned=*/true);
+    return DerivedSuccess(APValue(Count), E);
+  }
+
+  // The member queries, gathered natively and written straight to the
+  // caller's buffer: members_gather(info* dst, r, kind, scope, designating,
+  // capacity) gives the count; with a non-null 'dst', it also writes the
+  // reflections there (and 'capacity' must be that count).
+  if (Metafn && Metafn->isMemberGather()) {
+    auto ReadArg = [&](const Expr *Arg, APValue &V) {
+      if (!::Evaluate(V, Info, Arg))
+        return false;
+      if (Arg->isGLValue()) {
+        LValue LV;
+        LV.setFrom(Info.Ctx, V);
+        return handleLValueToRValueConversion(Info, Arg, Arg->getType(), LV, V);
+      }
+      return true;
+    };
+    APValue PtrVal, CapVal;
+    if (!ReadArg(Args[0], PtrVal) || !ReadArg(Args[5], CapVal))
+      return false;
+    APValue Gathered;
+    if (E->getImpl()(Gathered, Evaluator, Diagnoser, Thrower, AllowInjection,
+                     E->getResultType(), Info.CurrentCall->CallRange, Args,
+                     ContextDecl)) {
+      bool Failed = Error(E);
+      Info.addNotes(Diagnostics);
+      return Failed;
+    }
+    unsigned N = Gathered.getArraySize();
+    LValue Ptr;
+    Ptr.setFrom(Info.Ctx, PtrVal);
+    if (!Ptr.isNullPointer()) {
+      if (CapVal.getInt().getZExtValue() != N)
+        return Error(E);
+      QualType ElemTy =
+          Args[0]->getType()->getPointeeType().getUnqualifiedType();
+      for (unsigned I = 0; I != N; ++I) {
+        if (I && !HandleLValueArrayAdjustment(Info, E, Ptr, ElemTy, 1))
+          return false;
+        if (!handleAssignment(Info, E, Ptr, ElemTy,
+                              Gathered.getArrayInitializedElt(I)))
+          return false;
+      }
+    }
+    llvm::APSInt Count(llvm::APInt(Info.Ctx.getTypeSize(E->getType()), N),
+                       /*isUnsigned=*/true);
+    return DerivedSuccess(APValue(Count), E);
+  }
+
   // Evaluate the metafunction.
   APValue Result;
   const CXXMetafunctionExpr::ImplFn &Implementation = E->getImpl();
   if (Implementation(Result, Evaluator, Diagnoser, Thrower, AllowInjection,
                      E->getResultType(), Info.CurrentCall->CallRange, Args,
-                     Info.ContainingDecl)) {
+                     ContextDecl)) {
     // A throwing metafunction reports failure to its implementation caller,
     // but the evaluator must propagate the installed exception instead of
     // converting that report back into a hard constant-expression error.
@@ -11077,7 +12466,13 @@ bool LValueExprEvaluator::VisitDeclRefExpr(const DeclRefExpr *E) {
 bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
   CallStackFrame *Frame = nullptr;
   unsigned Version = 0;
-  if (VD->hasLocalStorage()) {
+  bool IsDoExprLocal =
+      Info.DoExprLocalVarDecls.contains(VD) ||
+      (VD->hasLocalStorage() && Info.EvaluatingSyntheticDoExprFrame &&
+       Info.CurrentCall && !Info.CurrentCall->Callee &&
+       isSyntheticDoExprDeclContext(VD->getDeclContext()));
+  bool IsMatchExprLocal = Info.MatchExprLocalVarDecls.contains(VD);
+  if (VD->hasLocalStorage() || IsDoExprLocal || IsMatchExprLocal) {
     // Only if a local variable was declared in the function currently being
     // evaluated, do we expect to be able to find its value in the current
     // frame. (Otherwise it was likely declared in an enclosing context and
@@ -11086,7 +12481,21 @@ bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
     // diagnostic)).
     CallStackFrame *CurrFrame = Info.CurrentCall;
     const DeclContext *VarCtx = skipExpansionStmts(VD->getDeclContext());
-    if (CurrFrame->Callee && CurrFrame->Callee->Equals(VarCtx)) {
+    if (IsDoExprLocal || IsMatchExprLocal) {
+      // Usually the current frame, but not always: an init-hoist declaration
+      // (`do [k = 5] { ... }`) outlives the body, so its storage is created in
+      // the frame that encloses the body rather than in the body's own. Walk
+      // out to the frame that actually holds it, and fall back to the current
+      // one so an as-yet-uninitialized variable still diagnoses as before.
+      Frame = CurrFrame;
+      for (CallStackFrame *F = CurrFrame; F; F = F->Caller) {
+        if (F->getCurrentTemporary(VD)) {
+          Frame = F;
+          break;
+        }
+      }
+      Version = Frame->getCurrentTemporaryVersion(VD);
+    } else if (CurrFrame->Callee && CurrFrame->Callee->Equals(VarCtx)) {
       // Function parameters are stored in some caller's frame. (Usually the
       // immediate caller, but for an inherited constructor they may be more
       // distant.)
@@ -11469,6 +12878,20 @@ bool LValueExprEvaluator::VisitCompoundAssignOperator(
     Success = false;
   }
 
+  // For reflection/token_sequence types, perform lvalue-to-rvalue conversion
+  // on the RHS since handleCompoundAssignment expects the actual value.
+  QualType RHSTy = CAO->getRHS()->getType();
+  if (Success && CAO->getRHS()->isGLValue() &&
+      (RHSTy->isReflectionType() || RHSTy->isTokenSequenceType())) {
+    LValue LV;
+    LV.setFrom(Info.Ctx, RHS);
+    if (!handleLValueToRValueConversion(Info, CAO->getRHS(), RHSTy, LV, RHS)) {
+      if (!Info.noteFailure())
+        return false;
+      Success = false;
+    }
+  }
+
   // The overall lvalue result is the result of evaluating the LHS.
   if (!this->Visit(CAO->getLHS()) || !Success)
     return false;
@@ -11718,6 +13141,103 @@ public:
     return true;
   }
 
+  bool VisitCXXBuiltinStringizeExpr(const CXXBuiltinStringizeExpr *E) {
+    // Evaluate the token_sequence operand (as a subexpression of the
+    // current evaluation, not as a top-level entry with a leak check).
+    APValue Operand;
+    if (!EvaluateOperandAsRValue(Info, E->getOperand(), Operand))
+      return false;
+
+    if (!Operand.isTokenSequence()) {
+      Info.FFDiag(E->getOperand()->getExprLoc());
+      return false;
+    }
+
+    TokenSequenceData TSD = Operand.getTokenSequence();
+
+    // Convert tokens to string, preserving whitespace using Token::hasLeadingSpace().
+    std::string ResultStr;
+    llvm::raw_string_ostream OS(ResultStr);
+    PrintingPolicy Policy(Info.Ctx.getLangOpts());
+    // Pretty-print an interpolated expression: a resolved value (a
+    // ConstantExpr carrying its result) by that value, a macro argument
+    // through its opaque value to the argument as written.
+    auto PrintExpr = [&](const Expr *Ex) {
+      if (const auto *CE = dyn_cast<ConstantExpr>(Ex);
+          CE && CE->hasAPValueResult()) {
+        CE->getAPValueResult().printPretty(OS, Info.Ctx, CE->getType());
+        return;
+      }
+      if (const auto *OVE = dyn_cast<OpaqueValueExpr>(Ex))
+        if (const Expr *Src = OVE->getSourceExpr())
+          Ex = Src;
+      Ex->printPretty(OS, nullptr, Policy);
+    };
+    bool IsFirst = true;
+    for (const Token &Tok : TSD) {
+      // Add space if this token had leading space (preserves original spacing).
+      if (!IsFirst && Tok.hasLeadingSpace())
+        ResultStr += ' ';
+      IsFirst = false;
+
+      // Get the token's text representation. Annotation tokens (interpolated
+      // types, expressions, templates, declaration descriptions) render as
+      // source-like text -- stringize exists for humans to read.
+      if (Tok.is(tok::annot_typename)) {
+        QualType::getFromOpaquePtr(Tok.getAnnotationValue()).print(OS, Policy);
+      } else if (Tok.isOneOf(tok::annot_primary_expr,
+                             tok::annot_token_seq_expr)) {
+        // An interpolated argument or value. (A resolved *value*
+        // interpolation keeps the annot_token_seq_expr kind, only its
+        // annotation value changes; an interpolation belonging to a nested,
+        // not-yet-evaluated literal is raw tokens, not an annotation.)
+        PrintExpr(static_cast<const Expr *>(Tok.getAnnotationValue()));
+      } else if (Tok.is(tok::annot_template_name)) {
+        TemplateName::getFromVoidPointer(Tok.getAnnotationValue())
+            .print(OS, Policy);
+      } else if (Tok.is(tok::annot_decl_spec)) {
+        const auto *FDS =
+            static_cast<const FunctionDeclSpec *>(Tok.getAnnotationValue());
+        OS << "<declaration of '" << FDS->Source->getQualifiedNameAsString()
+           << "'>";
+      } else if (Tok.is(tok::annot_template_param_spec)) {
+        const auto *TPS = static_cast<const TemplateParamListSpec *>(
+            Tok.getAnnotationValue());
+        OS << "<template parameters of '"
+           << TPS->Spec->Source->getQualifiedNameAsString() << "'>";
+      } else if (Tok.isAnnotation()) {
+        OS << "<annotation>";
+      } else if (Tok.isLiteral() && Tok.getLiteralData()) {
+        ResultStr.append(Tok.getLiteralData(), Tok.getLength());
+      } else if (const IdentifierInfo *II = Tok.getIdentifierInfo()) {
+        ResultStr += II->getName();
+      } else if (const char *Sp = tok::getPunctuatorSpelling(Tok.getKind())) {
+        ResultStr += Sp;
+      } else if (Tok.is(tok::unknown) && Tok.getLength() == 1 &&
+                 Tok.getLocation().isValid()) {
+        // The '\' of an interpolation belonging to a nested literal lexes as
+        // a single-character unknown token; spell it from the source.
+        ResultStr += *Info.Ctx.getSourceManager().getCharacterData(
+            Tok.getLocation());
+      }
+    }
+
+    // Create a string literal with the result.
+    QualType CharTy = Info.Ctx.CharTy.withConst();
+    APInt Size(Info.Ctx.getTypeSize(Info.Ctx.getSizeType()),
+               ResultStr.size() + 1);
+    QualType ArrayTy = Info.Ctx.getConstantArrayType(
+        CharTy, Size, nullptr, ArraySizeModifier::Normal, 0);
+
+    StringLiteral *SL =
+        StringLiteral::Create(Info.Ctx, ResultStr, StringLiteralKind::Ordinary,
+                              /*Pascal*/ false, ArrayTy, E->getBeginLoc());
+
+    evaluateLValue(SL, Result);
+    Result.addArray(Info, E, cast<ConstantArrayType>(ArrayTy));
+    return true;
+  }
+
   // FIXME: Missing: @protocol, @selector
 };
 } // end anonymous namespace
@@ -11810,6 +13330,9 @@ bool PointerExprEvaluator::VisitCastExpr(const CastExpr *E) {
   case CK_AnyPointerToBlockPointerCast:
   case CK_AddressSpaceConversion:
     if (!Visit(SubExpr))
+      return false;
+    // A tagged pointer can only be converted to another void pointer type.
+    if (Result.isTagged() && !E->getType()->isVoidPointerType() && !Result.checkNotTagged(Info, E))
       return false;
     if (E->getType()->isFunctionPointerType() ||
         SubExpr->getType()->isFunctionPointerType()) {
@@ -12028,6 +13551,36 @@ static CharUnits getBaseAlignment(EvalInfo &Info, const LValue &Value) {
   return GetAlignOfType(Info.Ctx, Value.Base.getTypeInfoType(), UETT_AlignOf);
 }
 
+/// The pointer tagging builtins (P3125R6) work on the low bits of a pointer that are zero because of the alignment
+/// of the object the pointer points into. A tagged pointer is its untagged pointer plus the tag as a byte offset,
+/// which is also what it is at run time; the subobject designator is kept so that stripping the tag restores it.
+static bool getPointerTagBits(EvalInfo &Info, const Expr *E, uint64_t &Bits) {
+  APSInt Value;
+  if (!EvaluateInteger(E, Value, Info))
+    return false;
+  if (Value.isNegative() || Value.getActiveBits() > 5 || Value.getZExtValue() > 16) {
+    Info.FFDiag(E, diag::note_constexpr_pointer_tag_bits) << Value;
+    return false;
+  }
+  Bits = Value.getZExtValue();
+  return true;
+}
+
+/// Is the object P points into aligned enough to hold Bits tag bits at every address of it?
+static bool checkPointerTagBaseAlignment(EvalInfo &Info, const Expr *E, const LValue &P, uint64_t Bits) {
+  if (!P.Base)
+    return true; // a null pointer or an integer value: its low bits are what they are
+  CharUnits BaseAlign;
+  if (P.Base.is<DynamicAllocLValue>())
+    BaseAlign = Info.Ctx.getTypeAlignInChars(P.Base.getDynamicAllocType());
+  else
+    BaseAlign = getBaseAlignment(Info, P);
+  if (BaseAlign.getQuantity() >= (int64_t(1) << Bits))
+    return true;
+  Info.FFDiag(E, diag::note_constexpr_pointer_tag_alignment) << unsigned(Bits) << BaseAlign.getQuantity();
+  return false;
+}
+
 /// Evaluate the value of the alignment argument to __builtin_align_{up,down},
 /// __builtin_is_aligned and __builtin_assume_aligned.
 static bool getAlignmentArgument(const Expr *E, QualType ForType,
@@ -12166,6 +13719,8 @@ bool PointerExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
     // behavior is non-constant.
     if (!evaluatePointer(E->getArg(0), Result))
       return false;
+    if (!Result.checkNotTagged(Info, E->getArg(0)))
+      return false;
 
     LValue OffsetResult(Result);
     APSInt Alignment;
@@ -12215,6 +13770,8 @@ bool PointerExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
   case Builtin::BI__builtin_align_down: {
     if (!evaluatePointer(E->getArg(0), Result))
       return false;
+    if (!Result.checkNotTagged(Info, E->getArg(0)))
+      return false;
     APSInt Alignment;
     if (!getAlignmentArgument(E->getArg(1), E->getArg(0)->getType(), Info,
                               Alignment))
@@ -12247,6 +13804,47 @@ bool PointerExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
     Info.FFDiag(E->getArg(0), diag::note_constexpr_alignment_adjust)
         << Alignment;
     return false;
+  }
+  case Builtin::BI__builtin_pointer_tag_insert: {
+    uint64_t Bits;
+    APSInt Tag;
+    if (!evaluatePointer(E->getArg(0), Result) || !EvaluateInteger(E->getArg(1), Tag, Info) ||
+        !getPointerTagBits(Info, E->getArg(2), Bits))
+      return false;
+    if (Tag.isNegative() || Tag.getActiveBits() > Bits) {
+      Info.FFDiag(E->getArg(1), diag::note_constexpr_pointer_tag_value) << Tag << unsigned(Bits);
+      return false;
+    }
+    if (!checkPointerTagBaseAlignment(Info, E->getArg(0), Result, Bits))
+      return false;
+    if (Result.Designator.isOnePastTheEnd() && !Result.Designator.Invalid) {
+      Info.FFDiag(E->getArg(0), diag::note_constexpr_pointer_tag_past_end);
+      return false;
+    }
+    uint64_t Mask = (uint64_t(1) << Bits) - 1;
+    if (Result.isTagged() || (uint64_t(Result.Offset.getQuantity()) & Mask) != 0) {
+      Info.FFDiag(E->getArg(0), diag::note_constexpr_pointer_tag_unaligned) << (int64_t(1) << Bits);
+      return false;
+    }
+    // The tag is kept beside the offset and the designator of the untagged pointer, so that it can be taken off
+    // again, and so that the pointer cannot be used to access an object.
+    Result.PtrTag = unsigned(Tag.getZExtValue());
+    if (Result.PtrTag)
+      Result.IsNullPtr = false;
+    return true;
+  }
+  case Builtin::BI__builtin_pointer_tag_strip: {
+    uint64_t Bits;
+    if (!evaluatePointer(E->getArg(0), Result) || !getPointerTagBits(Info, E->getArg(1), Bits))
+      return false;
+    if (!checkPointerTagBaseAlignment(Info, E->getArg(0), Result, Bits))
+      return false;
+    uint64_t Mask = (uint64_t(1) << Bits) - 1;
+    Result.Offset -= CharUnits::fromQuantity(int64_t(uint64_t(Result.Offset.getQuantity()) & Mask));
+    Result.PtrTag &= ~unsigned(Mask);
+    if (!Result.Base && Result.Offset.isZero() && !Result.PtrTag)
+      Result.IsNullPtr = true;
+    return true;
   }
   case Builtin::BI__builtin_operator_new:
     return HandleOperatorNewCall(Info, E, Result);
@@ -12888,28 +14486,36 @@ bool MemberPointerExprEvaluator::VisitUnaryAddrOf(const UnaryOperator *E) {
 //===----------------------------------------------------------------------===//
 
 namespace {
-  class RecordExprEvaluator
-  : public ExprEvaluatorBase<RecordExprEvaluator> {
-    const LValue &This;
-    APValue &Result;
-  public:
+// A token literal's tokens, interpolations resolved (see
+// ReflectionEvaluator::VisitCXXTokenSequenceExpr).
+static bool EvaluateTokenLiteral(EvalInfo &Info, const CXXTokenSequenceExpr *E,
+                                 APValue &Result);
 
-    RecordExprEvaluator(EvalInfo &info, const LValue &This, APValue &Result)
+class RecordExprEvaluator : public ExprEvaluatorBase<RecordExprEvaluator> {
+  const LValue &This;
+  APValue &Result;
+
+public:
+  RecordExprEvaluator(EvalInfo &info, const LValue &This, APValue &Result)
       : ExprEvaluatorBaseTy(info), This(This), Result(Result) {}
 
-    bool Success(const APValue &V, const Expr *E) {
-      Result = V;
-      return true;
-    }
-    bool ZeroInitialization(const Expr *E) {
-      return ZeroInitialization(E, E->getType());
-    }
-    bool ZeroInitialization(const Expr *E, QualType T);
+  bool Success(const APValue &V, const Expr *E) {
+    Result = V;
+    return true;
+  }
+  bool ZeroInitialization(const Expr *E) {
+    return ZeroInitialization(E, E->getType());
+  }
+  bool ZeroInitialization(const Expr *E, QualType T);
 
     bool VisitCallExpr(const CallExpr *E) {
       return handleCallExpr(E, Result, &This);
     }
+    bool VisitDoExpr(const DoExpr *E) {
+      return handleDoExpr(E, Result, &This);
+    }
     bool VisitCastExpr(const CastExpr *E);
+    bool VisitCXXTokenSequenceExpr(const CXXTokenSequenceExpr *E);
     bool VisitInitListExpr(const InitListExpr *E);
     bool VisitCXXConstructExpr(const CXXConstructExpr *E) {
       return VisitCXXConstructExpr(E, E->getType());
@@ -13009,10 +14615,35 @@ bool RecordExprEvaluator::ZeroInitialization(const Expr *E, QualType T) {
   return HandleClassZeroInitialization(Info, E, RD, This, Result);
 }
 
+bool RecordExprEvaluator::VisitCXXTokenSequenceExpr(
+    const CXXTokenSequenceExpr *E) {
+  // A token literal: its tokens, interpolations resolved, in a
+  // std::meta::token_sequence.
+  APValue TS;
+  if (!EvaluateTokenLiteral(Info, E, TS) || !TS.isTokenSequence())
+    return false;
+  if (!MakeTokenSequenceValue(Info, E->getType(), TS.getTokenSequence(),
+                              Result))
+    return Error(E);
+  return true;
+}
+
 bool RecordExprEvaluator::VisitCastExpr(const CastExpr *E) {
   switch (E->getCastKind()) {
   default:
     return ExprEvaluatorBaseTy::VisitCastExpr(E);
+
+  case CK_TokenArrayToSequence: {
+    // A std::meta::token_sequence holding the compiler's token array.
+    APValue TS;
+    if (!Evaluate(TS, Info, E->getSubExpr()))
+      return false;
+    if (!TS.isTokenSequence() ||
+        !MakeTokenSequenceValue(Info, E->getType(), TS.getTokenSequence(),
+                                Result))
+      return Error(E);
+    return true;
+  }
 
   case CK_ConstructorConversion:
     return Visit(E->getSubExpr());
@@ -17097,6 +18728,8 @@ public:
   bool VisitConceptSpecializationExpr(const ConceptSpecializationExpr *E);
   bool VisitRequiresExpr(const RequiresExpr *E);
   // FIXME: Missing: array subscript of vector, member of vector
+
+  bool VisitMatchTestExpr(const MatchTestExpr *E);
 };
 
 class FixedPointExprEvaluator
@@ -17307,6 +18940,7 @@ GCCTypeClass EvaluateBuiltinClassifyType(QualType T,
       return GCCTypeClass::None;
 
     case BuiltinType::NullPtr:
+    case BuiltinType::NoReturn:
 
     case BuiltinType::ObjCId:
     case BuiltinType::ObjCClass:
@@ -17818,6 +19452,10 @@ static bool tryEvaluateBuiltinObjectSize(const Expr *E, unsigned Type,
       return false;
   }
 
+  // A tagged pointer is an invalid pointer value: the object it points into is unknown.
+  if (LVal.isTagged())
+    return false;
+
   // If we point to before the start of the object, there are no accessible
   // bytes.
   if (LVal.getLValueOffset().isNegative()) {
@@ -17962,6 +19600,17 @@ bool IntExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
     return Success(Layout.size().getQuantity(), E);
   }
 
+  case Builtin::BI__builtin_pointer_tag_get: {
+    uint64_t Bits;
+    LValue Ptr;
+    if (!EvaluatePointer(E->getArg(0), Ptr, Info) || !getPointerTagBits(Info, E->getArg(1), Bits))
+      return false;
+    if (!checkPointerTagBaseAlignment(Info, E->getArg(0), Ptr, Bits))
+      return false;
+    uint64_t Mask = (uint64_t(1) << Bits) - 1;
+    return Success((uint64_t(Ptr.Offset.getQuantity()) + Ptr.PtrTag) & Mask, E);
+  }
+
   case Builtin::BI__builtin_is_aligned: {
     APValue Src;
     APSInt Alignment;
@@ -17971,6 +19620,8 @@ bool IntExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
       // If we evaluated a pointer, check the minimum known alignment.
       LValue Ptr;
       Ptr.setFrom(Info.Ctx, Src);
+      if (!Ptr.checkNotTagged(Info, E->getArg(0)))
+        return false;
       CharUnits BaseAlignment = getBaseAlignment(Info, Ptr);
       CharUnits PtrAlign = BaseAlignment.alignmentAtOffset(Ptr.Offset);
       // We can return true if the known alignment at the computed offset is
@@ -20040,6 +21691,10 @@ EvaluateComparisonBinaryOperator(EvalInfo &Info, const BinaryOperator *E,
     if (!EvaluatePointer(E->getRHS(), RHSValue, Info) || !LHSOK)
       return false;
 
+    // Tagged pointers are invalid pointer values: they can be compared for equality only.
+    if (!IsEquality && (!LHSValue.checkNotTagged(Info, E) || !RHSValue.checkNotTagged(Info, E)))
+      return false;
+
     // Reject differing bases from the normal codepath; we special-case
     // comparisons to null.
     if (!HasSameBase(LHSValue, RHSValue)) {
@@ -20165,8 +21820,8 @@ EvaluateComparisonBinaryOperator(EvalInfo &Info, const BinaryOperator *E,
     // The comparison here must be unsigned, and performed with the same
     // width as the pointer.
     unsigned PtrSize = Info.Ctx.getTypeSize(LHSTy);
-    uint64_t CompareLHS = LHSOffset.getQuantity();
-    uint64_t CompareRHS = RHSOffset.getQuantity();
+    uint64_t CompareLHS = LHSOffset.getQuantity() + LHSValue.PtrTag;
+    uint64_t CompareRHS = RHSOffset.getQuantity() + RHSValue.PtrTag;
     assert(PtrSize <= 64 && "Unexpected pointer width");
     uint64_t Mask = ~0ULL >> (64 - PtrSize);
     CompareLHS &= Mask;
@@ -20256,7 +21911,9 @@ EvaluateComparisonBinaryOperator(EvalInfo &Info, const BinaryOperator *E,
     return Success(CmpResult::Equal, E);
   }
 
-  if (LHSTy->isReflectionType() && RHSTy->isReflectionType()) {
+  if ((LHSTy->isReflectionType() && RHSTy->isReflectionType()) ||
+      ((LHSTy->isTokenSequenceType() || LHSTy->isMetaTokenType()) &&
+       (RHSTy->isTokenSequenceType() || RHSTy->isMetaTokenType()))) {
     APValue LHSValue, RHSValue;
     llvm::FoldingSetNodeID LID, RID;
     if (!Evaluate(LHSValue, Info, E->getLHS()))
@@ -20330,6 +21987,16 @@ bool IntExprEvaluator::VisitBinaryOperator(const BinaryOperator *E) {
       return false;
   }
 
+  // A pattern-first condition can introduce declarations used by later
+  // operands. When a condition is checked outside an evaluated function call,
+  // keep one synthetic frame alive for the entire short-circuit chain rather
+  // than creating and destroying one for each CaseConditionExpr.
+  std::optional<CallStackFrame> CaseConditionFrame;
+  if (MatchTestExpr::containsCaseCondition(E) &&
+      Info.CurrentCall == &Info.BottomFrame)
+    CaseConditionFrame.emplace(Info, E->getSourceRange(), /*Callee=*/nullptr,
+                               /*This=*/nullptr, /*CallExpr=*/E, CallRef());
+
   if (DataRecursiveIntBinOpEvaluator::shouldEnqueue(E))
     return DataRecursiveIntBinOpEvaluator(*this, Result).Traverse(E);
 
@@ -20380,6 +22047,9 @@ bool IntExprEvaluator::VisitBinaryOperator(const BinaryOperator *E) {
       return false;
 
     if (!EvaluatePointer(E->getRHS(), RHSValue, Info) || !LHSOK)
+      return false;
+
+    if (!LHSValue.checkNotTagged(Info, E) || !RHSValue.checkNotTagged(Info, E))
       return false;
 
     // Reject differing bases from the normal codepath; we special-case
@@ -20776,6 +22446,7 @@ bool IntExprEvaluator::VisitCastExpr(const CastExpr *E) {
   case CK_NoOp:
   case CK_LValueToRValueBitCast:
   case CK_HLSLArrayRValue:
+  case CK_NoReturnToAny:
     return ExprEvaluatorBaseTy::VisitCastExpr(E);
 
   case CK_MemberPointerToBoolean:
@@ -20992,6 +22663,358 @@ bool IntExprEvaluator::VisitConceptSpecializationExpr(
 
 bool IntExprEvaluator::VisitRequiresExpr(const RequiresExpr *E) {
   return Success(E->isSatisfied(), E);
+}
+
+static bool
+EvaluateProjectionCondition(const MatchProjection *Projection, EvalInfo &Info,
+                            MatchProjectionEvaluationCache *ProjectionCache) {
+  if (!Projection)
+    return false;
+  if (ProjectionCache && !ProjectionCache->Conditions.insert(Projection).second)
+    return true;
+  auto EvaluateOnce = [&](const VarDecl *D) {
+    if (D)
+      Info.MatchExprLocalVarDecls.insert(D);
+    return !D ||
+           (ProjectionCache &&
+            !ProjectionCache->Declarations.insert(D).second) ||
+           EvaluateDecl(Info, D);
+  };
+  if (!EvaluateOnce(Projection->getHoldingVar()) ||
+      !EvaluateOnce(Projection->getIntermediateVar()) ||
+      !EvaluateOnce(Projection->getConditionVar()))
+    return false;
+  return true;
+}
+
+static bool
+EvaluateProjectionValue(const MatchProjection *Projection, EvalInfo &Info,
+                        MatchProjectionEvaluationCache *ProjectionCache) {
+  if (ProjectionCache && !ProjectionCache->Values.insert(Projection).second)
+    return true;
+  if (const VarDecl *D = Projection->getProjectedVar();
+      D &&
+      (!ProjectionCache || ProjectionCache->Declarations.insert(D).second)) {
+    Info.MatchExprLocalVarDecls.insert(D);
+    if (!EvaluateDecl(Info, D))
+      return false;
+  }
+  if (!Projection->getProjectedVar() && Projection->getProjectedExpr() &&
+      Projection->getProjectedExpr()->getType()->isVoidType() &&
+      !EvaluateIgnoredValue(Info, Projection->getProjectedExpr()))
+    return false;
+  if (const DecompositionDecl *D = Projection->getDecomposedDecl(); D) {
+    Info.MatchExprLocalVarDecls.insert(D);
+    if (!EvaluateDecl(Info, D, /*EvaluateConditionDecl=*/true))
+      return false;
+  }
+  return true;
+}
+
+static bool
+EvaluateMatchPattern(const MatchPattern *Pattern,
+                     const MatchPatternInstantiation *Instantiation,
+                     bool &Result, EvalInfo &Info,
+                     MatchProjectionEvaluationCache *ProjectionCache,
+                     std::optional<BlockScopeRAII> *DeclarationScope) {
+  switch (Pattern->getMatchPatternClass()) {
+  case MatchPattern::WildcardPatternClass:
+    return Result = true;
+  case MatchPattern::DeclarationPatternClass: {
+    const auto *P = static_cast<const DeclarationPattern *>(Pattern);
+    const MatchPatternInfo *PatternInfo = Instantiation->find(P);
+    const MatchProjection *Projection =
+        PatternInfo ? PatternInfo->Projection : nullptr;
+    if (!Projection || Projection->getKind() != MatchProjection::CastProjection)
+      return Result = true;
+    return EvaluateProjectionCondition(Projection, Info, ProjectionCache) &&
+           EvaluateAsBooleanCondition(Projection->getConditionExpr(), Result,
+                                      Info);
+  }
+  case MatchPattern::TypePatternClass: {
+    const auto *P = static_cast<const TypePattern *>(Pattern);
+    const MatchPatternInfo *PatternInfo = Instantiation->find(P);
+    assert(PatternInfo && "expected type pattern state");
+    if (const MatchProjection *Projection = PatternInfo->Projection)
+      return EvaluateProjectionCondition(Projection, Info, ProjectionCache) &&
+             EvaluateAsBooleanCondition(Projection->getConditionExpr(), Result,
+                                        Info);
+    Result = PatternInfo->TypePatternMatches;
+    return true;
+  }
+  case MatchPattern::ExpressionPatternClass: {
+    const auto *P = static_cast<const ExpressionPattern *>(Pattern);
+    const MatchPatternInfo *PatternInfo = Instantiation->find(P);
+    assert(PatternInfo && PatternInfo->Condition &&
+           "expected expression pattern state");
+    return (!PatternInfo->Projection ||
+            EvaluateProjectionCondition(PatternInfo->Projection, Info,
+                                        ProjectionCache)) &&
+           EvaluateAsBooleanCondition(PatternInfo->Condition, Result, Info);
+  }
+  case MatchPattern::ParenPatternClass: {
+    const auto *P = static_cast<const ParenPattern *>(Pattern);
+    return EvaluateMatchPattern(P->getSubPattern(), Instantiation, Result, Info,
+                                ProjectionCache, DeclarationScope);
+  }
+  case MatchPattern::OrPatternClass: {
+    const auto *P = static_cast<const OrPattern *>(Pattern);
+    Result = false;
+    for (auto [I, Alternative] : llvm::enumerate(P->alternatives())) {
+      if (!Instantiation->isViableOrAlternative(P, I))
+        continue;
+      if (!EvaluateMatchPattern(Alternative, Instantiation, Result, Info,
+                                ProjectionCache, DeclarationScope))
+        return false;
+      if (Result)
+        return true;
+    }
+    return true;
+  }
+  case MatchPattern::AlternativePatternClass: {
+    const auto *P = static_cast<const AlternativePattern *>(Pattern);
+    const MatchPatternInfo *PatternInfo = Instantiation->find(P);
+    if (!PatternInfo || !PatternInfo->Projection)
+      return false;
+    return EvaluateProjectionCondition(PatternInfo->Projection, Info,
+                                       ProjectionCache) &&
+           EvaluateAsBooleanCondition(
+               PatternInfo->Projection->getConditionExpr(), Result, Info) &&
+           (!Result ||
+            (EvaluateProjectionValue(PatternInfo->Projection, Info,
+                                     ProjectionCache) &&
+             ([&] {
+               if (const TypePattern *Selector = P->getTypeSelector()) {
+                 const MatchPatternInfo *SelectorInfo =
+                     Instantiation->find(Selector);
+                 if (SelectorInfo && SelectorInfo->Projection) {
+                   if (!EvaluateMatchPattern(Selector, Instantiation, Result,
+                                             Info, ProjectionCache,
+                                             DeclarationScope))
+                     return false;
+                   if (!Result)
+                     return true;
+                   if (!EvaluateProjectionValue(SelectorInfo->Projection, Info,
+                                                ProjectionCache))
+                     return false;
+                 }
+               }
+               return !P->getSubPattern() ||
+                      EvaluateMatchPattern(P->getSubPattern(), Instantiation,
+                                           Result, Info, ProjectionCache,
+                                           DeclarationScope);
+             })()));
+  }
+  case MatchPattern::DecompositionPatternClass: {
+    const auto *P = static_cast<const DecompositionPattern *>(Pattern);
+    const MatchPatternInfo *PatternInfo = Instantiation->find(P);
+    assert(PatternInfo && PatternInfo->Projection &&
+           "expected decomposition pattern state");
+    if (!EvaluateProjectionValue(PatternInfo->Projection, Info,
+                                 ProjectionCache))
+      return false;
+    Result = true;
+    for (const MatchPattern *C : Instantiation->getDecompositionPatterns(P)) {
+      if (!EvaluateMatchPattern(C, Instantiation, Result, Info, ProjectionCache,
+                                DeclarationScope)) {
+        return false;
+      }
+      if (!Result) {
+        break;
+      }
+    }
+    return true;
+  }
+  }
+  llvm_unreachable("unknown match pattern kind");
+}
+
+static bool
+hasMatchPatternDeclarations(const MatchPattern *Pattern,
+                            const MatchPatternInstantiation *Instantiation) {
+  if (isa<DeclarationPattern>(Pattern))
+    return true;
+  if (const auto *Or = dyn_cast<OrPattern>(Pattern))
+    return llvm::any_of(llvm::enumerate(Or->alternatives()),
+                        [&](auto IndexedAlternative) {
+                          return Instantiation->isViableOrAlternative(
+                                     Or, IndexedAlternative.index()) &&
+                                 hasMatchPatternDeclarations(
+                                     IndexedAlternative.value(), Instantiation);
+                        });
+  if (const auto *Decomposition = dyn_cast<DecompositionPattern>(Pattern))
+    return llvm::any_of(Instantiation->getDecompositionPatterns(Decomposition),
+                        [&](const MatchPattern *Child) {
+                          return hasMatchPatternDeclarations(Child,
+                                                             Instantiation);
+                        });
+  return llvm::any_of(Pattern->children(), [&](const MatchPattern *Child) {
+    return hasMatchPatternDeclarations(Child, Instantiation);
+  });
+}
+
+static bool EvaluatePatternDeclarations(
+    const MatchPattern *Pattern, const MatchPatternInstantiation *Instantiation,
+    EvalInfo &Info, MatchProjectionEvaluationCache &ProjectionCache) {
+  if (const auto *P = dyn_cast<DeclarationPattern>(Pattern)) {
+    const MatchPatternInfo *PatternInfo = Instantiation->find(P);
+    if (PatternInfo && PatternInfo->Projection &&
+        PatternInfo->Projection->getKind() ==
+            MatchProjection::DecompositionProjection) {
+      const auto *Declaration = cast<DecompositionDecl>(P->getDeclaration());
+      if (Declaration != PatternInfo->Projection->getDecomposedDecl())
+        for (BindingDecl *Binding : Declaration->bindings())
+          if (DecompositionDecl *Nested = Binding->getNestedDecomposition())
+            if (!EvaluateDecompositionDeclInit(Info, Nested))
+              return false;
+      return true;
+    }
+    const VarDecl *Declaration = P->getDeclaration();
+    if (!ProjectionCache.Declarations.insert(Declaration).second)
+      return true;
+    Info.MatchExprLocalVarDecls.insert(Declaration);
+    if (!EvaluateDecl(Info, Declaration))
+      return false;
+    if (const auto *Decomposition = dyn_cast<DecompositionDecl>(Declaration))
+      for (const BindingDecl *Binding : Decomposition->all_bindings())
+        if (const VarDecl *HoldingVar = Binding->getHoldingVar())
+          if (ProjectionCache.Declarations.insert(HoldingVar).second &&
+              !EvaluateDecl(Info, HoldingVar))
+            return false;
+    return true;
+  }
+  if (const auto *Or = dyn_cast<OrPattern>(Pattern)) {
+    for (auto [I, Alternative] : llvm::enumerate(Or->alternatives()))
+      if (Instantiation->isViableOrAlternative(Or, I) &&
+          !EvaluatePatternDeclarations(Alternative, Instantiation, Info,
+                                       ProjectionCache))
+        return false;
+    return true;
+  }
+  if (const auto *Decomposition = dyn_cast<DecompositionPattern>(Pattern)) {
+    for (const MatchPattern *Child :
+         Instantiation->getDecompositionPatterns(Decomposition))
+      if (!EvaluatePatternDeclarations(Child, Instantiation, Info,
+                                       ProjectionCache))
+        return false;
+  } else {
+    for (const MatchPattern *Child : Pattern->children())
+      if (!EvaluatePatternDeclarations(Child, Instantiation, Info,
+                                       ProjectionCache))
+        return false;
+  }
+  return true;
+}
+
+static bool EvaluateSharedDeclarationProjections(
+    const MatchPattern *Pattern, const MatchPatternInstantiation *Instantiation,
+    EvalInfo &Info, MatchProjectionEvaluationCache &ProjectionCache) {
+  if (const auto *P = dyn_cast<DeclarationPattern>(Pattern)) {
+    const MatchPatternInfo *PatternInfo = Instantiation->find(P);
+    const MatchProjection *Projection =
+        PatternInfo ? PatternInfo->Projection : nullptr;
+    return !Projection ||
+           EvaluateProjectionValue(Projection, Info, &ProjectionCache);
+  }
+  if (isa<TypePattern>(Pattern))
+    return true;
+  if (const auto *Or = dyn_cast<OrPattern>(Pattern)) {
+    for (auto [I, Alternative] : llvm::enumerate(Or->alternatives()))
+      if (Instantiation->isViableOrAlternative(Or, I) &&
+          !EvaluateSharedDeclarationProjections(Alternative, Instantiation,
+                                                Info, ProjectionCache))
+        return false;
+    return true;
+  }
+  if (const auto *Decomposition = dyn_cast<DecompositionPattern>(Pattern)) {
+    for (const MatchPattern *Child :
+         Instantiation->getDecompositionPatterns(Decomposition))
+      if (!EvaluateSharedDeclarationProjections(Child, Instantiation, Info,
+                                                ProjectionCache))
+        return false;
+  } else {
+    for (const MatchPattern *Child : Pattern->children())
+      if (!EvaluateSharedDeclarationProjections(Child, Instantiation, Info,
+                                                ProjectionCache))
+        return false;
+  }
+  return true;
+}
+
+bool IntExprEvaluator::VisitMatchTestExpr(const MatchTestExpr *E) {
+  // Keep full-expression objects in the enclosing frame, even at namespace
+  // scope, rather than in a frame that ends with the test.
+  BlockScopeRAII MatchScope(Info);
+  auto Finish = [&](bool Success) {
+    if (!Success)
+      return false;
+    MatchScope.extendToFullExpression();
+    return true;
+  };
+
+  ArrayRef<MatchTestInstantiation> Instantiations = E->getInstantiations();
+  bool HasNoCandidates =
+      E->hasSemanticInstantiations() && Instantiations.empty();
+  if (const VarDecl *VD = E->getHoldingVar()) {
+    Info.MatchExprLocalVarDecls.insert(VD);
+    if (!EvaluateDecl(Info, VD))
+      return false;
+  } else if ((HasNoCandidates || E->getSubject()->getType()->isVoidType()) &&
+             !EvaluateIgnoredValue(Info, E->getSubject())) {
+    return false;
+  }
+  if (HasNoCandidates)
+    return Finish(Success(false, E));
+
+  MatchTestInstantiation DirectInstantiation = E->getDirectInstantiation();
+  if (Instantiations.empty())
+    Instantiations = DirectInstantiation;
+
+  MatchProjectionEvaluationCache ProjectionCache;
+  for (const MatchTestInstantiation &Instantiation : Instantiations) {
+    std::optional<BlockScopeRAII> Scope;
+    bool Result;
+    if (!EvaluateMatchPattern(Instantiation.Pattern,
+                              Instantiation.PatternInstantiation, Result, Info,
+                              &ProjectionCache, &Scope))
+      return false;
+    bool PatternSelected = Result;
+    if (Result && !Scope)
+      Scope.emplace(Info);
+    if (Result && !EvaluateSharedDeclarationProjections(
+                      Instantiation.Pattern, Instantiation.PatternInstantiation,
+                      Info, ProjectionCache))
+      return false;
+    if (Result && !EvaluatePatternDeclarations(
+                      Instantiation.Pattern, Instantiation.PatternInstantiation,
+                      Info, ProjectionCache))
+      return false;
+    if (Result && Instantiation.Guard.Init) {
+      APValue InitValue;
+      StmtResult InitResult = {InitValue, nullptr};
+      if (EvaluateStmt(InitResult, Info, Instantiation.Guard.Init) !=
+          ESR_Succeeded)
+        return false;
+    }
+    if (Result && Instantiation.Guard.Condition &&
+        !EvaluateCond(Info, Instantiation.Guard.ConditionVariable,
+                      Instantiation.Guard.Condition, Result))
+      return false;
+    if (Result && Instantiation.Condition) {
+      bool ContinuationMatched;
+      if (!EvaluateAsBooleanCondition(Instantiation.Condition,
+                                      ContinuationMatched, Info))
+        return false;
+      Result = ContinuationMatched;
+    }
+    if (Scope && (Result || !isa<CaseConditionExpr>(E)))
+      Scope->extendToFullExpression();
+    else if (Scope && !Scope->destroy())
+      return false;
+    if (PatternSelected)
+      return Finish(Success(Result, E));
+  }
+  return Finish(Success(false, E));
 }
 
 bool FixedPointExprEvaluator::VisitUnaryOperator(const UnaryOperator *E) {
@@ -22509,6 +24532,7 @@ bool ComplexExprEvaluator::VisitCastExpr(const CastExpr *E) {
   case CK_NoOp:
   case CK_LValueToRValueBitCast:
   case CK_HLSLArrayRValue:
+  case CK_NoReturnToAny:
     return ExprEvaluatorBaseTy::VisitCastExpr(E);
 
   case CK_Dependent:
@@ -23216,6 +25240,154 @@ static bool EvaluateAtomic(const Expr *E, const LValue *This, APValue &Result,
 
 namespace {
 bool EvaluateBuiltinStartLifetime(EvalInfo &Info, const CallExpr *E);
+/// Read a (pointer, length) string argument pair of __builtin_constexpr_diag
+/// through the evaluator's memory model, so string literals and constexpr
+/// arrays (including char8_t ones) work uniformly.
+static bool readConstexprDiagString(EvalInfo &Info, const Expr *PtrE,
+                                    const Expr *LenE,
+                                    SmallVectorImpl<char> &Out) {
+  APSInt Len;
+  if (!EvaluateInteger(LenE, Len, Info))
+    return false;
+  // Reject negative and absurd lengths outright rather than walking with a
+  // wrapped count (the library facade always passes a size_t, but the
+  // builtin is callable directly).
+  if (Len.isNegative() || Len.getActiveBits() > 20) {
+    Info.FFDiag(LenE);
+    return false;
+  }
+  uint64_t N = Len.getZExtValue();
+  LValue Ptr;
+  if (!EvaluatePointer(PtrE, Ptr, Info))
+    return false;
+  QualType CharTy = PtrE->getType()->getPointeeType();
+  for (uint64_t I = 0; I != N; ++I) {
+    APValue Char;
+    if (!handleLValueToRValueConversion(Info, PtrE, CharTy, Ptr, Char))
+      return false;
+    Out.push_back(static_cast<char>(Char.getInt().getExtValue()));
+    if (!HandleLValueArrayAdjustment(Info, PtrE, Ptr, CharTy, 1))
+      return false;
+  }
+  return true;
+}
+
+/// P2758 (std::constexpr_print_str / constexpr_warning_str /
+/// constexpr_error_str): emit a message during constant evaluation.
+/// Kinds: 0 = print (note), 1 = warning, 2 = error. A kind-2 call emits the
+/// error but remains a constant expression (the *program* is ill-formed) --
+/// except inside an expression-macro body, where it fails the evaluation so
+/// that the invocation produces no expansion and the macro invocation is an
+/// invalid expression (observable through a requires-expression during
+/// substitution).
+static bool EvaluateBuiltinConstexprDiag(EvalInfo &Info, const CallExpr *E) {
+  assert((E->getNumArgs() == 5 || E->getNumArgs() == 3) &&
+         "Sema checks the arity");
+
+  APSInt KindVal;
+  if (!EvaluateInteger(E->getArg(0), KindVal, Info))
+    return false;
+  SmallString<32> Tag;
+  SmallString<128> Msg;
+  if (E->getNumArgs() == 3) {
+    // (kind, tag, message), NUL-terminated strings: the form libstdc++ uses.
+    auto ReadCString = [&](const Expr *PtrE, SmallVectorImpl<char> &Out) {
+      LValue Ptr;
+      if (!EvaluatePointer(PtrE, Ptr, Info))
+        return false;
+      QualType CharTy = PtrE->getType()->getPointeeType();
+      for (uint64_t I = 0;; ++I) {
+        if (I > (1u << 20)) {
+          Info.FFDiag(PtrE);
+          return false;
+        }
+        APValue Char;
+        if (!handleLValueToRValueConversion(Info, PtrE, CharTy, Ptr, Char))
+          return false;
+        int64_t V = Char.getInt().getExtValue();
+        if (V == 0)
+          return true;
+        Out.push_back(static_cast<char>(V));
+        if (!HandleLValueArrayAdjustment(Info, PtrE, Ptr, CharTy, 1))
+          return false;
+      }
+    };
+    if (!ReadCString(E->getArg(1), Tag) || !ReadCString(E->getArg(2), Msg))
+      return false;
+  } else if (!readConstexprDiagString(Info, E->getArg(1), E->getArg(2), Tag) ||
+             !readConstexprDiagString(Info, E->getArg(3), E->getArg(4), Msg)) {
+    return false;
+  }
+
+  uint64_t Kind = KindVal.getZExtValue();
+  if (KindVal.isNegative() || Kind > 2) {
+    Info.FFDiag(E);
+    return false;
+  }
+  for (char C : Tag)
+    if (!isAsciiIdentifierContinue(C) && C != '-' && C != '=') {
+      Info.FFDiag(E, diag::note_constexpr_diag_bad_tag);
+      return false;
+    }
+
+  // Explicit failure of an expression macro: record the message as the
+  // reason the evaluation failed and produce no expansion.
+  if (Kind == 2 && Info.EvaluatingMacroBody) {
+    if (Tag.empty())
+      Info.FFDiag(E, diag::note_constexpr_message) << Msg.str();
+    else
+      Info.FFDiag(E, diag::note_constexpr_message_tag) << Tag.str()
+                                                       << Msg.str();
+    return false;
+  }
+
+  // Only a manifestly constant evaluation reports; speculative evaluations,
+  // constant folding of runtime expressions, and the potential-constant
+  // check of a constexpr function's definition all stay silent (and stay
+  // constant).
+  if (!Info.InConstantContext || Info.checkingPotentialConstantExpression() ||
+      Info.SpeculativeEvaluationDepth != 0)
+    return true;
+
+  DiagnosticsEngine &Diags = Info.Ctx.getDiagnostics();
+  // Report at the innermost frame that is in user code: the builtin call
+  // itself typically sits inside the library facade in a system header,
+  // where warnings would be suppressed and the location would be useless.
+  SourceLocation Loc = E->getExprLoc();
+  const SourceManager &SM = Info.Ctx.getSourceManager();
+  for (const CallStackFrame *F = Info.CurrentCall;
+       F && Loc.isValid() && SM.isInSystemHeader(Loc); F = F->Caller)
+    Loc = F->getCallRange().getBegin();
+  // A print is a free-standing note; make sure it is not suppressed as a
+  // note trailing an ignored diagnostic.
+  if (Kind == 0)
+    Diags.setLastDiagnosticIgnored(false);
+  switch (Kind) {
+  case 0:
+    if (Tag.empty())
+      Diags.Report(Loc, diag::note_constexpr_message) << Msg.str();
+    else
+      Diags.Report(Loc, diag::note_constexpr_message_tag) << Tag.str()
+                                                          << Msg.str();
+    break;
+  case 1:
+    if (Tag.empty())
+      Diags.Report(Loc, diag::warn_constexpr_message) << Msg.str();
+    else
+      Diags.Report(Loc, diag::warn_constexpr_message_tag) << Tag.str()
+                                                          << Msg.str();
+    break;
+  case 2:
+    if (Tag.empty())
+      Diags.Report(Loc, diag::err_constexpr_message) << Msg.str();
+    else
+      Diags.Report(Loc, diag::err_constexpr_message_tag) << Tag.str()
+                                                         << Msg.str();
+    break;
+  }
+  return true;
+}
+
 class VoidExprEvaluator
   : public ExprEvaluatorBase<VoidExprEvaluator> {
 public:
@@ -23267,6 +25439,8 @@ public:
       APValue Result;
       return ExprEvaluatorBaseTy::handleCallExpr(E, Result, nullptr);
     }
+    case Builtin::BI__builtin_constexpr_diag:
+      return EvaluateBuiltinConstexprDiag(Info, E);
 
     default:
       return false;
@@ -23274,8 +25448,338 @@ public:
   }
 
   bool VisitCXXDeleteExpr(const CXXDeleteExpr *E);
+  bool VisitCXXBuiltinInjectExpr(const CXXBuiltinInjectExpr *E);
+  bool VisitCXXBuiltinReportTokensExpr(const CXXBuiltinReportTokensExpr *E);
 };
 } // end anonymous namespace
+
+/// Evaluate \p SubExpr to an APValue rvalue. Sema is responsible for
+/// inserting any user-defined conversion to std::meta::info or
+/// std::meta::token_sequence at AST construction time, so this helper
+/// simply evaluates and applies lvalue-to-rvalue conversion if needed.
+// Evaluate an operand to its rvalue as a *subexpression* of the current
+// evaluation. (The file-level EvaluateAsRValue is a top-level entry point: it
+// ends with CheckMemoryLeaks, so calling it mid-evaluation reports every live
+// allocation -- e.g. a std::vector in the enclosing consteval function -- as a
+// leak.) All token-sequence and interpolation operands go through here.
+static bool EvaluateOperandAsRValue(EvalInfo &Info, const Expr *SubExpr,
+                                    APValue &Result) {
+  if (!::Evaluate(Result, Info, SubExpr))
+    return false;
+  if (SubExpr->isGLValue()) {
+    LValue LV;
+    LV.setFrom(Info.Ctx, Result);
+    if (!handleLValueToRValueConversion(Info, SubExpr, SubExpr->getType(),
+                                        LV, Result))
+      return false;
+  }
+  return true;
+}
+
+/// Extract a string from an argument expression, appending to Result.
+/// Handles four cases:
+/// 1. User-defined string types with size()/data() (when SizeCall is provided)
+/// 2. String literals and pointers/arrays to char
+/// 3. Char types (appended as single character)
+/// 4. Other integers (converted to decimal string)
+/// Returns false on error.
+static bool ExtractStringFromArg(EvalInfo &Info, Expr *Arg,
+                                 Expr *SizeCall, Expr *DataCall,
+                                 SmallVectorImpl<char> &Result) {
+  // User-defined string-like argument: Sema pre-built the size() and data()
+  // calls. Evaluate them inline against the current Info so that any
+  // function parameters in the surrounding call frame are visible.
+  if (SizeCall) {
+    assert(DataCall && "size without data");
+    APSInt SizeValue;
+    if (!::EvaluateInteger(SizeCall, SizeValue, Info))
+      return false;
+    uint64_t Size = SizeValue.getZExtValue();
+    LValue Pointer;
+    if (!::EvaluatePointer(DataCall, Pointer, Info))
+      return false;
+    QualType CharTy = DataCall->getType()->getPointeeType();
+    for (uint64_t J = 0; J < Size; ++J) {
+      APValue Char;
+      if (!handleLValueToRValueConversion(Info, DataCall, CharTy, Pointer,
+                                           Char))
+        return false;
+      Result.push_back(static_cast<char>(Char.getInt().getExtValue()));
+      if (!HandleLValueArrayAdjustment(Info, DataCall, Pointer, CharTy, 1))
+        return false;
+    }
+    return true;
+  }
+
+  if (Arg->getType()->isCharType()) {
+    // Char argument: append as single character.
+    APValue Val;
+    if (!EvaluateAsRValue(Info, Arg, Val))
+      return false;
+    Result.push_back(static_cast<char>(Val.getInt().getExtValue()));
+    return true;
+  }
+
+  if (Arg->getType()->isIntegralOrEnumerationType()) {
+    // Integer argument: convert to decimal string.
+    APValue Val;
+    if (!EvaluateAsRValue(Info, Arg, Val))
+      return false;
+    Val.getInt().toString(Result, 10);
+    return true;
+  }
+
+  if (Arg->getType()->isPointerType() || Arg->getType()->isArrayType()) {
+    // String argument: try to extract a string literal.
+    // Strip implicit casts to find the underlying StringLiteral.
+    const Expr *Stripped = Arg->IgnoreParenImpCasts();
+    if (const auto *SL = dyn_cast<StringLiteral>(Stripped)) {
+      StringRef Str = SL->getString();
+      // Exclude the null terminator if present.
+      if (!Str.empty() && Str.back() == '\0')
+        Str = Str.drop_back();
+      Result.append(Str.begin(), Str.end());
+      return true;
+    }
+
+    // Non-literal: evaluate and follow the LValue base back to a
+    // StringLiteral. For array-typed glvalues (e.g. a forwarding
+    // reference parameter `Ts const&` bound to a string literal), we
+    // must use EvaluateLValue rather than EvaluateAsRValue — the
+    // latter would lvalue-to-rvalue-load the array contents into an
+    // Array APValue and lose the base we want to follow.
+    APValue Val;
+    if (Arg->getType()->isArrayType()) {
+      LValue LV;
+      if (!EvaluateLValue(Arg, LV, Info))
+        return false;
+      LV.moveInto(Val);
+    } else if (!EvaluateAsRValue(Info, Arg, Val)) {
+      return false;
+    }
+
+    if (!Val.isLValue()) {
+      Info.FFDiag(Arg->getExprLoc());
+      return false;
+    }
+
+    APValue::LValueBase Base = Val.getLValueBase();
+    if (!Base) {
+      Info.FFDiag(Arg->getExprLoc());
+      return false;
+    }
+
+    if (const auto *SLit = dyn_cast_or_null<StringLiteral>(
+            Base.dyn_cast<const Expr *>())) {
+      StringRef Str = SLit->getString();
+      int64_t Off = Val.getLValueOffset().getQuantity();
+      if (Off >= 0 && (uint64_t)Off <= (uint64_t)Str.size()) {
+        Str = Str.substr(Off);
+        StringRef::size_type Pos = Str.find(0);
+        if (Pos != StringRef::npos)
+          Str = Str.substr(0, Pos);
+        Result.append(Str.begin(), Str.end());
+      }
+      return true;
+    }
+
+    Info.FFDiag(Arg->getExprLoc());
+    return false;
+  }
+
+  // Class-typed args reach here only if Sema didn't pre-build the
+  // size()/data() calls — which means the type was rejected.
+  Info.FFDiag(Arg->getExprLoc());
+  return false;
+}
+
+static void PrintTokenSequenceToStderr(const TokenSequenceData *TSD,
+                                       ASTContext &Ctx) {
+  llvm::raw_fd_ostream &OS = llvm::errs();
+  PrintingPolicy PP(Ctx.getLangOpts());
+  OS << "^^{ ";
+
+  bool NeedSpace = false;
+  assert(TSD && "token sequence must have token data");
+
+  for (const Token &Tok : *TSD) {
+    // Spacing: don't add space before closing/separating punctuation,
+    // or after opening punctuation.
+    bool IsOpenPunct = Tok.isOneOf(tok::l_paren, tok::l_brace, tok::l_square);
+    bool IsClosePunct = Tok.isOneOf(tok::r_paren, tok::r_brace, tok::r_square,
+                                    tok::comma, tok::semi, tok::ellipsis);
+    if (NeedSpace && !IsClosePunct)
+      OS << ' ';
+
+    if (Tok.is(tok::annot_typename)) {
+      // Interpolated type.
+      QualType QT = QualType::getFromOpaquePtr(Tok.getAnnotationValue());
+      OS << "\\(";
+      QT.print(OS, PP);
+      OS << ")";
+    } else if (Tok.is(tok::annot_template_name)) {
+      // Interpolated template.
+      OS << "\\(";
+      TemplateName::getFromVoidPointer(Tok.getAnnotationValue()).print(OS, PP);
+      OS << ")";
+    } else if (Tok.is(tok::annot_token_seq_expr)) {
+      // Interpolated expression.
+      Expr *E = static_cast<Expr *>(Tok.getAnnotationValue());
+      OS << "\\(";
+      if (auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+        DRE->getDecl()->printQualifiedName(OS);
+      } else if (auto *CE = dyn_cast<ConstantExpr>(E)) {
+        if (CE->hasAPValueResult()) {
+          const APValue &V = CE->getAPValueResult();
+          if (V.isReflection()) {
+            switch (V.getReflectionKind()) {
+            case ReflectionKind::Type:
+              V.getReflectedType().print(OS, PP);
+              break;
+            case ReflectionKind::Declaration:
+              if (auto *ND = dyn_cast<NamedDecl>(V.getReflectedDecl()))
+                ND->printQualifiedName(OS);
+              else
+                OS << "<decl>";
+              break;
+            case ReflectionKind::BaseSpecifier: {
+              // Print the base class type for base specifier reflections.
+              const CXXBaseSpecifier *Base = V.getReflectedBaseSpecifier();
+              Base->getType().print(OS, PP);
+              break;
+            }
+            default:
+              // For other reflection kinds, use the expression's type
+              // (which is std::meta::info) to avoid null type issues when
+              // the reflection is stored as an LValue.
+              V.printPretty(OS, PP, CE->getType(), &Ctx);
+              break;
+            }
+          } else {
+            V.printPretty(OS, PP, CE->getType(), &Ctx);
+          }
+        } else {
+          E->printPretty(OS, nullptr, PP);
+        }
+      } else {
+        E->printPretty(OS, nullptr, PP);
+      }
+      OS << ")";
+    } else if (Tok.isLiteral() && Tok.getLiteralData()) {
+      OS << StringRef(Tok.getLiteralData(), Tok.getLength());
+    } else if (const auto *II = Tok.getIdentifierInfo()) {
+      OS << II->getName();
+    } else if (const char *Punc = tok::getPunctuatorSpelling(Tok.getKind())) {
+      OS << Punc;
+    } else if (const char *Kw = tok::getKeywordSpelling(Tok.getKind())) {
+      OS << Kw;
+    } else {
+      OS << tok::getTokenName(Tok.getKind());
+    }
+
+    NeedSpace = !IsOpenPunct;
+  }
+
+  OS << " }";
+}
+
+bool VoidExprEvaluator::VisitCXXBuiltinReportTokensExpr(
+    const CXXBuiltinReportTokensExpr *E) {
+  if (Info.checkingPotentialConstantExpression())
+    return false;
+
+  // Extract the message string.
+  SmallString<64> MsgStr;
+  if (!ExtractStringFromArg(Info, E->getMessage(), E->getMsgSizeCall(),
+                            E->getMsgDataCall(), MsgStr))
+    return false;
+
+  // Evaluate the operand. Sema has already inserted any user-defined
+  // conversion to std::meta::token_sequence on the operand expression.
+  APValue Operand;
+  if (!EvaluateOperandAsRValue(Info, E->getOperand(), Operand))
+    return false;
+
+  if (!Operand.isTokenSequence()) {
+    Info.FFDiag(E->getBeginLoc(),
+                diag::metafn_builtin_inject_not_token_sequence);
+    return false;
+  }
+
+  // Print the report.
+  SourceLocation Loc = E->getKwLoc();
+  PresumedLoc PLoc = Info.Ctx.getSourceManager().getPresumedLoc(Loc);
+
+  llvm::raw_fd_ostream &OS = llvm::errs();
+  OS << "std::meta::report_tokens";
+  if (PLoc.isValid())
+    OS << " at " << PLoc.getFilename() << ":" << PLoc.getLine();
+  OS << " \"" << MsgStr << "\":\n  ";
+
+  TokenSequenceData TSD = Operand.getTokenSequence();
+  PrintTokenSequenceToStderr(&TSD, Info.Ctx);
+  OS << "\n";
+
+  return true;
+}
+
+bool VoidExprEvaluator::VisitCXXBuiltinInjectExpr(
+    const CXXBuiltinInjectExpr *E) {
+  if (Info.checkingPotentialConstantExpression())
+    return false;
+
+  // Check that injection is allowed (must be plainly constant evaluated).
+  bool AllowInjection =
+      (Info.EvalMode ==
+       EvaluationMode::ConstantExpressionPlainlyConstantEvaluated);
+  if (!AllowInjection) {
+    Info.FFDiag(E->getBeginLoc(),
+                diag::metafn_injected_decl_non_plainly_consteval);
+    return false;
+  }
+
+  // Evaluate the operand. Sema has already inserted any user-defined
+  // conversion to std::meta::token_sequence on the operand expression.
+  APValue Operand;
+  if (!EvaluateOperandAsRValue(Info, E->getOperand(), Operand))
+    return false;
+
+  if (!Operand.isTokenSequence()) {
+    Info.FFDiag(E->getBeginLoc(),
+                diag::metafn_builtin_inject_not_token_sequence);
+    return false;
+  }
+
+  // Evaluate the optional target namespace.
+  DeclContext *TargetDC = nullptr;
+  if (E->hasTargetNS()) {
+    APValue TargetNS;
+    if (!::Evaluate(TargetNS, Info, E->getTargetNS()))
+      return false;
+    if (E->getTargetNS()->isGLValue()) {
+      LValue LV;
+      LV.setFrom(Info.Ctx, TargetNS);
+      if (!handleLValueToRValueConversion(Info, E->getTargetNS(),
+                                           E->getTargetNS()->getType(), LV,
+                                           TargetNS))
+        return false;
+    }
+
+    if (!TargetNS.isReflection() ||
+        TargetNS.getReflectionKind() != ReflectionKind::Namespace) {
+      Info.FFDiag(E->getTargetNS()->getExprLoc(),
+                  diag::metafn_builtin_inject_target_not_namespace);
+      return false;
+    }
+    Decl *NSDecl = TargetNS.getReflectedNamespace();
+    TargetDC = dyn_cast<DeclContext>(NSDecl);
+  }
+
+  TokenSequenceData TSD = Operand.getTokenSequence();
+  Info.EvalStatus.PendingInjections.push_back(
+      {E->getBeginLoc(), TargetDC, TSD});
+  return true;
+}
 
 bool VoidExprEvaluator::VisitCXXDeleteExpr(const CXXDeleteExpr *E) {
   // We cannot speculatively evaluate a delete expression.
@@ -23383,7 +25887,12 @@ public:
   }
 
   bool ZeroInitialization(const Expr *E) {
-    Result = APValue(ReflectionKind::Null, nullptr);
+    if (E->getType()->isTokenSequenceType() || E->getType()->isMetaTokenType()) {
+      Result = APValue(CreateEmptyTokenSequenceData(Info.Ctx));
+    } else {
+      // Zero-init for info is the null reflection.
+      Result = APValue(ReflectionKind::Null, nullptr);
+    }
     return true;
   }
 
@@ -23392,13 +25901,454 @@ public:
   }
 
   bool VisitCXXReflectExpr(const CXXReflectExpr *E);
+  bool VisitCXXTokenSequenceExpr(const CXXTokenSequenceExpr *E);
+  bool VisitCastExpr(const CastExpr *E);
+  bool
+  VisitCXXTokenInterpolationListExpr(const CXXTokenInterpolationListExpr *E);
   bool VisitCXXMetafunctionExpr(const CXXMetafunctionExpr *E);
   bool VisitCXXSpliceExpr(const CXXSpliceExpr *E);
+  bool VisitCXXBuiltinIdExpr(const CXXBuiltinIdExpr *E);
+  bool VisitCXXBuiltinStrLiteralExpr(const CXXBuiltinStrLiteralExpr *E);
+  bool VisitCXXBuiltinTokenizeExpr(const CXXBuiltinTokenizeExpr *E);
+  bool VisitBinaryOperator(const BinaryOperator *E);
+  bool VisitDeclRefExpr(const DeclRefExpr *E);
+  bool VisitArraySubscriptExpr(const ArraySubscriptExpr *E);
 };
 
 bool ReflectionEvaluator::VisitCXXReflectExpr(const CXXReflectExpr *E) {
-  APValue Result(E->getReflection());
-  return Success(Result, E);
+  return Success(E->getReflection(), E);
+}
+
+bool ReflectionEvaluator::VisitDeclRefExpr(const DeclRefExpr *E) {
+  // An expression-macro parameter denotes whatever was bound to it in the
+  // macro's frame: a reflection of the argument expression or a token
+  // sequence.
+  // Only the macro's own frame has such a binding; speculative evaluation
+  // while the body is still being parsed has no frame at all.
+  if (const auto *PVD = dyn_cast<ParmVarDecl>(E->getDecl())) {
+    CallStackFrame *Frame = Info.CurrentCall;
+    if (Frame->Callee && Frame->Callee == PVD->getDeclContext() &&
+        Frame->Arguments.CallIndex)
+      if (const APValue *V = Info.getParamSlot(Frame->Arguments, PVD))
+        if (V->isReflection() || V->isTokenSequence())
+          return Success(*V, E);
+  }
+  if (Info.checkingPotentialConstantExpression())
+    return false;
+  return Error(E);
+}
+
+/// Whether \p T is the enumeration std::meta::<Name>. (std::meta::operators
+/// and std::meta::punctuator values interpolate as the token they name.)
+static bool isStdMetaEnum(QualType T, StringRef Name) {
+  const auto *ET = T->getAs<EnumType>();
+  if (!ET)
+    return false;
+  const EnumDecl *ED = ET->getDecl();
+  if (!ED->getIdentifier() || ED->getName() != Name)
+    return false;
+  auto SkipInline = [](const DeclContext *DC) {
+    while (const auto *NS = dyn_cast<NamespaceDecl>(DC)) {
+      if (!NS->isInline())
+        break;
+      DC = NS->getParent();
+    }
+    return DC;
+  };
+  const auto *Meta = dyn_cast<NamespaceDecl>(SkipInline(ED->getDeclContext()));
+  if (!Meta || !Meta->getIdentifier() || Meta->getName() != "meta")
+    return false;
+  return SkipInline(Meta->getParent())->isStdNamespace();
+}
+
+static tok::TokenKind tokenKindForOverloadedOperator(OverloadedOperatorKind OO) {
+  switch (OO) {
+#define OVERLOADED_OPERATOR(Name, Spelling, Token, Unary, Binary, MemberOnly)  \
+  case OO_##Name:                                                              \
+    return tok::Token;
+#define OVERLOADED_OPERATOR_MULTI(Name, Spelling, Unary, Binary, MemberOnly)   \
+  case OO_##Name:                                                              \
+    return tok::unknown;
+#include "clang/Basic/OperatorKinds.def"
+  default:
+    return tok::unknown;
+  }
+}
+
+/// Interpolate one '\(e)' -- the annotation token \p SrcTok, whose
+/// expression is \p SubExpr -- appending the tokens it stands for to
+/// \p NewTokens.
+static bool interpolateTokens(EvalInfo &Info, const Token &SrcTok,
+                              Expr *SubExpr,
+                              SmallVectorImpl<Token> &NewTokens) {
+  // Evaluate the expression in the current constexpr context.
+  APValue Val;
+  QualType ExprTy = SubExpr->getType();
+  if (ExprTy->isTokenSequenceType() || ExprTy->isMetaTokenType()) {
+    // Token sequence (or token) interpolation: splice tokens inline.
+    if (!EvaluateOperandAsRValue(Info, SubExpr, Val))
+      return false;
+    assert(Val.isTokenSequence());
+    TokenSequenceData Inner = Val.getTokenSequence();
+    // The first token of the inner sequence should inherit the leading
+    // space from the annotation token to preserve whitespace for stringize.
+    if (!Inner.empty()) {
+      Token First = Inner.front();
+      if (SrcTok.hasLeadingSpace())
+        First.setFlag(Token::LeadingSpace);
+      NewTokens.push_back(First);
+
+      auto Rest = Inner.drop_front(1);
+      NewTokens.append(Rest.begin(), Rest.end());
+    }
+  } else if (ExprTy->isReflectionType()) {
+    // Reflection-typed expression: evaluate and check kind.
+    if (!EvaluateOperandAsRValue(Info, SubExpr, Val))
+      return false;
+
+    if (Val.isReflectedType()) {
+      QualType QT = Val.getReflectedType();
+
+      // Strip deduced type sugar (e.g. AutoType from 'auto L = ...')
+      // so the injected type is the concrete type, not 'auto'.
+      QT = stripDeducedTypeSugar(Info.Ctx, QT);
+
+      // Create an annot_typename token carrying the type.
+      Token Tok = SrcTok;
+      Tok.setKind(tok::annot_typename);
+      Tok.setAnnotationValue(QT.getAsOpaquePtr());
+      NewTokens.push_back(Tok);
+    } else if (Val.isReflectedExpression()) {
+      // A macro argument: one opaque value per interpolation, unique
+      // so it is emitted in place, evaluating the argument exactly
+      // where (and as often as) it was interpolated.
+      Expr *Arg = Val.getReflectedExpression();
+      auto *OVE = new (Info.Ctx)
+          OpaqueValueExpr(Arg->getExprLoc(), Arg->getType(),
+                          Arg->getValueKind(), Arg->getObjectKind(), Arg);
+      OVE->setIsUnique(true);
+
+      Token Tok = SrcTok;
+      Tok.setKind(tok::annot_primary_expr);
+      Tok.setLocation(Arg->getBeginLoc());
+      Tok.setAnnotationEndLoc(Arg->getEndLoc());
+      Tok.setAnnotationValue(static_cast<void *>(OVE));
+      NewTokens.push_back(Tok);
+    } else if (Val.isReflectedValue() || Val.isReflectedObject()) {
+      // A value (e.g. from constant_of) or object reflection:
+      // interpolate as a constant of the reflected type, so it can
+      // appear anywhere a constant can - a template argument in
+      // particular.
+      QualType QT = Val.getTypeOfReflectedResult(Info.Ctx);
+      APValue Underlying = Val.isReflectedValue() ? Val.getReflectedValue()
+                                                  : Val.getReflectedObject();
+      ExprValueKind VK = Val.isReflectedObject() ? VK_LValue : VK_PRValue;
+      OpaqueValueExpr *OVE =
+          new (Info.Ctx) OpaqueValueExpr(SubExpr->getExprLoc(), QT, VK);
+      ConstantExpr *CE = ConstantExpr::Create(Info.Ctx, OVE, Underlying);
+
+      Token Tok = SrcTok;
+      Tok.setKind(tok::annot_primary_expr);
+      Tok.setAnnotationValue(static_cast<void *>(CE));
+      NewTokens.push_back(Tok);
+    } else if (Val.isReflectedFunctionDeclSpec()) {
+      // A declaration description (std::meta::declaration_of):
+      // a single annotation token; in member-declaration position
+      // it declares the described function.
+      Token Tok = SrcTok;
+      Tok.setKind(tok::annot_decl_spec);
+      Tok.setAnnotationValue(
+          static_cast<void *>(Val.getReflectedFunctionDeclSpec()));
+      Tok.setAnnotationEndLoc(SrcTok.getLocation());
+      NewTokens.push_back(Tok);
+    } else if (Val.isReflectedDecl() &&
+               isa<EnumConstantDecl>(Val.getReflectedDecl())) {
+      // Enumerator reflection: create an integer literal with the
+      // enum constant's value, then cast to the enum type. This
+      // ensures the value is preserved through case label evaluation.
+      auto *ECD = cast<EnumConstantDecl>(Val.getReflectedDecl());
+      QualType EnumTy = ECD->getType();
+      QualType UnderlyingTy = EnumTy;
+      if (const auto *ET = EnumTy->getAs<EnumType>())
+        UnderlyingTy = ET->getDecl()->getIntegerType();
+
+      IntegerLiteral *IL = IntegerLiteral::Create(
+          Info.Ctx, ECD->getInitVal(), UnderlyingTy, SubExpr->getExprLoc());
+
+      Expr *ResultExpr = IL;
+      if (EnumTy != UnderlyingTy) {
+        ResultExpr = ImplicitCastExpr::Create(
+            Info.Ctx, EnumTy, CK_IntegralCast, IL,
+            /*BasePath=*/nullptr, VK_PRValue, FPOptionsOverride());
+      }
+
+      APValue EnumVal(ECD->getInitVal());
+      ConstantExpr *CE = ConstantExpr::Create(Info.Ctx, ResultExpr, EnumVal);
+
+      Token Tok = SrcTok;
+      Tok.setAnnotationValue(static_cast<void *>(CE));
+      NewTokens.push_back(Tok);
+    } else if (Val.isReflectedDecl() &&
+               isa<ValueDecl>(Val.getReflectedDecl()) &&
+               !isa<FieldDecl>(Val.getReflectedDecl())) {
+      // Non-field declaration reflection: create a DeclRefExpr for
+      // the reflected declaration and emit as annot_primary_expr.
+      ValueDecl *VD = cast<ValueDecl>(Val.getReflectedDecl());
+      QualType DeclTy = VD->getType().getNonReferenceType();
+      ExprValueKind VK =
+          VD->getType()->isReferenceType() ? VK_LValue : VK_LValue;
+      DeclRefExpr *DRE = DeclRefExpr::Create(
+          Info.Ctx, NestedNameSpecifierLoc(), SourceLocation(), VD,
+          /*RefersToEnclosingVariableOrCapture=*/false, SubExpr->getExprLoc(),
+          DeclTy, VK);
+
+      Token Tok = SrcTok;
+      Tok.setAnnotationValue(static_cast<void *>(DRE));
+      NewTokens.push_back(Tok);
+    } else if (Val.isReflectedTemplate()) {
+      // Template reflection: a template-name token. The parser forms
+      // a template-id from it when a template-argument-list follows,
+      // exactly as for a template named by an identifier.
+      Token Tok = SrcTok;
+      Tok.setKind(tok::annot_template_name);
+      Tok.setAnnotationValue(Val.getReflectedTemplate().getAsVoidPointer());
+      NewTokens.push_back(Tok);
+    } else if (Val.isReflectedNamespace()) {
+      // Namespace reflection: a splice, which the parser already
+      // accepts as the leading component of a nested-name-specifier
+      // and in using-directives. A valid SpliceResult's opaque
+      // pointer is the SpliceSpecifier pointer itself.
+      OpaqueValueExpr *OVE = new (Info.Ctx)
+          OpaqueValueExpr(SubExpr->getExprLoc(), SubExpr->getType(), VK_PRValue,
+                          OK_Ordinary, SubExpr);
+      ConstantExpr *CE = ConstantExpr::Create(Info.Ctx, OVE, Val);
+      SpliceSpecifier *Splice = SpliceSpecifier::Create(
+          Info.Ctx, SrcTok.getLocation(), CE, SrcTok.getLocation(),
+          /*TemplateArgs=*/nullptr);
+
+      Token Tok = SrcTok;
+      Tok.setKind(tok::annot_splice);
+      Tok.setAnnotationValue(static_cast<void *>(Splice));
+      NewTokens.push_back(Tok);
+    } else {
+      // For FieldDecl, base specifiers, and other reflection kinds:
+      // emit as annot_primary_expr with a ConstantExpr carrying the
+      // reflection value. The parser handles this in member access
+      // context by treating it as a splice.
+      OpaqueValueExpr *OVE = new (Info.Ctx)
+          OpaqueValueExpr(SubExpr->getExprLoc(), SubExpr->getType(), VK_PRValue,
+                          OK_Ordinary, SubExpr);
+      ConstantExpr *CE = ConstantExpr::Create(Info.Ctx, OVE, Val);
+
+      Token Tok = SrcTok;
+      Tok.setAnnotationValue(static_cast<void *>(CE));
+      NewTokens.push_back(Tok);
+    }
+  } else if (ExprTy->isRecordType()) {
+    // Record type without a conversion to std::meta::info or
+    // std::meta::token_sequence (Sema would have inserted one
+    // otherwise). Interpolate the value literally.
+    if (!EvaluateOperandAsRValue(Info, SubExpr, Val))
+      return false;
+    OpaqueValueExpr *OVE = new (Info.Ctx)
+        OpaqueValueExpr(SubExpr->getExprLoc(), SubExpr->getType(), VK_PRValue,
+                        OK_Ordinary, SubExpr);
+    ConstantExpr *CE = ConstantExpr::Create(Info.Ctx, OVE, Val);
+
+    Token Tok = SrcTok;
+    Tok.setAnnotationValue(static_cast<void *>(CE));
+    NewTokens.push_back(Tok);
+  } else {
+    // Non-reflection, non-record interpolation: evaluate as
+    // rvalue and wrap in a ConstantExpr.
+    if (!EvaluateOperandAsRValue(Info, SubExpr, Val))
+      return false;
+
+    Expr *ResultExpr;
+    QualType ExprType = SubExpr->getType();
+
+    // A std::meta::punctuator value is the punctuator's token.
+    if (Val.isInt() && isStdMetaEnum(ExprType, "punctuator")) {
+      tok::TokenKind Kind =
+          getPunctuatorForMetaIndex(Val.getInt().getZExtValue());
+      if (Kind == tok::unknown) {
+        Info.FFDiag(SubExpr, diag::note_constexpr_invalid_punctuator)
+            << toString(Val.getInt(), 10);
+        return false;
+      }
+      Token Tok;
+      Tok.startToken();
+      Tok.setKind(Kind);
+      Tok.setLocation(SrcTok.getLocation());
+      Tok.setLength(strlen(tok::getPunctuatorSpelling(Kind)));
+      if (SrcTok.hasLeadingSpace())
+        Tok.setFlag(Token::LeadingSpace);
+      NewTokens.push_back(Tok);
+      return true;
+    }
+
+    // A std::meta::operators value spells the operator's token.
+    if (Val.isInt() && isStdMetaEnum(ExprType, "operators")) {
+      OverloadedOperatorKind OO =
+          getOverloadedOperatorForMetaIndex(Val.getInt().getZExtValue());
+      tok::TokenKind Kind = tokenKindForOverloadedOperator(OO);
+      if (Kind == tok::unknown) {
+        Info.FFDiag(SubExpr, diag::note_constexpr_macro_operator_not_token)
+            << getOperatorSpelling(OO);
+        return false;
+      }
+      Token Tok;
+      Tok.startToken();
+      Tok.setKind(Kind);
+      Tok.setLocation(SrcTok.getLocation());
+      Tok.setLength(strlen(getOperatorSpelling(OO)));
+      if (SrcTok.hasLeadingSpace())
+        Tok.setFlag(Token::LeadingSpace);
+      NewTokens.push_back(Tok);
+      return true;
+    }
+
+    // For integral and enum types, create an IntegerLiteral
+    // directly from the value. This avoids issues where implicit
+    // conversions would later wrap the inner expression and lose
+    // the constant value.
+    if (Val.isInt() && ExprType->isIntegralOrEnumerationType()) {
+      // For enums, we need to use the underlying integer type for
+      // the literal, then cast back to the enum type.
+      QualType LiteralType = ExprType;
+      if (const auto *ET = ExprType->getAs<EnumType>())
+        LiteralType = ET->getDecl()->getIntegerType();
+
+      // Create an integer literal with the evaluated value
+      IntegerLiteral *IL = IntegerLiteral::Create(
+          Info.Ctx, Val.getInt(), LiteralType, SubExpr->getExprLoc());
+
+      Expr *InnerExpr = IL;
+      // If it was an enum, add an implicit cast back to enum type
+      if (ExprType != LiteralType) {
+        InnerExpr = ImplicitCastExpr::Create(
+            Info.Ctx, ExprType, CK_IntegralCast, IL,
+            /*BasePath=*/nullptr, VK_PRValue, FPOptionsOverride());
+      }
+      ResultExpr = ConstantExpr::Create(Info.Ctx, InnerExpr, Val);
+    } else {
+      // For other types, use OpaqueValueExpr as before
+      OpaqueValueExpr *OVE = new (Info.Ctx) OpaqueValueExpr(
+          SubExpr->getExprLoc(), ExprType, VK_PRValue, OK_Ordinary, SubExpr);
+      OVE->setIsUnique(true);
+      ResultExpr = ConstantExpr::Create(Info.Ctx, OVE, Val);
+    }
+
+    Token Tok = SrcTok;
+    Tok.setAnnotationValue(static_cast<void *>(ResultExpr));
+    NewTokens.push_back(Tok);
+  }
+  return true;
+}
+
+bool ReflectionEvaluator::VisitCXXTokenInterpolationListExpr(
+    const CXXTokenInterpolationListExpr *E) {
+  // Each element as its own interpolation, then the separator's tokens
+  // between consecutive elements (a ',' if none was written).
+  auto SourceToken = [&](const Expr *At) {
+    Token Tok;
+    Tok.startToken();
+    Tok.setKind(tok::annot_token_seq_expr);
+    Tok.setLocation(At->getBeginLoc());
+    Tok.setAnnotationEndLoc(At->getEndLoc());
+    return Tok;
+  };
+  SmallVector<Token, 4> Separator;
+  if (Expr *Sep = E->getSeparator()) {
+    if (!interpolateTokens(Info, SourceToken(Sep), Sep, Separator))
+      return false;
+  } else {
+    Token Comma;
+    Comma.startToken();
+    Comma.setKind(tok::comma);
+    Comma.setLocation(E->getBeginLoc());
+    Comma.setLength(1);
+    Separator.push_back(Comma);
+  }
+  SmallVector<Token, 32> Tokens;
+  for (unsigned I = 0, N = E->getNumElements(); I != N; ++I) {
+    if (I)
+      Tokens.append(Separator.begin(), Separator.end());
+    Expr *Elt = E->getElement(I);
+    if (!interpolateTokens(Info, SourceToken(Elt), Elt, Tokens))
+      return false;
+  }
+  return Success(APValue(Tokens.empty()
+                             ? CreateEmptyTokenSequenceData(Info.Ctx)
+                             : CreateTokenSequenceData(Info.Ctx, Tokens)),
+                 E);
+}
+
+bool ReflectionEvaluator::VisitCXXTokenSequenceExpr(
+    const CXXTokenSequenceExpr *E) {
+  APValue Refl(E->getValue());
+
+  // Resolve any interpolation expressions in the token sequence.
+  {
+    TokenSequenceData TSD = Refl.getTokenSequence();
+    bool HasInterpolations = false;
+    for (const Token &Tok : TSD) {
+      if (Tok.is(tok::annot_token_seq_expr)) {
+        HasInterpolations = true;
+        break;
+      }
+    }
+
+    if (HasInterpolations) {
+      // Build a new token array with interpolations resolved.
+      // Use a SmallVector since token sequence interpolation can change the
+      // number of tokens.
+      SmallVector<Token, 32> NewTokens;
+      NewTokens.reserve(TSD.size());
+      for (const Token &SrcTok : TSD) {
+        if (SrcTok.is(tok::annot_token_seq_expr)) {
+          if (!interpolateTokens(
+                  Info, SrcTok,
+                  static_cast<Expr *>(SrcTok.getAnnotationValue()), NewTokens))
+            return false;
+        } else {
+          NewTokens.push_back(SrcTok);
+        }
+      }
+
+      TokenSequenceData NewTSD =
+          CreateTokenSequenceData(Info.Ctx, NewTokens);
+      return Success(APValue(NewTSD), E);
+    }
+  }
+
+  return Success(Refl, E);
+}
+
+static bool EvaluateTokenLiteral(EvalInfo &Info, const CXXTokenSequenceExpr *E,
+                                 APValue &Result) {
+  return ReflectionEvaluator(Info, Result).VisitCXXTokenSequenceExpr(E);
+}
+
+bool ReflectionEvaluator::VisitCastExpr(const CastExpr *E) {
+  if (E->getCastKind() != CK_SequenceToTokenArray)
+    return BaseType::VisitCastExpr(E);
+  // The token array a std::meta::token_sequence holds.
+  const Expr *Sub = E->getSubExpr();
+  APValue Obj;
+  if (Sub->isGLValue()) {
+    LValue LV;
+    if (!EvaluateLValue(Sub, LV, Info) ||
+        !handleLValueToRValueConversion(Info, Sub, Sub->getType(), LV, Obj))
+      return false;
+  } else if (!Evaluate(Obj, Info, Sub)) {
+    return false;
+  }
+  TokenSequenceData TSD;
+  if (!ReadTokenSequenceObject(Info, E, Obj, Info.Ctx.MetaTokenTy.withConst(),
+                               TSD))
+    return Error(E);
+  return Success(APValue(TSD), E);
 }
 
 bool ReflectionEvaluator::VisitCXXMetafunctionExpr(
@@ -23409,10 +26359,190 @@ bool ReflectionEvaluator::VisitCXXMetafunctionExpr(
 bool ReflectionEvaluator::VisitCXXSpliceExpr(const CXXSpliceExpr *E) {
   return BaseType::VisitCXXSpliceExpr(E);
 }
+
+bool ReflectionEvaluator::VisitCXXBuiltinIdExpr(const CXXBuiltinIdExpr *E) {
+  // Evaluate each argument and concatenate into an identifier string.
+  SmallString<64> Name;
+  for (unsigned I = 0; I < E->getNumArgs(); ++I) {
+    if (!ExtractStringFromArg(Info, E->getArg(I), E->getSizeCall(I),
+                              E->getDataCall(I), Name))
+      return false;
+  }
+
+  // A single identifier token: id() is a token_sequence producer, the
+  // identifier sibling of str_lit(). The name must lex as exactly one
+  // identifier -- not, say, 'operator|=' (which would declare an ordinary
+  // function of that odd name, not an operator function) -- and not as a
+  // keyword, which the token would not behave as.
+  bool IsIdentifier = false;
+  {
+    SmallString<64> Buf(Name);
+    Buf.push_back('\0');
+    Lexer RawLex(SourceLocation(), Info.Ctx.getLangOpts(), Buf.begin(),
+                 Buf.begin(), Buf.end() - 1);
+    Token First, Next;
+    RawLex.LexFromRawLexer(First);
+    RawLex.LexFromRawLexer(Next);
+    IsIdentifier = First.is(tok::raw_identifier) &&
+                   First.getLength() == Name.size() && Next.is(tok::eof);
+  }
+  IdentifierInfo &II = Info.Ctx.Idents.get(Name);
+  if (!IsIdentifier || II.isKeyword(Info.Ctx.getLangOpts())) {
+    Info.FFDiag(E->getExprLoc(), diag::note_constexpr_id_not_identifier)
+        << Name << IsIdentifier;
+    return false;
+  }
+  Token Tok;
+  Tok.startToken();
+  Tok.setKind(tok::identifier);
+  Tok.setIdentifierInfo(&II);
+  Tok.setLength(II.getLength());
+  Tok.setLocation(E->getBeginLoc());
+  Token Toks[] = {Tok};
+  return Success(APValue(CreateTokenSequenceData(Info.Ctx, Toks)), E);
+}
+
+bool ReflectionEvaluator::VisitCXXBuiltinStrLiteralExpr(
+    const CXXBuiltinStrLiteralExpr *E) {
+  // Evaluate each argument and concatenate into a string.
+  SmallString<64> Content;
+  for (unsigned I = 0; I < E->getNumArgs(); ++I) {
+    if (!ExtractStringFromArg(Info, E->getArg(I), E->getSizeCall(I),
+                              E->getDataCall(I), Content))
+      return false;
+  }
+
+  // Build the string literal token. The literal data includes quotes.
+  SmallString<68> LiteralData;
+  LiteralData.push_back('"');
+  LiteralData.append(Content);
+  LiteralData.push_back('"');
+
+  // Create the string literal token.
+  Token Tok;
+  Tok.startToken();
+  Tok.setKind(tok::string_literal);
+  Tok.setLocation(E->getBeginLoc());
+  // CreateTokenSequenceData below gives the literal its own NUL-terminated
+  // storage in the ASTContext.
+  Tok.setLiteralData(LiteralData.data());
+  Tok.setLength(LiteralData.size());
+
+  // Create a token sequence containing just this token.
+  Token Tokens[] = {Tok};
+  TokenSequenceData TSD = CreateTokenSequenceData(Info.Ctx, Tokens);
+  return Success(APValue(TSD), E);
+}
+
+bool ReflectionEvaluator::VisitCXXBuiltinTokenizeExpr(
+    const CXXBuiltinTokenizeExpr *E) {
+  // Extract and concatenate string content from all arguments.
+  SmallString<64> Content;
+  for (unsigned I = 0; I < E->getNumArgs(); ++I) {
+    if (!ExtractStringFromArg(Info, E->getArg(I), E->getSizeCall(I),
+                              E->getDataCall(I), Content))
+      return false;
+  }
+
+  // Lex the string content into tokens.
+  // We use a raw lexer since we don't have a Preprocessor available here.
+  // The Lexer requires null-terminated input, so ensure the buffer is
+  // null-terminated.
+  Content.push_back('\0');
+  SmallVector<Token, 16> Tokens;
+  const char *BufStart = Content.data();
+  const char *BufEnd = Content.data() + Content.size() - 1;
+
+  Lexer RawLex(E->getBeginLoc(), Info.Ctx.getLangOpts(),
+               BufStart, BufStart, BufEnd);
+
+  Token Tok;
+  while (true) {
+    RawLex.LexFromRawLexer(Tok);
+    if (Tok.is(tok::eof))
+      break;
+
+    // Handle raw identifiers - we need to convert them to proper identifiers
+    // or keywords.
+    if (Tok.is(tok::raw_identifier)) {
+      // Look up the identifier to see if it's a keyword.
+      IdentifierInfo &II = Info.Ctx.Idents.get(
+          StringRef(Tok.getRawIdentifier()));
+      Tok.setKind(II.getTokenID());
+      Tok.setIdentifierInfo(&II);
+    }
+
+    // The literal data points into Content, which outlives the call of
+    // CreateTokenSequenceData below; that gives it storage of its own.
+
+    // Set location to the expression location for all tokens.
+    Tok.setLocation(E->getBeginLoc());
+    Tokens.push_back(Tok);
+  }
+
+  TokenSequenceData TSD = CreateTokenSequenceData(Info.Ctx, Tokens);
+  return Success(APValue(TSD), E);
+}
+
+bool ReflectionEvaluator::VisitBinaryOperator(const BinaryOperator *E) {
+  // Handle token_sequence + token_sequence concatenation.
+  if (E->getOpcode() != BO_Add)
+    return BaseType::VisitBinaryOperator(E);
+
+  QualType LHSTy = E->getLHS()->getType();
+  QualType RHSTy = E->getRHS()->getType();
+  if (!LHSTy->isTokenSequenceType() || !RHSTy->isTokenSequenceType())
+    return BaseType::VisitBinaryOperator(E);
+
+  APValue LHSVal, RHSVal;
+  if (!EvaluateOperandAsRValue(Info, E->getLHS(), LHSVal))
+    return false;
+  if (!EvaluateOperandAsRValue(Info, E->getRHS(), RHSVal))
+    return false;
+
+  if (!LHSVal.isTokenSequence() || !RHSVal.isTokenSequence()) {
+    Info.FFDiag(E->getExprLoc());
+    return false;
+  }
+
+  TokenSequenceData NewTSD =
+    CreateTokenSequenceData(Info.Ctx, LHSVal.getTokenSequence(), RHSVal.getTokenSequence());
+  return Success(APValue(NewTSD), E);
+}
+bool ReflectionEvaluator::VisitArraySubscriptExpr(
+    const ArraySubscriptExpr *E) {
+  // ts[i]: the i-th token of a token sequence as a single-token sequence.
+  if (!E->getBase()->getType()->isTokenSequenceType())
+    return Error(E);
+
+  APValue BaseVal;
+  if (!EvaluateOperandAsRValue(Info, E->getBase(), BaseVal))
+    return false;
+  APSInt Index;
+  if (!EvaluateInteger(E->getIdx(), Index, Info))
+    return false;
+
+  if (!BaseVal.isTokenSequence()) {
+    Info.FFDiag(E->getExprLoc());
+    return false;
+  }
+  TokenSequenceData TSD = BaseVal.getTokenSequence();
+  if (Index.isNegative() || Index.uge(TSD.size())) {
+    Info.FFDiag(E->getExprLoc(), diag::note_constexpr_token_index_out_of_range)
+        << toString(Index, 10) << (unsigned)TSD.size();
+    return false;
+  }
+
+  Token Toks[] = {TSD[Index.getZExtValue()]};
+  return Success(APValue(CreateTokenSequenceData(Info.Ctx, Toks)), E);
+}
 }  // end anonymous namespace
 
 static bool EvaluateReflection(const Expr *E, APValue &Result, EvalInfo &Info) {
-  assert(E->isPRValue() && E->getType()->isReflectionType());
+  assert(E->isPRValue() &&
+         (E->getType()->isReflectionType() ||
+          E->getType()->isTokenSequenceType() ||
+          E->getType()->isMetaTokenType()));
   return ReflectionEvaluator(Info, Result).Visit(E);
 }
 
@@ -23436,7 +26566,8 @@ static bool Evaluate(APValue &Result, EvalInfo &Info, const Expr *E) {
   } else if (T->isIntegralOrEnumerationType()) {
     if (!IntExprEvaluator(Info, Result).Visit(E))
       return false;
-  } else if (T->isReflectionType()) {
+  } else if (T->isReflectionType() || T->isTokenSequenceType() ||
+             T->isMetaTokenType()) {
     if (!EvaluateReflection(E, Result, Info))
       return false;
   } else if (T->hasPointerRepresentation()) {
@@ -23487,6 +26618,14 @@ static bool Evaluate(APValue &Result, EvalInfo &Info, const Expr *E) {
         << E->getType();
     if (!EvaluateVoid(E, Info))
       return false;
+  } else if (T->isNoReturnType()) {
+    // A diverging expression (P3549): evaluating it never completes. Evaluate
+    // it for the diagnostic it produces (a throw, a call to a non-constexpr
+    // function, ...); if it somehow succeeds there is still no value.
+    if (!VoidExprEvaluator(Info).Visit(E))
+      return false;
+    Info.FFDiag(E, diag::note_invalid_subexpr_in_const_expr);
+    return false;
   } else if (T->isAtomicType()) {
     QualType Unqual = T.getAtomicUnqualifiedType();
     if (Unqual->isArrayType() || Unqual->isRecordType()) {
@@ -24189,6 +27328,7 @@ static ICEDiag CheckICE(const Expr* E, const ASTContext &Ctx) {
   case Expr::VAArgExprClass:
   case Expr::AddrLabelExprClass:
   case Expr::StmtExprClass:
+  case Expr::DoExprClass:
   case Expr::CXXMemberCallExprClass:
   case Expr::CUDAKernelCallExprClass:
   case Expr::CXXAddrspaceCastExprClass:
@@ -24252,6 +27392,9 @@ static ICEDiag CheckICE(const Expr* E, const ASTContext &Ctx) {
   case Expr::CXXParenListInitExprClass:
   case Expr::HLSLOutArgExprClass:
   case Expr::CXXDependentMemberSpliceExprClass:
+  case Expr::MatchTestExprClass:
+  case Expr::CaseConditionExprClass:
+  case Expr::MatchSelectExprClass:
     return ICEDiag(IK_NotICE, E->getBeginLoc());
 
   case Expr::InitListExprClass: {
@@ -24262,6 +27405,13 @@ static ICEDiag CheckICE(const Expr* E, const ASTContext &Ctx) {
     if (E->isPRValue())
       if (cast<InitListExpr>(E)->getNumInits() == 1)
         return CheckICE(cast<InitListExpr>(E)->getInit(0), Ctx);
+    return ICEDiag(IK_NotICE, E->getBeginLoc());
+  }
+
+  case Expr::CXXMacroInvocationExprClass: {
+    const auto *MI = cast<CXXMacroInvocationExpr>(E);
+    if (MI->isResolved())
+      return CheckICE(MI->getExpansion(), Ctx);
     return ICEDiag(IK_NotICE, E->getBeginLoc());
   }
 
@@ -24299,7 +27449,14 @@ static ICEDiag CheckICE(const Expr* E, const ASTContext &Ctx) {
   case Expr::ExpressionTraitExprClass:
   case Expr::CXXNoexceptExprClass:
   case Expr::CXXReflectExprClass:
+  case Expr::CXXTokenSequenceExprClass:
   case Expr::CXXMetafunctionExprClass:
+  case Expr::CXXBuiltinInjectExprClass:
+  case Expr::CXXBuiltinReportTokensExprClass:
+  case Expr::CXXTokenInterpolationListExprClass:
+  case Expr::CXXBuiltinIdExprClass:
+  case Expr::CXXBuiltinStrLiteralExprClass:
+  case Expr::CXXBuiltinTokenizeExprClass:
   case Expr::CXXSpliceExprClass:
   case Expr::StackLocationExprClass:
   case Expr::ExtractLValueExprClass:
@@ -24763,6 +27920,78 @@ bool Expr::EvaluateWithSubstitution(APValue &Value, ASTContext &Ctx,
          !Info.EvalStatus.HasSideEffects;
 }
 
+bool Expr::EvaluateMacroBody(const FunctionDecl *Macro,
+                             ArrayRef<APValue> ParamValues, APValue &Result,
+                             const ASTContext &Ctx,
+                             SmallVectorImpl<PartialDiagnosticAt> &Diags,
+                             Decl *InvocationContext,
+                             ArrayRef<const Expr *> ParamInits) {
+  Expr::EvalStatus Status;
+  Status.Diag = &Diags;
+  EvalInfo Info(Ctx, Status, EvaluationMode::ConstantExpression);
+  Info.InConstantContext = true;
+  Info.EvaluatingMacroBody = true;
+  // macro_expansion_context() in the body sees where the expansion lands, not
+  // where the macro was defined.
+  Info.MacroExpansionContext = InvocationContext;
+
+  // The parameters hold reflections and token sequences rather than values of
+  // their declared types; nothing about them is evaluated from an argument.
+  for (const APValue &V : ParamValues)
+    if (V.isReflectedExpression() &&
+        V.getReflectedExpression()->isValueDependent())
+      Info.MacroArgsValueDependent = true;
+  // As for a call: the parameters (a raw parameter's token_sequence is an
+  // object) are destroyed at the end of it.
+  CallScopeRAII CallScope(Info);
+  CallRef Call = Info.CurrentCall->createCall(Macro);
+  for (unsigned I = 0, N = std::min<unsigned>(ParamValues.size(),
+                                              Macro->getNumParams());
+       I != N; ++I) {
+    const ParmVarDecl *PVD = Macro->getParamDecl(I);
+    if (I < ParamInits.size() && ParamInits[I]) {
+      // A real object of the declared type (a raw parameter's
+      // token_sequence), constructed here, as an argument would be, and
+      // destroyed at the end of the call: every mention of the parameter in
+      // the body is this one object.
+      LValue LV;
+      APValue &Slot = Info.CurrentCall->createParam(Call, PVD, LV);
+      FullExpressionRAII Scope(Info);
+      if (!EvaluateInPlace(Slot, Info, LV, ParamInits[I]) || !Scope.destroy())
+        return false;
+      continue;
+    }
+    // Otherwise the slot holds what the parameter names in the body -- a
+    // reflection, or the compiler's token array -- with that type.
+    QualType SlotTy = ParamValues[I].isTokenSequence() ? Ctx.TokenSequenceTy
+                                                       : Ctx.MetaInfoTy;
+    Info.CurrentCall->createMacroParam(Call, PVD, SlotTy) = ParamValues[I];
+  }
+
+  EvalStmtResult ESR;
+  {
+    CallStackFrame Frame(Info, Macro->getSourceRange(), Macro,
+                         /*This=*/nullptr, /*CallExpr=*/nullptr, Call);
+    StmtResult Ret = {Result, nullptr};
+    Info.CurrentCall->FunctionReturnValue = &Result;
+    ESR = EvaluateStmt(Ret, Info, Macro->getBody());
+  }
+  if (ESR == ESR_Succeeded) {
+    Info.FFDiag(Macro->getEndLoc(), diag::note_constexpr_no_return);
+    return false;
+  }
+  if (ESR != ESR_Returned || !CallScope.destroy())
+    return false;
+  // A std::meta::token_sequence: the token array it holds.
+  if (Result.isStruct() && Result.getStructNumFields() == 1 &&
+      Result.getStructField(0).isTokenSequence()) {
+    APValue TS = Result.getStructField(0);
+    Result = std::move(TS);
+  }
+  Info.discardCleanups();
+  return !Info.EvalStatus.HasSideEffects;
+}
+
 bool Expr::isPotentialConstantExpr(const FunctionDecl *FD,
                                    SmallVectorImpl<
                                      PartialDiagnosticAt> &Diags) {
@@ -25220,6 +28449,9 @@ public:
   bool check(const APValue &Value, QualType Type) {
     if (Value.isReflection())
       return !Value.isNullReflection();
+    // A token sequence is a compiler-owned consteval-only value.
+    if (Value.isTokenSequence())
+      return true;
     if (Value.isMemberPointer()) {
       const auto *FD = dyn_cast_or_null<FunctionDecl>(Value.getMemberPointerDecl());
       return FD && FD->isImmediateFunction();

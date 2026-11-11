@@ -2602,7 +2602,17 @@ public:
   bool isArithmeticType() const;   // C99 6.2.5p18 (integer + floating)
   bool isVoidType() const;         // C99 6.2.5p19
   bool isReflectionType() const;   // C++2c reflection [CXX26]
-  bool isScalarType() const;       // C99 6.2.5p21 (arithmetic + pointers)
+  bool isTokenSequenceType() const;  // C++2c token sequences
+  bool isMetaTokenType() const;      // std::meta::token
+  /// std::meta::token_sequence: the type of a token literal, ^^{ ... } (the
+  /// compiler's token array, with the library's interface).
+  bool isStdMetaTokenSequenceType() const;
+  /// The compiler's token array, or std::meta::token_sequence.
+  bool isTokenSequenceLikeType() const {
+    return isTokenSequenceType() || isStdMetaTokenSequenceType();
+  }
+  bool isNoReturnType() const;       // std::noreturn_t (P3549)
+  bool isScalarType() const;         // C99 6.2.5p21 (arithmetic + pointers)
   bool isAggregateType() const;
   bool isFundamentalType() const;
   bool isCompoundType() const;
@@ -2778,7 +2788,8 @@ public:
     STK_IntegralComplex,
     STK_FloatingComplex,
     STK_FixedPoint,
-    STK_Reflection
+    STK_Reflection,
+    STK_TokenSequence,
   };
 
   /// Given that this is a scalar type, classify it.
@@ -3217,7 +3228,7 @@ private:
       : Type(Builtin, QualType(),
              K == Dependent ? TypeDependence::DependentInstantiation
                             : TypeDependence::None,
-             /*ConstevalOnly=*/(K == MetaInfo)) {
+             /*ConstevalOnly=*/(K == MetaInfo || K == TokenSequence || K == MetaToken)) {
     static_assert(Kind::LastKind <
                       (1 << BuiltinTypeBitfields::NumOfBuiltinTypeBits) &&
                   "Defined builtin type exceeds the allocated space for serial "
@@ -7217,10 +7228,10 @@ public:
 class AutoType : public DeducedType {
   friend class ASTContext; // ASTContext creates these
 
-  TemplateDecl *TypeConstraintConcept;
+  TemplateName TypeConstraintConcept;
 
   AutoType(QualType DeducedAsType, AutoTypeKeyword Keyword,
-           TypeDependence ExtraDependence, QualType Canon, TemplateDecl *CD,
+           TypeDependence ExtraDependence, QualType Canon, TemplateName CD,
            ArrayRef<TemplateArgument> TypeConstraintArgs);
 
 public:
@@ -7229,13 +7240,11 @@ public:
             AutoTypeBits.NumArgs};
   }
 
-  TemplateDecl *getTypeConstraintConcept() const {
+  TemplateName getTypeConstraintConcept() const {
     return TypeConstraintConcept;
   }
 
-  bool isConstrained() const {
-    return TypeConstraintConcept != nullptr;
-  }
+  bool isConstrained() const { return !TypeConstraintConcept.isNull(); }
 
   bool isDecltypeAuto() const {
     return getKeyword() == AutoTypeKeyword::DecltypeAuto;
@@ -7252,7 +7261,7 @@ public:
   void Profile(llvm::FoldingSetNodeID &ID, const ASTContext &Context);
   static void Profile(llvm::FoldingSetNodeID &ID, const ASTContext &Context,
                       QualType Deduced, AutoTypeKeyword Keyword,
-                      bool IsDependent, TemplateDecl *CD,
+                      bool IsDependent, TemplateName CD,
                       ArrayRef<TemplateArgument> Arguments);
 
   static bool classof(const Type *T) {
@@ -8613,6 +8622,9 @@ inline bool Type::isFundamentalType() const {
   return isVoidType() ||
          isNullPtrType() ||
          isReflectionType() ||
+         isTokenSequenceType() ||
+         isMetaTokenType() ||
+         isNoReturnType() ||
          // FIXME: It's really annoying that we don't have an
          // 'isArithmeticType()' which agrees with the standard definition.
          (isArithmeticType() && !isEnumeralType());
@@ -9013,6 +9025,19 @@ inline bool Type::isVoidType() const {
   return isSpecificBuiltinType(BuiltinType::Void);
 }
 
+inline bool Type::isTokenSequenceType() const {
+  if (const auto *BT = dyn_cast<BuiltinType>(CanonicalType)) {
+    return BT->getKind() == BuiltinType::TokenSequence;
+  }
+  return false;
+}
+
+inline bool Type::isMetaTokenType() const {
+  if (const auto *BT = dyn_cast<BuiltinType>(CanonicalType))
+    return BT->getKind() == BuiltinType::MetaToken;
+  return false;
+}
+
 inline bool Type::isHalfType() const {
   // FIXME: Should we allow complex __fp16? Probably not.
   return isSpecificBuiltinType(BuiltinType::Half);
@@ -9040,6 +9065,10 @@ inline bool Type::isMFloat8Type() const {
 
 inline bool Type::isFloat128Type() const {
   return isSpecificBuiltinType(BuiltinType::Float128);
+}
+
+inline bool Type::isNoReturnType() const {
+  return isSpecificBuiltinType(BuiltinType::NoReturn);
 }
 
 inline bool Type::isIbm128Type() const {
@@ -9121,7 +9150,7 @@ inline bool Type::isReflectionType() const {
 inline bool Type::isScalarType() const {
   if (const auto *BT = dyn_cast<BuiltinType>(CanonicalType))
     return BT->getKind() > BuiltinType::Void &&
-           BT->getKind() <= BuiltinType::MetaInfo;
+           BT->getKind() <= BuiltinType::TokenSequence;
   if (const EnumType *ET = dyn_cast<EnumType>(CanonicalType))
     // Enums are scalar types, but only if they are defined.  Incomplete enums
     // are not treated as scalar types.

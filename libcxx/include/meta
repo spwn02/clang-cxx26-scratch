@@ -401,7 +401,8 @@ consteval auto has_inaccessible_bases(
 #else
 #  include <__algorithm/reverse.h>
 #  include <__config>
-#include <__memory/addressof.h>
+#  include <__memory/addressof.h>
+#  include <__meta/metafunction_ids.h>
 #include <bit>
 #include <compare>
 #include <exception>
@@ -410,6 +411,7 @@ consteval auto has_inaccessible_bases(
 
 #include <__ranges/access.h>
 #include <__ranges/concepts.h>
+#include <__ranges/enable_borrowed_range.h>
 #include <__ranges/size.h>
 
 #include <source_location>
@@ -529,142 +531,6 @@ concept reflection_range =
 
 
 namespace __detail {
-enum : unsigned {
-
-  // non-exposed metafunctions
-  __metafn_get_begin_enumerator_decl_of,
-  __metafn_get_get_next_enumerator_decl_of,
-  __metafn_get_ith_base_of,
-  __metafn_get_ith_template_argument_of,
-  __metafn_get_begin_member_decl_of,
-  __metafn_get_next_member_decl_of,
-  __metafn_is_structural_type,
-  __metafn_map_decl_to_entity,
-
-  // CXX26 metafunctions
-  __metafn_identifier_of,
-  __metafn_has_identifier,
-  __metafn_operator_of,
-  __metafn_source_location_of,
-  __metafn_type_of,
-  __metafn_parent_of,
-  __metafn_has_parent,
-  __metafn_underlying_entity_of,
-  __metafn_object_of,
-  __metafn_constant_of,
-  __metafn_template_of,
-  __metafn_substitute,
-  __metafn_extract,
-  __metafn_is_public,
-  __metafn_is_protected,
-  __metafn_is_private,
-  __metafn_is_virtual,
-  __metafn_is_pure_virtual,
-  __metafn_is_override,
-  __metafn_is_deleted,
-  __metafn_is_defaulted,
-  __metafn_is_explicit,
-  __metafn_is_noexcept,
-  __metafn_is_bit_field,
-  __metafn_is_enumerator,
-  __metafn_is_final,
-  __metafn_is_const,
-  __metafn_is_volatile,
-  __metafn_is_mutable_member,
-  __metafn_is_lvalue_reference_qualified,
-  __metafn_is_rvalue_reference_qualified,
-  __metafn_has_static_storage_duration,
-  __metafn_has_thread_storage_duration,
-  __metafn_has_automatic_storage_duration,
-  __metafn_has_internal_linkage,
-  __metafn_has_module_linkage,
-  __metafn_has_external_linkage,
-  __metafn_has_linkage,
-  __metafn_is_class_member,
-  __metafn_is_namespace_member,
-  __metafn_is_nonstatic_data_member,
-  __metafn_is_static_member,
-  __metafn_is_base,
-  __metafn_is_data_member_spec,
-  __metafn_is_namespace,
-  __metafn_is_function,
-  __metafn_is_variable,
-  __metafn_is_type,
-  __metafn_is_alias,
-  __metafn_is_complete_type,
-  __metafn_has_complete_definition,
-  __metafn_is_enumerable_type,
-  __metafn_is_template,
-  __metafn_is_function_template,
-  __metafn_is_variable_template,
-  __metafn_is_class_template,
-  __metafn_is_alias_template,
-  __metafn_is_conversion_function_template,
-  __metafn_is_operator_function_template,
-  __metafn_is_literal_operator_template,
-  __metafn_is_constructor_template,
-  __metafn_is_concept,
-  __metafn_is_structured_binding,
-  __metafn_is_value,
-  __metafn_is_object,
-  __metafn_has_template_arguments,
-  __metafn_has_default_member_initializer,
-  __metafn_is_conversion_function,
-  __metafn_is_operator_function,
-  __metafn_is_literal_operator,
-  __metafn_is_constructor,
-  __metafn_is_default_constructor,
-  __metafn_is_copy_constructor,
-  __metafn_is_move_constructor,
-  __metafn_is_assignment,
-  __metafn_is_copy_assignment,
-  __metafn_is_move_assignment,
-  __metafn_is_destructor,
-  __metafn_is_special_member_function,
-  __metafn_is_user_provided,
-  __metafn_is_user_declared,
-  __metafn_reflect_result,
-  __metafn_data_member_spec,
-  __metafn_define_aggregate,
-  __metafn_offset_of,
-  __metafn_size_of,
-  __metafn_bit_offset_of,
-  __metafn_bit_size_of,
-  __metafn_alignment_of,
-  __metafn_has_c_language_linkage,
-
-  // P3096 parameter reflection metafunctions
-  __metafn_get_ith_parameter_of,
-  __metafn_is_vararg_function,
-  __metafn_has_default_argument,
-  __metafn_is_explicit_object_parameter,
-  __metafn_is_function_parameter,
-  __metafn_return_type_of,
-  __metafn_variable_of,
-
-  // P3394 annotation metafunctions
-  __metafn_get_ith_annotation_of,
-  __metafn_is_annotation,
-
-  // P3493 accessibility metafunctions
-  __metafn_access_context,
-  __metafn_current_function,
-  __metafn_current_class,
-  __metafn_current_namespace,
-  __metafn_is_accessible,
-
-  // Other bespoke functions (not proposed at this time)
-  __metafn_is_access_specified,
-  __metafn_reflect_invoke,
-
-  // P4033 extension: completing unscoped (C-style) enums
-
-  __metafn_is_closure_type,
-
-  // P3491R3 string-literal helper
-  __metafn_is_string_literal,
-  __metafn_reflect_array_object,
-};
 
 consteval auto __workaround_expand_compiler_builtins(info __type) -> info;
 
@@ -674,6 +540,136 @@ consteval auto __underlying_entity_of(info __r) -> info {
 }
 
 }  // namespace __detail
+
+#if _LIBCPP_STD_VER >= 29
+// A single token: a scalar.
+using token = decltype(__metafunction(__detail::__metafn_token_type));
+
+// Any contiguous run of tokens: a token_sequence, a span, an array.
+template <class _Rp>
+concept __token_range =
+    ranges::contiguous_range<_Rp> && ranges::sized_range<_Rp> &&
+    same_as<remove_cv_t<ranges::range_value_t<_Rp>>, token>;
+
+// A sequence of tokens: the type of a token literal, ^^{ ... }, and of a
+// macro's raw parameter. It is a value. Copying one is cheap; += and + make
+// a longer sequence (in amortized constant time per token appended), and
+// subseq a shorter one (in constant time), without disturbing any other
+// sequence. The compiler owns the tokens (in static storage, like a string
+// literal's), so iterators into a sequence never dangle.
+//
+// The compiler holds the tokens in a member only it can name, and does the
+// operations below natively; the definitions here say what they do.
+class token_sequence {
+public:
+  using value_type = token;
+  using size_type = size_t;
+  using difference_type = ptrdiff_t;
+  using reference = token const&;
+  using const_reference = token const&;
+  using pointer = token const*;
+  using const_pointer = token const*;
+  using iterator = token const*;
+  using const_iterator = token const*;
+
+  static constexpr size_type npos = size_type(-1);
+
+  _LIBCPP_HIDE_FROM_ABI constexpr token_sequence() noexcept = default;
+
+  // The tokens listed: token_sequence{t0, t1}.
+  consteval token_sequence(initializer_list<token> __il)
+      : token_sequence(__metafunction(__detail::__metafn_tokens_join,
+                                      __il.begin(), __il.size())) {}
+
+  // The tokens of a range: a contiguous one in one step, any other one by
+  // one.
+  template <__token_range _Rp>
+    requires(!same_as<remove_cvref_t<_Rp>, token_sequence>)
+  consteval explicit token_sequence(_Rp const& __r)
+      : token_sequence(__metafunction(__detail::__metafn_tokens_join,
+                                      ranges::data(__r), ranges::size(__r))) {}
+  template <ranges::input_range _Rp>
+    requires(!__token_range<_Rp> &&
+             same_as<remove_cvref_t<ranges::range_reference_t<_Rp>>, token>)
+  consteval explicit token_sequence(_Rp&& __r) {
+    for (token __t : __r)
+      *this += __t;
+  }
+
+  // The tokens as objects, in static storage made once per sequence (null if
+  // there are none).
+  _LIBCPP_HIDE_FROM_ABI constexpr pointer data() const noexcept {
+    return __metafunction(__detail::__metafn_tokens_materialize, *this);
+  }
+  _LIBCPP_HIDE_FROM_ABI constexpr iterator begin() const noexcept { return data(); }
+  _LIBCPP_HIDE_FROM_ABI constexpr iterator end() const noexcept { return data() + size(); }
+  _LIBCPP_HIDE_FROM_ABI constexpr iterator cbegin() const noexcept { return begin(); }
+  _LIBCPP_HIDE_FROM_ABI constexpr iterator cend() const noexcept { return end(); }
+  _LIBCPP_HIDE_FROM_ABI constexpr size_type size() const noexcept {
+    return __metafunction(__detail::__metafn_token_count, *this);
+  }
+  _LIBCPP_HIDE_FROM_ABI constexpr bool empty() const noexcept { return size() == 0; }
+  _LIBCPP_HIDE_FROM_ABI constexpr reference operator[](size_type __i) const { return data()[__i]; }
+  _LIBCPP_HIDE_FROM_ABI constexpr reference front() const { return data()[0]; }
+  _LIBCPP_HIDE_FROM_ABI constexpr reference back() const { return data()[size() - 1]; }
+
+  // The __n tokens (or as many as there are) starting at __pos.
+  consteval auto subseq(size_type __pos, size_type __n = npos) const
+      -> token_sequence {
+    return __metafunction(__detail::__metafn_tokens_subseq, *this, __pos, __n);
+  }
+
+  // Appending and concatenating, and comparing token by token. (Hidden
+  // friends: an operator template found by ADL would be considered for every
+  // operator on any std::meta type, and that costs.)
+  friend consteval auto operator+=(token_sequence& __a,
+                                   token_sequence const& __b)
+      -> token_sequence& {
+    __a = __metafunction(__detail::__metafn_tokens_append, __a, __b);
+    return __a;
+  }
+  friend consteval auto operator+=(token_sequence& __a, token __t)
+      -> token_sequence& {
+    __a = __metafunction(__detail::__metafn_tokens_append, __a, __t);
+    return __a;
+  }
+  friend consteval auto operator+(token_sequence __a,
+                                  token_sequence const& __b)
+      -> token_sequence {
+    __a += __b;
+    return __a;
+  }
+  friend consteval auto operator+(token_sequence __a, token __t)
+      -> token_sequence {
+    __a += __t;
+    return __a;
+  }
+  friend consteval auto operator+(token __t, token_sequence const& __b)
+      -> token_sequence {
+    token_sequence __r;
+    __r += __t;
+    __r += __b;
+    return __r;
+  }
+  friend consteval bool operator==(token_sequence const& __a,
+                                   token_sequence const& __b) {
+    return __metafunction(__detail::__metafn_tokens_equal, __a, __b);
+  }
+  // A token against a single-token sequence: tok == ^^{ + }.
+  friend consteval bool operator==(token __t, token_sequence const& __s) {
+    return __metafunction(__detail::__metafn_tokens_equal, __t, __s);
+  }
+};
+
+namespace __detail {
+// (How the compiler interpolates any other contiguous range of tokens: a
+// std::span<const token>, say.)
+template <__token_range _Rp>
+_LIBCPP_HIDE_FROM_ABI constexpr auto __tokens_of_range(_Rp const& __r) -> token_sequence {
+  return token_sequence(__r);
+}
+}  // namespace __detail
+#endif // _LIBCPP_STD_VER >= 29
 
 namespace __range_of_infos {
 
@@ -917,6 +913,22 @@ consteval auto u8identifier_of(info __r) -> u8string_view {
                         ^^u8identifier_of);
 }
 
+#if _LIBCPP_STD_VER >= 29
+// The spelling of a single identifier token. As for identifier_of(info), any
+// other operand -- a keyword, literal or punctuator, or an empty or
+// multi-token sequence -- is not a constant expression; test with
+// token_kind_of(tok) == token_kind::identifier first.
+consteval auto identifier_of(token __tok) -> string_view {
+  return __metafunction(__detail::__metafn_identifier_of_token, ^^const char *,
+                        __tok, /*UTF8=*/false);
+}
+
+consteval auto u8identifier_of(token __tok) -> u8string_view {
+  return __metafunction(__detail::__metafn_identifier_of_token,
+                        ^^const char8_t *, __tok, /*UTF8=*/true);
+}
+#endif // _LIBCPP_STD_VER >= 29
+
 // Returns an implementation-defined name for the reflected entity.
 consteval auto display_string_of(info __r) -> string_view;
 consteval auto u8display_string_of(info __r) -> u8string_view;
@@ -938,8 +950,18 @@ using enum operators;
 
 // Returns the operator overloaded by the represented operator function or
 // operator function template.
+#if _LIBCPP_STD_VER >= 29
+consteval auto is_binary_operation(info) -> bool;
+#endif
+
 consteval auto operator_of(info __r) -> operators {
-  if (!is_operator_function(__r) && !is_operator_function_template(__r))
+  if (!is_operator_function(__r) && !is_operator_function_template(__r)
+#if _LIBCPP_STD_VER >= 29
+      // The reflection of a binary-operation expression (a macro argument)
+      // has an operator too.
+      && !is_binary_operation(__r)
+#endif
+  )
     throw __lib_exception(u8"operator_of requires an operator function or operator function template", ^^operator_of, source_location::current(__builtin_meta_call_origin()));
   return operators(__metafunction(__detail::__metafn_operator_of, __r));
 }
@@ -3828,7 +3850,434 @@ consteval auto u8display_string_of(info __r) -> u8string_view {
   return __detail::pretty_printer<char8_t>::print(__r);
 }
 
+#if _LIBCPP_STD_VER >= 29
+
+// helper for building up delimited lists of token sequences
+class list_builder {
+  token_sequence __body_ = ^^{};
+  token_sequence __delim_;
+  bool __first_ = true;
+
+public:
+  // default to no delimiter
+  consteval explicit list_builder(token_sequence __d = ^^{ }) : __delim_(__d) {}
+
+  consteval auto operator+=(token_sequence const& __tok) -> void {
+    if (!__tok.empty()) {
+      if (not __first_) {
+        __body_ += __delim_;
+      }
+      __first_ = false;
+      __body_ += __tok;
+    }
+  }
+  consteval auto operator+=(token __tok) -> void {
+    if (not __first_) {
+      __body_ += __delim_;
+    }
+    __first_ = false;
+    __body_ += __tok;
+  }
+
+  consteval operator token_sequence() const { return __body_; }
+};
+
+// A single identifier token assembled from the arguments (strings and
+// integers), the identifier sibling of str_lit(). Compare against a token
+// directly: ts[0] == id("a").
+template <class... _Ts>
+consteval auto id(_Ts const&...) -> token_sequence;
+
+template <class... _Ts>
+consteval auto str_lit(_Ts const&...) -> token_sequence;
+
+// Tokenize strings into a token_sequence.
+// Arguments are concatenated and then lexed as C++ source code.
+// Accepts integers, characters, string literals, and types with data()/size().
+template <class... _Ts>
+consteval auto tokenize(_Ts const&...) -> token_sequence;
+
+// Convert a token_sequence back into a string.
+// Preserves whitespace between tokens.
+consteval auto stringize(token_sequence) -> char const*;
+consteval auto stringize(token) -> char const*;
+
+// Queue token injection into the current or specified namespace.
+// Accepts any type convertible to token_sequence.
+consteval auto queue_injection(token_sequence __tokens) -> void;
+consteval auto queue_injection(info __target_ns, token_sequence __tokens) -> void;
+
+// Report tokens for debugging (emits a warning with the token content).
+template <class _Mp>
+consteval auto report_tokens(_Mp const& __msg, token_sequence __tokens) -> void;
+
+// Expression macros (experimental): queries on the reflection of an argument
+// expression bound to a macro parameter, and on token sequences.
+
+// The argument as spelled at the invocation.
+consteval auto source_text_of(info __r) -> string_view {
+  return __metafunction(__detail::__metafn_source_text_of, ^^const char *, __r);
+}
+
+// Whether the expression applies a (built-in, overloaded, or rewritten)
+// binary operator. operator_of gives the operator; operands_of the operands
+// as written, each itself a reflection of an expression.
+consteval auto is_binary_operation(info __r) -> bool {
+  return __metafunction(__detail::__metafn_is_binary_operation, __r);
+}
+
+consteval auto operands_of(info __r) -> vector<info> {
+  return {__metafunction(__detail::__metafn_get_ith_operand_of, __r, 0),
+          __metafunction(__detail::__metafn_get_ith_operand_of, __r, 1)};
+}
+
+// The lexical category of a single token. All operators and punctuators
+// collapse into `punctuator` (compare against a specific spelling with
+// `tok == ^^{ + }` when you need to distinguish them). A sequence that is
+// empty or holds more than one token classifies as `unknown`.
+enum class token_kind {
+  identifier,
+  keyword,
+  literal,
+  punctuator,
+  annotation,
+  unknown,
+};
+
+// Token classification. To match a specific identifier, compare the token
+// against id(...) directly: tok == id("name"); to read its spelling, use
+// identifier_of(tok).
+consteval auto token_kind_of(token __tok) -> token_kind {
+  return token_kind(__metafunction(__detail::__metafn_token_kind_of, __tok));
+}
+
+consteval auto operator_of(token __tok) -> operators {
+  return operators(__metafunction(__detail::__metafn_operator_of_token, __tok));
+}
+
+// C++'s punctuators: the operator-or-punctuator tokens that are not keywords,
+// plus '^^' and the splice brackets. A digraph or alternative token is the
+// same punctuator as its primary spelling ('<%' is left_brace, 'and' is
+// ampersand_ampersand). Names follow those of std::meta::operators; every
+// operator with a one-token spelling has a punctuator of the same name.
+//
+// Like an operators value, a punctuator value interpolates as its token:
+// ^^{ \(punctuator::left_brace) } is a sequence of just '{', which a token
+// literal cannot spell.
+//
+// (The order is the compiler's: see clang/AST/MetaPunctuators.def.)
+enum class punctuator {
+  left_brace, right_brace, left_square, right_square, left_paren, right_paren,
+  left_splice, right_splice, semicolon, colon, ellipsis, question, colon_colon,
+  period, period_star, arrow, arrow_star, tilde, exclamation, plus, minus, star,
+  slash, percent, caret, ampersand, pipe, equals, plus_equals, minus_equals,
+  star_equals, slash_equals, percent_equals, caret_equals, ampersand_equals,
+  pipe_equals, equals_equals, exclamation_equals, less, greater, less_equals,
+  greater_equals, spaceship, ampersand_ampersand, pipe_pipe, less_less,
+  greater_greater, less_less_equals, greater_greater_equals, plus_plus,
+  minus_minus, comma, hash, hash_hash, caret_caret
+};
+
+// The punctuator a single token is.
+consteval auto punctuator_of(token __tok) -> punctuator {
+  return punctuator(__metafunction(__detail::__metafn_punctuator_of, __tok));
+}
+
+// The punctuator's (primary) spelling.
+consteval auto symbol_of(punctuator __p) -> string_view {
+  static constexpr string_view __names[55] = {
+      "{", "}", "[", "]", "(", ")", "[:", ":]", ";", ":", "...", "?", "::", ".",
+      ".*", "->", "->*", "~", "!", "+", "-", "*", "/", "%", "^", "&", "|", "=",
+      "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "==", "!=", "<", ">",
+      "<=", ">=", "<=>", "&&", "||", "<<", ">>", "<<=", ">>=", "++", "--", ",",
+      "#", "##", "^^"
+  };
+  return __names[int(__p)];
+}
+
+consteval auto u8symbol_of(punctuator __p) -> u8string_view {
+  static constexpr u8string_view __names[55] = {
+      u8"{", u8"}", u8"[", u8"]", u8"(", u8")", u8"[:", u8":]", u8";", u8":",
+      u8"...", u8"?", u8"::", u8".", u8".*", u8"->", u8"->*", u8"~", u8"!",
+      u8"+", u8"-", u8"*", u8"/", u8"%", u8"^", u8"&", u8"|", u8"=", u8"+=",
+      u8"-=", u8"*=", u8"/=", u8"%=", u8"^=", u8"&=", u8"|=", u8"==", u8"!=",
+      u8"<", u8">", u8"<=", u8">=", u8"<=>", u8"&&", u8"||", u8"<<", u8">>",
+      u8"<<=", u8">>=", u8"++", u8"--", u8",", u8"#", u8"##", u8"^^"
+  };
+  return __names[int(__p)];
+}
+
+// Whether a reflected macro argument is a constant expression, i.e. whether
+// constant_of(r) would yield its value. This is how an operator macro decides
+// between a compile-time and a run-time expansion for an operand.
+consteval auto is_constant_expression(info __r) -> bool {
+  return __metafunction(__detail::__metafn_is_constant_expression, __r);
+}
+
+// Speculatively parses the token sequence as a single expression at the
+// expansion site of the macro being evaluated, with all diagnostics
+// suppressed. Returns a reflection of the parsed expression if the tokens
+// form a valid one, and nullopt otherwise. On success the reflection can be
+// queried (type_of) and interpolated, reusing the parse:
+//
+//   if (auto r = test_expression(^^{ (\(e).begin()) }))
+//     return ^^{ \(*r) };
+consteval auto test_expression(token_sequence __tokens) -> optional<info> {
+  info __r = __metafunction(__detail::__metafn_test_expression, __tokens);
+  if (__r == info{})
+    return nullopt;
+  return __r;
+}
+
+// Views a reflected expression as an lvalue, as if it had been bound to
+// `auto&& tmp` and then named: identity for an lvalue, a change of view for
+// an xvalue, a materialized temporary (living until the end of the enclosing
+// full-expression) for a prvalue. This is how a macro's expansion reproduces
+// the semantics of a function's named parameter for an operand it received
+// unevaluated -- e.g. the `t` of [range.access.begin]:
+//
+//   return ^^{ auto(\(as_lvalue(r)).begin()) };
+consteval auto as_lvalue(info __r) -> info {
+  return __metafunction(__detail::__metafn_as_lvalue, __r);
+}
+
+// Reflects the context the macro being expanded is expanding *into*: the
+// enclosing function for an invocation in expression position (or in
+// declaration position inside a function body), the class for a member
+// declaration, otherwise the enclosing namespace.
+//
+// This is how a macro body queries its invocation site at translation time --
+// e.g. a `try_`-style macro asks for the enclosing function's return type via
+// return_type_of -- without injecting anything into the expansion to recompute
+// it there. A macro that only makes sense in one kind of context should check
+// the kind it got and decline (std::constexpr_error_str) otherwise.
+//
+// Only meaningful inside an expression macro body; evaluating it in an
+// ordinary constant expression is an error.
+consteval auto macro_expansion_context() -> info {
+  return __metafunction(__detail::__metafn_macro_expansion_context);
+}
+
+// Makes the macro being expanded wait for template instantiation. In a
+// templated context (a function template, a member of a class template, a
+// generic lambda, ...), the invocation is not expanded where it appears: it
+// becomes a dependent expression, and the macro is evaluated again for each
+// instantiation, where this call does nothing. Outside templates it does
+// nothing at all.
+//
+// For a macro whose expansion needs the instantiated context even though its
+// arguments are not dependent -- e.g. naming a local that only an
+// instantiation-time injection declares:
+//
+//   __macro id(token_sequence name) {
+//     std::meta::expand_at_instantiation();
+//     return name;
+//   }
+//
+// Call it before anything else in the body: the evaluation it ends is thrown
+// away.
+//
+// Only meaningful inside a macro body; evaluating it in an ordinary constant
+// expression is an error.
+consteval auto expand_at_instantiation() -> void {
+  (void)__metafunction(__detail::__metafn_expand_at_instantiation);
+}
+
+// Naming policy for declaration_of.
+struct clone_naming {
+  // Replacement declaration name; an empty sequence keeps the source's name
+  // (including operator names).
+  token_sequence name = ^^{ };
+
+  // Renaming prefixes: template parameters become T0, T1, ...; function
+  // parameters become p0, p1, ....
+  string_view template_parameter_prefix = "T";
+  string_view parameter_prefix = "p";
+};
+
+// Returns a reflection describing a clone of the member function (or member
+// function template) designated by 'fn': same template head, constraints,
+// parameters (with their default arguments), cv/ref-qualifiers, and return
+// type, with template and function parameters renamed per 'naming'. noexcept
+// is deliberately not cloned: the new body has its own exception behavior.
+//
+// The description does not yet declare anything. Interpolating it with \(d)
+// in member-declaration position of a class definition declares the described
+// function there, followed by its new body:
+//
+//   ^^{ \(d) { return \(call); } }
+//
+// Reusing the description in another class creates fresh declarations.
+consteval auto declaration_of(info __fn, clone_naming __naming = {}) -> info {
+  return __metafunction(__detail::__metafn_declaration_of, __fn, __naming.name,
+                        __naming.template_parameter_prefix.size(),
+                        __naming.template_parameter_prefix.data(),
+                        __naming.parameter_prefix.size(),
+                        __naming.parameter_prefix.data());
+}
+
+// Returns true if 'r' is a declaration description produced by
+// declaration_of.
+consteval auto is_declaration_spec(info __r) -> bool {
+  return __metafunction(__detail::__metafn_is_declaration_spec, __r);
+}
+
+// Declaration transformations: each takes a declaration description and
+// returns a new description with the transformation applied; the original
+// is unchanged. They compose:
+//
+//   auto d = declaration_of(m);
+//   d = make_override(d);          // inject '... override'
+//
+// make_override: the injected clone is declared 'override' -- it must
+// override an inherited virtual, diagnosed at the destination class the
+// same way a written 'override' would be. Refused for member function
+// template descriptions (a template cannot be virtual).
+consteval auto make_override(info __d) -> info {
+  return __metafunction(__detail::__metafn_make_override, __d);
+}
+
+// make_noexcept: the injected clone is declared noexcept. declaration_of
+// deliberately does not clone the source's exception specification (the
+// new body has its own exception behavior); this asks for noexcept
+// explicitly -- e.g. a mock mirroring an interface whose virtuals are
+// noexcept, where a looser override would be ill-formed.
+consteval auto make_noexcept(info __d) -> info {
+  return __metafunction(__detail::__metafn_make_noexcept, __d);
+}
+
+// declaration_of also accepts a *class template*: the description then
+// describes only its template head, consumed by the two fragment accessors
+// below (interpolating such a description directly is an error -- there is
+// no whole-declaration meaning for it).
+//
+// The motivating use is generating partial specializations that "forward"
+// a template's own parameters -- the tuple protocol for an annotated class
+// template, say:
+//
+//   auto d    = declaration_of(tmpl);
+//   auto head = template_parameter_list_for(d, {.defaults = false});
+//   auto args = template_argument_list_for(d);
+//   queue_injection(^^std, ^^{
+//     template <\(head)>
+//     struct tuple_size<\(tmpl)<\(args)>> : ... { };
+//
+//     template <size_t I, \(head)>
+//     struct tuple_element<I, \(tmpl)<\(args)>> { ... };
+//   });
+//
+// The head is a *fragment* spelled inside a written template<...> list, so
+// it composes with extra written parameters (tuple_element's I above).
+
+struct template_list_options {
+  // Whether the cloned parameters keep their default template arguments.
+  // Pass false when the fragment parameterizes a partial specialization,
+  // where default arguments are not permitted.
+  bool defaults = true;
+};
+
+// The description's template parameters as a parameter-list fragment:
+// 'class T0, size_t T1, class... T2' (renamed per the description's
+// template_parameter_prefix, constraints preserved). The returned sequence
+// carries the parameters semantically (as an annotation), so constrained
+// parameters keep their meaning at the injection site; it is only usable
+// inside a template<...> parameter list. The source's own requires-clause
+// is not carried: any actual specialization the injected declaration can
+// match already satisfies it. Works for class template heads and for
+// member function template descriptions alike.
+consteval auto template_parameter_list_for(info __d,
+                                           template_list_options __opts = {})
+    -> token_sequence {
+  return __metafunction(__detail::__metafn_template_parameter_list_for, __d,
+                        __opts.defaults);
+}
+
+// The matching argument list: 'T0, T1, T2...' (packs expanded). Refused for
+// a template parameter pack followed by more parameters -- such an argument
+// list is a non-deduced context, so a specialization written with it could
+// never be matched.
+consteval auto template_argument_list_for(info __d) -> token_sequence {
+  return __metafunction(__detail::__metafn_template_argument_list_for, __d);
+}
+
+struct argument_list_options {
+  // forward = true: each parameter passed as static_cast<decltype(p0)&&>(p0)
+  // (by-value and rvalue-reference parameters move). forward = false: each
+  // parameter named as an lvalue (p0) -- for callees that should not consume
+  // the arguments, or when the body uses them again after the call.
+  bool forward = true;
+};
+
+// The description's parameters spelled as call arguments:
+// 'static_cast<decltype(p0)&&>(p0), p1...' (packs expanded). The low-level
+// fragment beneath forwarding_call_for, for calls whose *callee* the
+// generator spells itself:
+//
+//   \(handler)(\(argument_list_for(d)))              // a mock's handler
+//
+//   auto args = list_builder(^^{ , });
+//   args += ^^{ data };
+//   args += argument_list_for(d);                    // vt->slot(data, args...)
+//
+// Packs expand positionally in a function argument list, so -- unlike
+// forwarding_call_for and template_argument_list_for -- a nonterminal pack
+// is fine here. The callee's own requirements remain the caller's problem
+// (a noexcept clone invoking a throwing callee terminates). Refused for
+// explicit-object members, C-style variadics, and head-only descriptions.
+consteval auto argument_list_for(info __d, argument_list_options __opts = {})
+    -> token_sequence {
+  return __metafunction(__detail::__metafn_argument_list_for, __d, __opts.forward);
+}
+
+// Returns tokens for a call forwarding the parameters of the description 'd'
+// to the same-named member of 'receiver', intended as the body of the
+// injected clone:
+//
+//   auto d = declaration_of(m);
+//   out += ^^{ \(d) { return \(forwarding_call_for(d, ^^{ impl })); } };
+//
+// The generated call names the *source* member on the receiver (found by
+// ordinary member lookup there; a renamed clone still forwards to the member
+// it was cloned from), passes every cloned template parameter explicitly,
+// and forwards each parameter as static_cast<decltype(p)&&>(p). The receiver
+// is grouped (so '*ptr' works) and cast to carry the described member's
+// cv- and ref-qualifiers, so a const clone calls the const overload even
+// through a mutable member, and an rvalue-qualified clone moves its
+// receiver. Pass {.forward = false} to pass the parameters as lvalues
+// instead of forwarding them (e.g. to use them again after the call). Refused (constexpr_error) for descriptions this recipe cannot
+// forward faithfully: explicit-object members, C-style variadics, and
+// template heads where a parameter pack is followed by more parameters.
+consteval auto forwarding_call_for(info __d, token_sequence __receiver,
+                                   argument_list_options __opts = {})
+    -> token_sequence {
+  return __metafunction(__detail::__metafn_forwarding_call_for, __d, __receiver,
+                        __opts.forward);
+}
+
+#endif // _LIBCPP_STD_VER >= 29
+
 _LIBCPP_END_NAMESPACE_REFLECTION_V2
+
+#if _LIBCPP_STD_VER >= 29
+// A token_sequence's tokens are in static storage, and copying one is cheap:
+// borrowed, and a view.
+template <>
+inline constexpr bool
+    std::ranges::enable_borrowed_range<std::meta::token_sequence> = true;
+template <>
+inline constexpr bool std::ranges::enable_view<std::meta::token_sequence> =
+    true;
+
+_LIBCPP_BEGIN_NAMESPACE_REFLECTION_V2
+
+// Each token of the sequence. (A token_sequence is a range of tokens, so
+// this is the sequence itself; it predates that.)
+consteval auto tokens_of(token_sequence __tokens) -> token_sequence {
+  return __tokens;
+}
+
+_LIBCPP_END_NAMESPACE_REFLECTION_V2
+#endif // _LIBCPP_STD_VER >= 29
 
 #endif  // _LIBCPP_STD_VER >= 26
 

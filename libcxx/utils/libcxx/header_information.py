@@ -166,12 +166,23 @@ header_restrictions = {
 }
 
 lit_header_restrictions = {
+    # The C++29 networking library is experimental: its headers are empty without the flag.
+    "io": "// ADDITIONAL_COMPILE_FLAGS: -fexperimental-library",
+    "io_buffer": "// ADDITIONAL_COMPILE_FLAGS: -fexperimental-library",
+    "io_stream": "// ADDITIONAL_COMPILE_FLAGS: -fexperimental-library",
+    "io_bridge": "// ADDITIONAL_COMPILE_FLAGS: -fexperimental-library",
+    "io_context": "// ADDITIONAL_COMPILE_FLAGS: -fexperimental-library",
+    "io_file": "// ADDITIONAL_COMPILE_FLAGS: -fexperimental-library",
+    "io_timer": "// ADDITIONAL_COMPILE_FLAGS: -fexperimental-library",
+    "io_signal": "// ADDITIONAL_COMPILE_FLAGS: -fexperimental-library",
+    "net": "// ADDITIONAL_COMPILE_FLAGS: -fexperimental-library",
+    "net_tls": "// ADDITIONAL_COMPILE_FLAGS: -fexperimental-library",
     # Removed in C++20: including them is an error since then.
-    "ccomplex": "// UNSUPPORTED: c++20, c++23, c++26",
-    "ciso646": "// UNSUPPORTED: c++20, c++23, c++26",
-    "cstdalign": "// UNSUPPORTED: c++20, c++23, c++26",
-    "cstdbool": "// UNSUPPORTED: c++20, c++23, c++26",
-    "ctgmath": "// UNSUPPORTED: c++20, c++23, c++26",
+    "ccomplex": "// UNSUPPORTED: c++20, c++23, c++26, c++29",
+    "ciso646": "// UNSUPPORTED: c++20, c++23, c++26, c++29",
+    "cstdalign": "// UNSUPPORTED: c++20, c++23, c++26, c++29",
+    "cstdbool": "// UNSUPPORTED: c++20, c++23, c++26, c++29",
+    "ctgmath": "// UNSUPPORTED: c++20, c++23, c++26, c++29",
     "barrier": "// UNSUPPORTED: no-threads, c++03, c++11, c++14, c++17",
     "coroutine": "// UNSUPPORTED: c++03, c++11, c++14, c++17",
     "cwchar": "// UNSUPPORTED: no-wide-characters",

@@ -1120,6 +1120,9 @@ llvm::DIType *CGDebugInfo::CreateType(const BuiltinType *BT) {
   case BuiltinType::WChar_U:
   case BuiltinType::ULongLong:
   case BuiltinType::MetaInfo:
+  case BuiltinType::TokenSequence:
+  case BuiltinType::MetaToken:
+  case BuiltinType::NoReturn:
     Encoding = llvm::dwarf::DW_ATE_unsigned;
     break;
   case BuiltinType::Short:
@@ -5484,8 +5487,9 @@ CGDebugInfo::EmitDeclareOfAutoVariable(const VarDecl *VD, llvm::Value *Storage,
 
   if (auto *DD = dyn_cast<DecompositionDecl>(VD)) {
     for (BindingDecl *B : DD->flat_bindings())
-      EmitDeclare(B, Storage, std::nullopt, Builder,
-                  VD->getType()->isReferenceType());
+      if (!B->isNestedDecomposition())
+        EmitDeclare(B, Storage, std::nullopt, Builder,
+                    VD->getType()->isReferenceType());
     // Don't emit an llvm.dbg.declare for the composite storage as it doesn't
     // correspond to a user variable.
     return nullptr;

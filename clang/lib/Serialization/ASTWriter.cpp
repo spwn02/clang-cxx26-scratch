@@ -536,7 +536,9 @@ void TypeLocWriter::VisitDecltypeTypeLoc(DecltypeTypeLoc TL) {
 }
 
 void TypeLocWriter::VisitReflectionSpliceTypeLoc(ReflectionSpliceTypeLoc TL) {
-  // nothing to do
+  addSourceLocation(TL.getTypenameKWLoc());
+  addSourceLocation(TL.getSpliceBeginLoc());
+  addSourceLocation(TL.getSpliceEndLoc());
 }
 
 void TypeLocWriter::VisitUnaryTransformTypeLoc(UnaryTransformTypeLoc TL) {
@@ -552,7 +554,7 @@ void ASTRecordWriter::AddConceptReference(const ConceptReference *CR) {
   AddSourceLocation(CR->getTemplateKWLoc());
   AddDeclarationNameInfo(CR->getConceptNameInfo());
   AddDeclRef(CR->getFoundDecl());
-  AddDeclRef(CR->getNamedConcept());
+  AddTemplateName(CR->getNamedConcept());
   push_back(CR->getTemplateArgsAsWritten() != nullptr);
   if (CR->getTemplateArgsAsWritten())
     AddASTTemplateArgumentListInfo(CR->getTemplateArgsAsWritten());
@@ -900,6 +902,9 @@ static void AddStmtsExprs(llvm::BitstreamWriter &Stream,
   RECORD(EXPR_CXX_UUIDOF_EXPR);
   RECORD(EXPR_CXX_UUIDOF_TYPE);
   RECORD(EXPR_LAMBDA);
+  RECORD(EXPR_MATCH_TEST);
+  RECORD(EXPR_CASE_CONDITION);
+  RECORD(EXPR_MATCH_SELECT);
 #undef RECORD
 }
 

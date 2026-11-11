@@ -59,6 +59,7 @@ namespace clang {
   class ParmVarDecl;
   class StringLiteral;
   class TargetInfo;
+  struct TokenSequenceData;
   class ValueDecl;
   class WarnUnusedResultAttr;
 
@@ -555,6 +556,14 @@ public:
   /// semantically correspond to a bool.
   bool isKnownToHaveBooleanValue(bool Semantic = true) const;
 
+  /// Is this a diverging expression (P3549)? One whose evaluation never
+  /// completes: an expression of type std::noreturn_t (which includes a
+  /// throw-expression), or a call to a function declared [[noreturn]],
+  /// whatever its declared return type. Looks through parentheses, full-
+  /// expression wrappers, temporaries, and conversions of a diverging
+  /// operand (CK_NoReturnToAny, CK_ToVoid, CK_NoOp).
+  bool isDiverging() const;
+
   /// Check whether this array fits the idiom of a flexible array member,
   /// depending on the value of -fstrict-flex-array.
   /// When IgnoreTemplateOrMacroSubstitution is set, it doesn't consider sizes
@@ -642,6 +651,25 @@ public:
     /// (which may include expensive operations like converting APValue objects
     /// to a string representation).
     SmallVectorImpl<PartialDiagnosticAt> *Diag = nullptr;
+
+    /// A token injection request from std::meta::queue_injection.
+    struct TokenInjection {
+      SourceLocation Loc;
+      DeclContext *TargetDC = nullptr; // null = inject at current context
+      TokenSequenceData TSD;
+      /// Starting access for members injected into a class.
+      AccessSpecifier AS = AS_public;
+      /// For the expansion of a declaration macro deferred to instantiation:
+      /// the invocation, so the tokens read as expanded from it.
+      SourceRange Invocation = SourceRange();
+      /// The expansion of a whole-declaration invocation 'name!(args);': the
+      /// invocation's ';' terminates it, so one follows the tokens (at Loc).
+      bool Terminated = false;
+    };
+
+    /// Token sequences pending injection from std::meta::queue_injection calls
+    /// during consteval block evaluation.
+    SmallVector<TokenInjection> PendingInjections;
 
     EvalStatus() = default;
 
@@ -748,6 +776,23 @@ public:
                              SmallVectorImpl<PartialDiagnosticAt> &Notes,
                              bool IsConstantInitializer,
                              bool EvaluateContracts = true) const;
+
+  /// Evaluate the body of an expression macro with its parameters bound to
+  /// \p ParamValues (reflections of the argument expressions, or token
+  /// sequences for raw parameters). On success \p Result holds the returned
+  /// token sequence. \p InvocationContext is the declaration enclosing the
+  /// macro invocation (e.g. the function it appears in), so that reflection
+  /// queries such as std::meta::current_function() resolve against the call
+  /// site rather than the macro definition.
+  /// \p ParamInits, where non-null, initializes the parameter (an object of
+  /// its declared type, e.g. a raw parameter's std::meta::token_sequence)
+  /// within the body's evaluation, instead of ParamValues[I].
+  static bool EvaluateMacroBody(const FunctionDecl *Macro,
+                                ArrayRef<APValue> ParamValues, APValue &Result,
+                                const ASTContext &Ctx,
+                                SmallVectorImpl<PartialDiagnosticAt> &Diags,
+                                Decl *InvocationContext = nullptr,
+                                ArrayRef<const Expr *> ParamInits = {});
 
   /// EvaluateWithSubstitution - Evaluate an expression as if from the context
   /// of a call to the given function with the given arguments, inside an
@@ -4679,6 +4724,89 @@ public:
   child_range children() { return child_range(&SubStmt, &SubStmt+1); }
   const_child_range children() const {
     return const_child_range(&SubStmt, &SubStmt + 1);
+  }
+};
+
+/// DoExpr - A do-expression:
+/// `do (init-statement-seq[opt]) -> Type { ... }`.
+///
+/// The init statements and trailing return type are optional. A do-expression
+/// evaluates its optional init statements followed by a compound statement
+/// body and yields a value via `do_return` statements within the body. Unlike a
+/// GNU statement-expression (`({ ... })`), the body does not introduce a
+/// function scope; `return`, `break`, `continue`, and `goto` operate on the
+/// enclosing function/loop.
+///
+/// A DoExpr is always a prvalue.
+class DoExpr : public Expr {
+  enum { INIT, BODY, END_EXPR };
+  Stmt *SubStmts[END_EXPR];
+  TypeSourceInfo *ExplicitType;
+  SourceLocation DoLoc;
+  SourceLocation LBraceLoc;
+  SourceLocation RBraceLoc;
+  unsigned TemplateDepth;
+  /// The body local, if any, that every value-yielding `do_return` in the
+  /// body names and that can therefore be constructed directly into the
+  /// do-expression's result slot.
+  const VarDecl *NRVOCandidate = nullptr;
+
+public:
+  DoExpr(Stmt *InitStmt, CompoundStmt *Body, QualType T, ExprValueKind VK,
+         TypeSourceInfo *ExplicitType, SourceLocation DoLoc,
+         SourceLocation LBraceLoc, SourceLocation RBraceLoc,
+         unsigned TemplateDepth, bool ContainsUnexpandedParameterPack = false)
+      : Expr(DoExprClass, T, VK, OK_Ordinary), SubStmts{InitStmt, Body},
+        ExplicitType(ExplicitType), DoLoc(DoLoc), LBraceLoc(LBraceLoc),
+        RBraceLoc(RBraceLoc), TemplateDepth(TemplateDepth) {
+    setDependence(computeDependence(this, TemplateDepth,
+                                    ContainsUnexpandedParameterPack));
+  }
+
+  explicit DoExpr(EmptyShell Empty) : Expr(DoExprClass, Empty) {}
+
+  Stmt *getInitStmt() { return SubStmts[INIT]; }
+  const Stmt *getInitStmt() const { return SubStmts[INIT]; }
+  void setInitStmt(Stmt *S) { SubStmts[INIT] = S; }
+  bool hasInitStmt() const { return SubStmts[INIT] != nullptr; }
+
+  CompoundStmt *getBody() { return cast<CompoundStmt>(SubStmts[BODY]); }
+  const CompoundStmt *getBody() const {
+    return cast<CompoundStmt>(SubStmts[BODY]);
+  }
+  void setBody(CompoundStmt *S) { SubStmts[BODY] = S; }
+
+  TypeSourceInfo *getExplicitType() const { return ExplicitType; }
+  void setExplicitType(TypeSourceInfo *TSI) { ExplicitType = TSI; }
+  bool hasExplicitType() const { return ExplicitType != nullptr; }
+
+  SourceLocation getDoLoc() const { return DoLoc; }
+  void setDoLoc(SourceLocation L) { DoLoc = L; }
+  SourceLocation getLBraceLoc() const { return LBraceLoc; }
+  void setLBraceLoc(SourceLocation L) { LBraceLoc = L; }
+  SourceLocation getRBraceLoc() const { return RBraceLoc; }
+  void setRBraceLoc(SourceLocation L) { RBraceLoc = L; }
+
+  unsigned getTemplateDepth() const { return TemplateDepth; }
+  void setTemplateDepth(unsigned D) { TemplateDepth = D; }
+
+  /// Retrieve the variable that this do-expression constructs directly into
+  /// its result slot, if the named return value optimization applies.
+  const VarDecl *getNRVOCandidate() const { return NRVOCandidate; }
+  void setNRVOCandidate(const VarDecl *VD) { NRVOCandidate = VD; }
+
+  SourceLocation getBeginLoc() const LLVM_READONLY { return DoLoc; }
+  SourceLocation getEndLoc() const LLVM_READONLY { return RBraceLoc; }
+
+  child_range children() {
+    return child_range(&SubStmts[0], &SubStmts[0] + END_EXPR);
+  }
+  const_child_range children() const {
+    return const_child_range(&SubStmts[0], &SubStmts[0] + END_EXPR);
+  }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == DoExprClass;
   }
 };
 

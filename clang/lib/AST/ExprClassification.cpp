@@ -176,6 +176,13 @@ static Cl::Kinds ClassifyInternal(ASTContext &Ctx, const Expr *E) {
   case Expr::CompoundLiteralExprClass:
     return !E->isLValue() ? ClassifyTemporary(E->getType()) : Cl::CL_LValue;
 
+  case Expr::DoExprClass:
+    // A do-expression's value category depends on its declared type:
+    // prvalue for non-reference types, lvalue for `T&`, xvalue for `T&&`.
+    // The Expr base already stores the right ValueKind; classify from there
+    // instead of treating it as always-prvalue.
+    return ClassifyExprValueKind(Lang, E, E->getValueKind());
+
     // Expressions that are prvalues.
   case Expr::CXXBoolLiteralExprClass:
   case Expr::CXXPseudoDestructorExprClass:
@@ -224,18 +231,36 @@ static Cl::Kinds ClassifyInternal(ASTContext &Ctx, const Expr *E) {
   case Expr::ConceptSpecializationExprClass:
   case Expr::RequiresExprClass:
   case Expr::CXXReflectExprClass:
+  case Expr::CXXTokenSequenceExprClass:
   case Expr::StackLocationExprClass:
   case Expr::CXXExpansionInitListExprClass:
   case Expr::CXXExpansionInitListSelectExprClass:
   case Expr::CXXIndeterminateExpansionSelectExprClass:
   case Expr::CXXIterableExpansionSelectExprClass:
   case Expr::CXXDestructurableExpansionSelectExprClass:
+  case Expr::MatchTestExprClass:
+  case Expr::CaseConditionExprClass:
     return Cl::CL_PRValue;
 
   case Expr::CXXMetafunctionExprClass:
     return E->getValueKind() == VK_LValue    ? Cl::CL_LValue
            : E->getValueKind() == VK_XValue ? Cl::CL_XValue
                                             : Cl::CL_PRValue;
+
+  case Expr::CXXBuiltinInjectExprClass:
+  case Expr::CXXBuiltinReportTokensExprClass:
+  case Expr::CXXTokenInterpolationListExprClass:
+  case Expr::CXXBuiltinIdExprClass:
+  case Expr::CXXBuiltinStrLiteralExprClass:
+  case Expr::CXXBuiltinTokenizeExprClass:
+  case Expr::CXXBuiltinStringizeExprClass:
+    return Cl::CL_PRValue;
+
+  case Expr::CXXMacroInvocationExprClass: {
+    const auto *MI = cast<CXXMacroInvocationExpr>(E);
+    return MI->isResolved() ? ClassifyInternal(Ctx, MI->getExpansion())
+                            : Cl::CL_PRValue;
+  }
 
   case Expr::EmbedExprClass:
     // Nominally, this just goes through as a PRValue until we actually expand
@@ -272,6 +297,10 @@ static Cl::Kinds ClassifyInternal(ASTContext &Ctx, const Expr *E) {
   case Expr::ArraySubscriptExprClass:
     if (cast<ArraySubscriptExpr>(E)->getBase()->getType()->isVectorType())
       return ClassifyInternal(Ctx, cast<ArraySubscriptExpr>(E)->getBase());
+    // Indexing a token sequence yields a new single-token sequence, not a
+    // subobject of the base: a prvalue (as Sema builds it).
+    if (cast<ArraySubscriptExpr>(E)->getBase()->getType()->isTokenSequenceType())
+      return Cl::CL_PRValue;
     if (Lang.CPlusPlus11) {
       // Step over the array-to-pointer decay if present, but not over the
       // temporary materialization.
@@ -312,11 +341,20 @@ static Cl::Kinds ClassifyInternal(ASTContext &Ctx, const Expr *E) {
 
     // C++ [expr.prim.general]p3: The result is an lvalue if the entity is a
     //   function or variable and a prvalue otherwise.
-  case Expr::DeclRefExprClass:
+  case Expr::DeclRefExprClass: {
+    const ValueDecl *D = cast<DeclRefExpr>(E)->getDecl();
     if (E->getType() == Ctx.UnknownAnyTy)
-      return isa<FunctionDecl>(cast<DeclRefExpr>(E)->getDecl())
-               ? Cl::CL_PRValue : Cl::CL_LValue;
-    return ClassifyDecl(Ctx, cast<DeclRefExpr>(E)->getDecl());
+      return isa<FunctionDecl>(D) ? Cl::CL_PRValue : Cl::CL_LValue;
+    // Inside an expression-macro body a parameter is not a variable: it names
+    // the reflection or token sequence bound to it, and Sema builds the
+    // reference as a prvalue of that type (see BuildDeclarationNameExpr) --
+    // except a raw token_sequence parameter, which is an object.
+    if (const auto *PVD = dyn_cast<ParmVarDecl>(D))
+      if (const auto *FD = dyn_cast<FunctionDecl>(PVD->getDeclContext());
+          FD && FD->isExpressionMacro() && E->isPRValue())
+        return Cl::CL_PRValue;
+    return ClassifyDecl(Ctx, D);
+  }
 
     // Member access is complex.
   case Expr::MemberExprClass:
@@ -480,6 +518,9 @@ static Cl::Kinds ClassifyInternal(ASTContext &Ctx, const Expr *E) {
   case Expr::LambdaExprClass:
   case Expr::CXXStdInitializerListExprClass:
     return Cl::CL_ClassTemporary;
+
+  case Expr::MatchSelectExprClass:
+    return ClassifyExprValueKind(Lang, E, E->getValueKind());
 
   case Expr::VAArgExprClass:
     return ClassifyUnnamed(Ctx, E->getType());

@@ -234,6 +234,8 @@ set(files
   __bit/bit_ceil.h
   __bit/bit_floor.h
   __bit/bit_log2.h
+  __bit/bit_permutations.h
+  __bit/bit_shift.h
   __bit/bit_width.h
   __bit/blsr.h
   __bit/byteswap.h
@@ -348,6 +350,7 @@ set(files
   __coroutine/trivial_awaitables.h
   __cstddef/byte.h
   __cstddef/max_align_t.h
+  __cstddef/noreturn_t.h
   __cstddef/nullptr_t.h
   __cstddef/ptrdiff_t.h
   __cstddef/size_t.h
@@ -548,6 +551,63 @@ set(files
   __hardened_violation
   __hash_table
   __hazard_pointer/hazard_pointer.h
+  __io/any_executor.h
+  __io/continuation.h
+  __io/execution_context.h
+  __io/executor.h
+  __io/executor_ref.h
+  __io/frame_allocator.h
+  __io/io_awaitable.h
+  __io/io_env.h
+  __io/join_support.h
+  __io/run.h
+  __io/run_async.h
+  __io/strand.h
+  __io/support/config.h
+  __io/support/epoll_poller.h
+  __io/support/kqueue_poller.h
+  __io/support/poller.h
+  __io/support/poller_types.h
+  __io/support/posix_signal.h
+  __io/task.h
+  __io/thread_pool.h
+  __io/when_all.h
+  __io/when_any.h
+  __io_bridge/as_sender.h
+  __io_bridge/await_sender.h
+  __io_bridge/split_ec.h
+  __io_buffer/buffer.h
+  __io_buffer/buffer_algorithms.h
+  __io_buffer/buffer_pair.h
+  __io_buffer/buffer_sequence.h
+  __io_buffer/buffer_slice.h
+  __io_buffer/circular_dynamic_buffer.h
+  __io_buffer/dynamic_buffer.h
+  __io_buffer/flat_dynamic_buffer.h
+  __io_buffer/make_buffer.h
+  __io_buffer/string_dynamic_buffer.h
+  __io_buffer/vector_dynamic_buffer.h
+  __io_context/blocking_service.h
+  __io_context/io_context.h
+  __io_context/op.h
+  __io_context/reactor.h
+  __io_context/reactor_wait.h
+  __io_file/file.h
+  __io_file/file_base.h
+  __io_file/support/posix_file.h
+  __io_signal/signal_set.h
+  __io_stream/any_buffer_sink.h
+  __io_stream/any_buffer_source.h
+  __io_stream/any_read_source.h
+  __io_stream/any_read_stream.h
+  __io_stream/any_stream.h
+  __io_stream/any_write_sink.h
+  __io_stream/any_write_stream.h
+  __io_stream/erased.h
+  __io_stream/error.h
+  __io_stream/stream_algorithms.h
+  __io_stream/stream_concepts.h
+  __io_timer/timer.h
   __ios/fpos.h
   __iterator/access.h
   __iterator/advance.h
@@ -646,6 +706,7 @@ set(files
   __math/trigonometric_functions.h
   __mbstate_t.h
   __mdspan/aligned_accessor.h
+  __mdspan/copy_fill.h
   __mdspan/default_accessor.h
   __mdspan/extents.h
   __mdspan/layout_left.h
@@ -679,6 +740,7 @@ set(files
   __memory/is_sufficiently_aligned.h
   __memory/noexcept_move_assign_container.h
   __memory/out_ptr.h
+  __memory/pointer_tag_pair.h
   __memory/pointer_traits.h
   __memory/polymorphic.h
   __memory/pstl_freestanding.h
@@ -705,11 +767,39 @@ set(files
   __memory_resource/pool_options.h
   __memory_resource/synchronized_pool_resource.h
   __memory_resource/unsynchronized_pool_resource.h
+  __meta/metafunction_ids.h
   __mutex/lock_guard.h
   __mutex/mutex.h
   __mutex/once_flag.h
   __mutex/tag_types.h
   __mutex/unique_lock.h
+  __net/connect.h
+  __net/datagram_core.h
+  __net/endpoint.h
+  __net/family.h
+  __net/ip_address.h
+  __net/ipv4_address.h
+  __net/ipv6_address.h
+  __net/local_datagram_socket.h
+  __net/local_endpoint.h
+  __net/local_stream_acceptor.h
+  __net/local_stream_socket.h
+  __net/message_flags.h
+  __net/resolver.h
+  __net/resolver_error.h
+  __net/socket_core.h
+  __net/socket_option.h
+  __net/support/posix_resolve.h
+  __net/support/posix_socket.h
+  __net/tcp_acceptor.h
+  __net/tcp_socket.h
+  __net/udp_socket.h
+  __net_tls/engine.h
+  __net_tls/error.h
+  __net_tls/openssl_engine.h
+  __net_tls/support/openssl_dl.h
+  __net_tls/tls_context.h
+  __net_tls/tls_stream.h
   __new/align_val_t.h
   __new/allocate.h
   __new/destroying_delete_t.h
@@ -904,6 +994,7 @@ set(files
   __system_error/error_category.h
   __system_error/error_code.h
   __system_error/error_condition.h
+  __system_error/formatter.h
   __system_error/system_error.h
   __system_error/throw_system_error.h
   __thread/formatter.h
@@ -933,6 +1024,7 @@ set(files
   __type_traits/aligned_storage.h
   __type_traits/aligned_union.h
   __type_traits/alignment_of.h
+  __type_traits/alternative_traits.h
   __type_traits/common_reference.h
   __type_traits/common_type.h
   __type_traits/conditional.h
@@ -987,6 +1079,7 @@ set(files
   __type_traits/is_layout_compatible.h
   __type_traits/is_literal_type.h
   __type_traits/is_member_pointer.h
+  __type_traits/is_noreturn.h
   __type_traits/is_nothrow_assignable.h
   __type_traits/is_nothrow_constructible.h
   __type_traits/is_nothrow_destructible.h
@@ -1168,6 +1261,14 @@ set(files
   initializer_list
   inplace_vector
   inttypes.h
+  io
+  io_bridge
+  io_buffer
+  io_context
+  io_file
+  io_signal
+  io_stream
+  io_timer
   iomanip
   ios
   iosfwd
@@ -1186,6 +1287,8 @@ set(files
   memory_resource
   meta
   mutex
+  net
+  net_tls
   new
   numbers
   numeric

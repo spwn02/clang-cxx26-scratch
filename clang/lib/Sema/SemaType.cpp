@@ -1332,12 +1332,11 @@ static QualType ConvertDeclSpecToType(TypeProcessingState &state) {
                       ? AutoTypeKeyword::DecltypeAuto
                       : AutoTypeKeyword::Auto;
 
-    TemplateDecl *TypeConstraintConcept = nullptr;
+    TemplateName TypeConstraintConcept;
     llvm::SmallVector<TemplateArgument, 8> TemplateArgs;
     if (DS.isConstrainedAuto()) {
       if (TemplateIdAnnotation *TemplateId = DS.getRepAsTemplateId()) {
-        TypeConstraintConcept =
-            cast<TemplateDecl>(TemplateId->Template.get().getAsTemplateDecl());
+        TypeConstraintConcept = TemplateId->Template.get();
         TemplateArgumentListInfo TemplateArgsInfo;
         TemplateArgsInfo.setLAngleLoc(TemplateId->LAngleLoc);
         TemplateArgsInfo.setRAngleLoc(TemplateId->RAngleLoc);
@@ -3085,15 +3084,15 @@ InventTemplateParameter(TypeProcessingState &state, QualType T,
   // Create the TemplateTypeParmDecl here to retrieve the corresponding
   // template parameter type. Template parameters are temporarily added
   // to the TU until the associated TemplateDecl is created.
-  TemplateTypeParmDecl *InventedTemplateParam =
-      TemplateTypeParmDecl::Create(
-          S.Context, S.Context.getTranslationUnitDecl(),
-          /*KeyLoc=*/D.getDeclSpec().getTypeSpecTypeLoc(),
-          /*NameLoc=*/D.getIdentifierLoc(),
-          TemplateParameterDepth, AutoParameterPosition,
-          S.InventAbbreviatedTemplateParameterTypeName(
-              D.getIdentifier(), AutoParameterPosition), false,
-          IsParameterPack, /*HasTypeConstraint=*/Auto->isConstrained());
+  TemplateTypeParmDecl *InventedTemplateParam = TemplateTypeParmDecl::Create(
+      S.Context, S.Context.getTranslationUnitDecl(),
+      /*KeyLoc=*/D.getDeclSpec().getTypeSpecTypeLoc(),
+      /*NameLoc=*/D.getIdentifierLoc(), TemplateParameterDepth,
+      AutoParameterPosition,
+      S.InventAbbreviatedTemplateParameterTypeName(D.getIdentifier(),
+                                                   AutoParameterPosition),
+      false, IsParameterPack,
+      /*HasTypeConstraint=*/Auto->isConstrained());
   InventedTemplateParam->setImplicit();
   Info.TemplateParams.push_back(InventedTemplateParam);
 
@@ -3116,7 +3115,8 @@ InventTemplateParameter(TypeProcessingState &state, QualType T,
       if (!Invalid) {
         S.AttachTypeConstraint(
             AutoLoc.getNestedNameSpecifierLoc(), AutoLoc.getConceptNameInfo(),
-            AutoLoc.getNamedConcept(), /*FoundDecl=*/AutoLoc.getFoundDecl(),
+            AutoLoc.getNamedConcept(),
+            /*FoundDecl=*/AutoLoc.getFoundDecl(),
             AutoLoc.hasExplicitTemplateArgs() ? &TAL : nullptr,
             InventedTemplateParam, D.getEllipsisLoc());
       }
@@ -3143,15 +3143,16 @@ InventTemplateParameter(TypeProcessingState &state, QualType T,
         }
       }
       if (!Invalid) {
-        UsingShadowDecl *USD =
-            TemplateId->Template.get().getAsUsingShadowDecl();
-        TemplateDecl *CD = TemplateId->Template.get().getAsTemplateDecl();
+        TemplateName TN = TemplateId->Template.get();
+        UsingShadowDecl *USD = TN.getAsUsingShadowDecl();
+        TemplateDecl *CD = TN.getAsTemplateDecl();
         S.AttachTypeConstraint(
             D.getDeclSpec().getTypeSpecScope().getWithLocInContext(S.Context),
             DeclarationNameInfo(DeclarationName(TemplateId->Name),
                                 TemplateId->TemplateNameLoc),
-            CD,
-            /*FoundDecl=*/USD ? cast<NamedDecl>(USD) : CD,
+            TN,
+            /*FoundDecl=*/
+            USD ? cast<NamedDecl>(USD) : cast_if_present<NamedDecl>(CD),
             TemplateId->LAngleLoc.isValid() ? &TemplateArgsInfo : nullptr,
             InventedTemplateParam, D.getEllipsisLoc());
       }
@@ -4394,7 +4395,7 @@ static TypeSourceInfo *GetFullTypeForDeclarator(TypeProcessingState &state,
   // and at most one function declarator if this is a function declaration.
   // If T is a deduced class template specialization type, only parentheses
   // are allowed.
-  if (auto *DT = T->getAs<DeducedType>()) {
+  if (auto *DT = T->getAs<DeducedType>(); DT && !T->containsErrors()) {
     const AutoType *AT = T->getAs<AutoType>();
     bool IsClassTemplateDeduction = isa<DeducedTemplateSpecializationType>(DT);
     if ((AT && AT->isDecltypeAuto()) || IsClassTemplateDeduction) {
@@ -5713,7 +5714,10 @@ static TypeSourceInfo *GetFullTypeForDeclarator(TypeProcessingState &state,
 
   // If there was an ellipsis in the declarator, the declaration declares a
   // parameter pack whose type may be a pack expansion type.
-  if (D.hasEllipsis()) {
+  if (D.hasEllipsis() && D.isPatternPackAllowed()) {
+    T = Context.getPackExpansionType(T, std::nullopt,
+                                     /*ExpectPackInType=*/false);
+  } else if (D.hasEllipsis()) {
     // C++0x [dcl.fct]p13:
     //   A declarator-id or abstract-declarator containing an ellipsis shall
     //   only be used in a parameter-declaration. Such a parameter-declaration
@@ -6117,6 +6121,29 @@ namespace {
       TL.setDecltypeLoc(DS.getTypeSpecTypeLoc());
       TL.setRParenLoc(DS.getTypeofParensRange().getEnd());
     }
+    void VisitReflectionSpliceTypeLoc(ReflectionSpliceTypeLoc TL) {
+      // The type is uniqued: take the locations of this occurrence.
+      if (DS.getTypeSpecType() == DeclSpec::TST_type_splice)
+        if (SpliceSpecifier *Splice = DS.getRepAsSpliceSpecifier()) {
+          TL.setTypenameKWLoc(SourceLocation());
+          TL.setSpliceBeginLoc(Splice->getBeginLoc());
+          TL.setSpliceEndLoc(Splice->getEndLoc());
+          return;
+        }
+      if (DS.getTypeSpecType() == DeclSpec::TST_typename) {
+        // `typename [: x :]`: the parsed type carries the locations.
+        TypeSourceInfo *TInfo = nullptr;
+        Sema::GetTypeFromParser(DS.getRepAsType(), &TInfo);
+        if (TInfo)
+          if (auto Parsed = TInfo->getTypeLoc().getAs<ReflectionSpliceTypeLoc>()) {
+            TL.setTypenameKWLoc(Parsed.getTypenameKWLoc());
+            TL.setSpliceBeginLoc(Parsed.getSpliceBeginLoc());
+            TL.setSpliceEndLoc(Parsed.getSpliceEndLoc());
+            return;
+          }
+      }
+      TL.initializeLocal(Context, DS.getTypeSpecTypeLoc());
+    }
     void VisitPackIndexingTypeLoc(PackIndexingTypeLoc TL) {
       assert(DS.getTypeSpecType() == DeclSpec::TST_typename_pack_indexing);
       TL.setEllipsisLoc(DS.getEllipsisLoc());
@@ -6175,9 +6202,10 @@ namespace {
                                            TemplateId->NumArgs);
         SemaRef.translateTemplateArguments(TemplateArgsPtr, TemplateArgsInfo);
       }
-      DeclarationNameInfo DNI = DeclarationNameInfo(
-          TL.getTypePtr()->getTypeConstraintConcept()->getDeclName(),
-          TemplateId->TemplateNameLoc);
+      DeclarationNameInfo DNI =
+          Context.getNameForTemplate(
+              TL.getTypePtr()->getTypeConstraintConcept(),
+              TemplateId->TemplateNameLoc);
 
       NamedDecl *FoundDecl;
       if (auto TN = TemplateId->Template.get();
@@ -9829,10 +9857,23 @@ QualType Sema::BuildCountAttributedArrayOrPointerType(QualType WrappedTy,
 /// that expression, according to the rules in C++11
 /// [dcl.type.simple]p4 and C++11 [expr.lambda.prim]p18.
 QualType Sema::getDecltypeForExpr(Expr *E) {
+  // A resolved macro invocation is its expansion: decltype(m!()) is
+  // decltype of what the macro expanded to (an unparenthesized name stays an
+  // id-expression).
+  while (auto *MI = dyn_cast<CXXMacroInvocationExpr>(E)) {
+    if (!MI->isResolved())
+      break;
+    E = MI->getExpansion();
+  }
 
   Expr *IDExpr = E;
+  // Strip implicit casts for decltype, but NOT derived-to-base casts which
+  // represent a semantic base subobject access (e.g., from base specifier
+  // splices like d.[:base:]).
   if (auto *ImplCastExpr = dyn_cast<ImplicitCastExpr>(E))
-    IDExpr = ImplCastExpr->getSubExpr();
+    if (ImplCastExpr->getCastKind() != CK_DerivedToBase &&
+        ImplCastExpr->getCastKind() != CK_UncheckedDerivedToBase)
+      IDExpr = ImplCastExpr->getSubExpr();
 
   if (auto *PackExpr = dyn_cast<PackIndexingExpr>(E)) {
     if (E->isInstantiationDependent())
@@ -9925,8 +9966,15 @@ QualType Sema::BuildDecltypeType(Expr *E, bool AsUnevaluated) {
       return QualType();
     }
 
+  if (getLangOpts().DivergingExpressions &&
+      isa<CXXThrowExpr>(E->IgnoreParens()))
+    Diag(E->getExprLoc(), diag::warn_diverging_compat_decltype);
+
+  // 'decltype(throw 0)' is how std::noreturn_t is named (P3549); a diverging
+  // operand is there for its type.
   if (AsUnevaluated && CodeSynthesisContexts.empty() &&
-      !E->isInstantiationDependent() && E->HasSideEffects(Context, false)) {
+      !E->isInstantiationDependent() && !E->getType()->isNoReturnType() &&
+      E->HasSideEffects(Context, false)) {
     // The expression operand for decltype is in an unevaluated expression
     // context, so side effects could result in unintended consequences.
     // Exclude instantiation-dependent expressions, because 'decltype' is often

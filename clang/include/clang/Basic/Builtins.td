@@ -996,6 +996,16 @@ def ConstexprExceptionRethrow : LangBuiltin<"CXX_LANG"> {
   let Prototype = "void(void*)";
 }
 
+// P2758: emitting messages at compile time. Takes a kind (0 = print,
+// 1 = warning, 2 = error), a tag (pointer + length), and a message
+// (pointer + length, char or char8_t). Only has an effect when manifestly
+// constant-evaluated; a kind-2 call additionally fails the evaluation.
+def ConstexprDiag : LangBuiltin<"CXX_LANG"> {
+  let Spellings = ["__builtin_constexpr_diag"];
+  let Attributes = [NoThrow, Constexpr, CustomTypeChecking];
+  let Prototype = "void(int, ...)";
+}
+
 def IsWithinLifetime : LangBuiltin<"CXX_LANG"> {
   let Spellings = ["__builtin_is_within_lifetime"];
   let Attributes = [NoThrow, CustomTypeChecking, Consteval];
@@ -4819,6 +4829,26 @@ def AlignDown : Builtin {
   let Spellings = ["__builtin_align_down"];
   let Attributes = [NoThrow, Const, CustomTypeChecking, Constexpr];
   let Prototype = "void*(void const*, size_t)";
+}
+
+// Pointer tagging (P3125R6, C++29): the low bits of a pointer that are zero because of the alignment of the object
+// it points into carry a small tag. The tag is part of the pointer value, in constant expressions too.
+def PointerTagInsert : Builtin {
+  let Spellings = ["__builtin_pointer_tag_insert"];
+  let Attributes = [NoThrow, Const, Constexpr];
+  let Prototype = "void*(void const volatile*, size_t, size_t)";
+}
+
+def PointerTagGet : Builtin {
+  let Spellings = ["__builtin_pointer_tag_get"];
+  let Attributes = [NoThrow, Const, Constexpr];
+  let Prototype = "size_t(void const volatile*, size_t)";
+}
+
+def PointerTagStrip : Builtin {
+  let Spellings = ["__builtin_pointer_tag_strip"];
+  let Attributes = [NoThrow, Const, Constexpr];
+  let Prototype = "void*(void const volatile*, size_t)";
 }
 
 // Safestack builtins.

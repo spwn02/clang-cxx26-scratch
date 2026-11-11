@@ -542,7 +542,7 @@ private:
   void mangleUnqualifiedBlock(const BlockDecl *Block);
   void mangleTemplateParamDecl(const NamedDecl *Decl);
   void mangleTemplateParameterList(const TemplateParameterList *Params);
-  void mangleTypeConstraint(const TemplateDecl *Concept,
+  void mangleTypeConstraint(TemplateName Concept,
                             ArrayRef<TemplateArgument> Arguments);
   void mangleTypeConstraint(const TypeConstraint *Constraint);
   void mangleRequiresClause(const Expr *RequiresClause);
@@ -560,6 +560,7 @@ private:
   void manglePrefix(QualType type);
   void mangleTemplatePrefix(GlobalDecl GD, bool NoFunction=false);
   void mangleTemplatePrefix(TemplateName Template);
+  void manglePackIndexingTemplateName(TemplateName TN);
   const NamedDecl *getClosurePrefix(const Decl *ND);
   void mangleClosurePrefix(const NamedDecl *ND, bool NoFunction = false);
   bool mangleUnresolvedTypeOrSimpleId(QualType DestroyedType,
@@ -1282,6 +1283,23 @@ void CXXNameMangler::mangleFixedPointLiteral() {
   Diags.Report(DiagID);
 }
 
+// PROVISIONAL (owner decision 2026-11-10): the Itanium ABI has no encoding for
+// a pack-index-template-name (P3670R4; cxx-abi issue 175 is open). Until the
+// ABI defines one, a still dependent name is mangled as
+//   u10pack_index <template-param of the pack> <index expression>
+// and a name whose selection is known is mangled as the selected template.
+void CXXNameMangler::manglePackIndexingTemplateName(TemplateName TN) {
+  PackIndexingTemplateStorage *PI = TN.getAsPackIndexingTemplate();
+  assert(PI && "not a pack-index-template-name");
+  if (PI->isFullySubstituted() && PI->getSelectedIndex()) {
+    mangleTemplatePrefix(PI->getSelectedTemplate());
+    return;
+  }
+  Out << "u10pack_index";
+  mangleTemplatePrefix(PI->getPattern());
+  mangleExpression(PI->getIndexExpr());
+}
+
 void CXXNameMangler::mangleNullPointer(QualType T) {
   //  <expr-primary> ::= L <type> 0 E
   Out << 'L';
@@ -1517,7 +1535,7 @@ void CXXNameMangler::mangleUnqualifiedName(
       //
       // Proposed on cxx-abi-dev on 2016-08-12
       Out << "DC";
-      for (auto *BD : DD->bindings())
+      for (auto *BD : DD->source_leaf_bindings())
         mangleSourceName(BD->getDeclName().getAsIdentifierInfo());
       Out << 'E';
       writeAbiTags(ND, AdditionalAbiTags);
@@ -2110,14 +2128,26 @@ void CXXNameMangler::mangleTemplateParameterList(
 }
 
 void CXXNameMangler::mangleTypeConstraint(
-    const TemplateDecl *Concept, ArrayRef<TemplateArgument> Arguments) {
-  const DeclContext *DC = Context.getEffectiveDeclContext(Concept);
+    TemplateName Concept, ArrayRef<TemplateArgument> Arguments) {
+  // P3670R4: a substituted pack-index-template-name is its selected concept.
+  if (const auto *PI = Concept.getAsPackIndexingTemplate();
+      PI && PI->isFullySubstituted() && PI->getSelectedIndex())
+    Concept = PI->getSelectedTemplate();
+  const TemplateDecl *TD = Concept.getAsTemplateDecl();
+  if (!TD) {
+    // Still dependent: the provisional pack-index-template-name encoding.
+    manglePackIndexingTemplateName(Concept);
+    if (!Arguments.empty())
+      mangleTemplateArgs(TemplateName(), Arguments);
+    return;
+  }
+  const DeclContext *DC = Context.getEffectiveDeclContext(TD);
   if (!Arguments.empty())
-    mangleTemplateName(Concept, Arguments);
+    mangleTemplateName(TD, Arguments);
   else if (DC->isTranslationUnit() || isStdNamespace(DC))
-    mangleUnscopedName(Concept, DC, nullptr);
+    mangleUnscopedName(TD, DC, nullptr);
   else
-    mangleNestedName(Concept, DC, nullptr);
+    mangleNestedName(TD, DC, nullptr);
 }
 
 void CXXNameMangler::mangleTypeConstraint(const TypeConstraint *Constraint) {
@@ -2262,6 +2292,11 @@ void CXXNameMangler::mangleTemplatePrefix(TemplateName Template) {
   //                   ::= <substitution>
   if (TemplateDecl *TD = Template.getAsTemplateDecl())
     return mangleTemplatePrefix(TD);
+
+  if (Template.getAsPackIndexingTemplate()) {
+    manglePackIndexingTemplateName(Template);
+    return;
+  }
 
   DependentTemplateName *Dependent = Template.getAsDependentTemplateName();
   assert(Dependent && "unexpected template name kind");
@@ -2418,6 +2453,11 @@ void CXXNameMangler::mangleType(TemplateName TN) {
     Out << "_SUBSTPACK_";
     break;
   }
+
+  case TemplateName::PackIndexingTemplate:
+    manglePackIndexingTemplateName(TN);
+    return;
+
   case TemplateName::DeducedTemplate:
     llvm_unreachable("Unexpected DeducedTemplate");
   }
@@ -2583,6 +2623,11 @@ bool CXXNameMangler::mangleUnresolvedTypeOrSimpleId(QualType Ty,
       Out << "_SUBSTPACK_";
       break;
     }
+
+    case TemplateName::PackIndexingTemplate:
+      // Not substitutable (see manglePackIndexingTemplateName).
+      return false;
+
     case TemplateName::UsingTemplate: {
       TemplateDecl *TD = TN.getAsTemplateDecl();
       assert(TD && !isa<TemplateTemplateParmDecl>(TD));
@@ -3421,6 +3466,15 @@ void CXXNameMangler::mangleType(const BuiltinType *T) {
     break;
   case BuiltinType::MetaInfo:
     Out << "Dm";
+    break;
+  case BuiltinType::MetaToken:
+    // A vendor extended type (consteval-only, so in practice only in the
+    // names of compile-time entities).
+    Out << "u5token";
+    break;
+  case BuiltinType::NoReturn:
+    // A vendor extended type until the ABI assigns one.
+    Out << "u10noreturn_t";
     break;
 
 #define BUILTIN_TYPE(Id, SingletonId)
@@ -4915,7 +4969,13 @@ void CXXNameMangler::mangleRequirement(SourceLocation RequiresExprLoc,
     Out << 'X';
     mangleExpression(ER->getExpr());
 
-    if (ER->hasNoexceptRequirement())
+    if (const Expr *Cond = ER->getNoexceptCondition()) {
+      // PROVISIONAL (owner decision 2026-11-10; P3822R2): the Itanium ABI has
+      // no encoding for a conditional noexcept requirement: 'Nc <expression>'
+      // (a plain noexcept stays 'N').
+      Out << "Nc";
+      mangleExpression(Cond);
+    } else if (ER->hasNoexceptRequirement())
       Out << 'N';
 
     if (!ER->getReturnTypeRequirement().isEmpty()) {
@@ -5250,6 +5310,47 @@ void CXXNameMangler::mangleReflection(const APValue &R) {
     mangleExpression(R.getReflectedAnnotation()->getArg());
     break;
   }
+  case ReflectionKind::DeclarationSpec: {
+    Out << "sfd";
+
+    // The source member's identity -- enclosing (specialized) class, member
+    // name, signature, and template head arity -- followed by the naming
+    // policy. Distinct sources must mangle distinctly.
+    FunctionDeclSpec *FDS = R.getReflectedFunctionDeclSpec();
+    if (auto *CTD = dyn_cast<ClassTemplateDecl>(FDS->Source)) {
+      // A class template head description: the template's identity plus the
+      // naming policy.
+      Out << "H$";
+      ArrayRef<TemplateArgument> NoArgs;
+      mangleTemplateName(CTD, NoArgs);
+      Out << "T$" << FDS->TemplateParameterPrefix << '$';
+      Out << "P$" << FDS->ParameterPrefix << '$';
+      break;
+    }
+    auto *MD = cast<CXXMethodDecl>(FDS->Source->getAsFunction());
+    Context.mangleCanonicalTypeName(
+        getASTContext().getCanonicalTagType(MD->getParent()), Out, false);
+    Out << "M$" << MD->getDeclName().getAsString() << '$';
+    Context.mangleCanonicalTypeName(MD->getType(), Out, false);
+    // Overloads with the same signature can still differ in their template
+    // heads (parameter kinds, constraints) and trailing requires-clauses;
+    // mangle those in full, as a lambda's template head is.
+    if (auto *FTD = dyn_cast<FunctionTemplateDecl>(FDS->Source))
+      mangleTemplateParameterList(FTD->getTemplateParameters());
+    if (const Expr *TRC = MD->getTrailingRequiresClause().ConstraintExpr)
+      mangleRequiresClause(TRC);
+    if (FDS->Name)
+      Out << "N$" << *FDS->Name << '$';
+    Out << "T$" << FDS->TemplateParameterPrefix << '$';
+    Out << "P$" << FDS->ParameterPrefix << '$';
+    if (FDS->MarkOverride)
+      Out << 'O';
+    if (FDS->MarkNoexcept)
+      Out << 'X';
+    break;
+  }
+  case ReflectionKind::Expression:
+    llvm_unreachable("token sequences and identifiers cannot be mangled");
   }
   Out << 'E';
 }
@@ -5355,7 +5456,36 @@ recurse:
   case Expr::CXXInheritedCtorInitExprClass:
   case Expr::CXXParenListInitExprClass:
   case Expr::PackIndexingExprClass:
+  case Expr::CXXBuiltinInjectExprClass:
+  case Expr::CXXBuiltinReportTokensExprClass:
+  case Expr::CXXTokenInterpolationListExprClass:
+  case Expr::CXXBuiltinIdExprClass:
+  case Expr::CXXBuiltinStrLiteralExprClass:
+  case Expr::CXXBuiltinTokenizeExprClass:
+  case Expr::CXXBuiltinStringizeExprClass:
     llvm_unreachable("unexpected statement kind");
+
+  case Expr::CXXMacroInvocationExprClass: {
+    // A dependent invocation in a signature (decltype(m!(t))): there is no ABI
+    // for expression macros. A vendor extended expression (u <source-name>
+    // <template-arg>* E) keeps it from aliasing the call m(t) of a function.
+    const auto *MI = cast<CXXMacroInvocationExpr>(E);
+    if (MI->isResolved()) {
+      mangleExpression(MI->getExpansion(), Arity);
+      break;
+    }
+    Out << "u14__macro_invoke";
+    Out << 'X';
+    mangleExpression(MI->getCallee());
+    Out << 'E';
+    for (const Expr *Arg : MI->getArgs()) {
+      Out << 'X';
+      mangleExpression(Arg);
+      Out << 'E';
+    }
+    Out << 'E';
+    break;
+  }
 
   case Expr::ExplDependentCallExprClass:
     mangleExpression(cast<ExplDependentCallExpr>(E)->getSubExpr());
@@ -5369,6 +5499,10 @@ recurse:
       mangleReflection(RE->getReflection());
     break;
   }
+
+  case Expr::CXXTokenSequenceExprClass:
+    // FIXME: Token sequences in mangled names are not yet supported.
+    break;
 
   case Expr::ConstantExprClass:
     E = cast<ConstantExpr>(E)->getSubExpr();
@@ -5460,8 +5594,13 @@ recurse:
     return;
   }
 
-  // These are used for internal purposes and cannot be meaningfully mangled.
+  // These are used for internal purposes and cannot be meaningfully mangled,
+  // except that an interpolated macro argument stands for its source.
   case Expr::OpaqueValueExprClass:
+    if (const Expr *Source = cast<OpaqueValueExpr>(E)->getSourceExpr()) {
+      mangleExpression(Source, Arity);
+      break;
+    }
     llvm_unreachable("cannot mangle opaque value; mangling wrong thing?");
 
   case Expr::InitListExprClass: {
@@ -5670,6 +5809,12 @@ recurse:
   case Expr::DependentTemplateIdExprClass: {
     NotPrimaryExpr();
     const auto *DTI = cast<DependentTemplateIdExpr>(E);
+    if (DTI->getTemplateName().getAsPackIndexingTemplate()) {
+      manglePackIndexingTemplateName(DTI->getTemplateName());
+      mangleTemplateArgs(TemplateName(), DTI->template_arguments().data(),
+                         DTI->getNumTemplateArgs());
+      break;
+    }
     mangleUnresolvedName(std::nullopt, DTI->getName(),
                          DTI->template_arguments().data(),
                          DTI->getNumTemplateArgs(), Arity);
@@ -6061,7 +6206,7 @@ recurse:
       // entity, meaning that references to enclosing template arguments don't
       // work.
       Out << "L_Z";
-      mangleTemplateName(CSE->getNamedConcept(), CSE->getTemplateArguments());
+      mangleTemplateName(CSE->getConceptDecl(), CSE->getTemplateArguments());
       Out << 'E';
       break;
     }
@@ -6355,6 +6500,10 @@ recurse:
     Diags.Report(DiagID);
     return;
   }
+  case Expr::MatchTestExprClass:
+  case Expr::CaseConditionExprClass:
+  case Expr::MatchSelectExprClass:
+    assert(0 && "not implemented");
   }
 
   if (AsTemplateArg && !IsPrimaryExpr)

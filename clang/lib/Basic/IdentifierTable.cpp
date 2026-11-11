@@ -171,13 +171,25 @@ static KeywordStatus getKeywordStatusHelper(const LangOptions &LangOpts,
     return LangOpts.DeferTS ? KS_Enabled : KS_Disabled;
   case KEYREFLECT:
     return LangOpts.Reflection ? KS_Extension : KS_Unknown;
+  case KEYTOKENINJ:
+    // Token sequence injection (P4380) is C++29 only: a keyword of the
+    // language there, not an extension (no -Wlanguage-extension-token).
+    return LangOpts.CPlusPlus29 && LangOpts.Reflection ? KS_Enabled
+                                                       : KS_Unknown;
+  case KEYDOEXPR:
+    if (LangOpts.DoExpressions)
+      return KS_Enabled;
+    // 'do_return' is an ordinary identifier before C++29, but it will stop
+    // being one, so let earlier C++ modes diagnose the uses that a migration
+    // to C++29 would break. Same treatment as the C++20 keywords.
+    return LangOpts.CPlusPlus ? KS_Future : KS_Unknown;
   default:
     llvm_unreachable("Unknown KeywordStatus flag");
   }
 }
 
 KeywordStatus clang::getKeywordStatus(const LangOptions &LangOpts,
-                                      unsigned Flags) {
+                                      uint64_t Flags) {
   // KEYALL means always enabled, so special case this one.
   if (Flags == KEYALL) return KS_Enabled;
   // These are tests that need to 'always win', as they are special in that they
@@ -191,7 +203,7 @@ KeywordStatus clang::getKeywordStatus(const LangOptions &LangOpts,
   KeywordStatus CurStatus = KS_Unknown;
 
   while (Flags != 0) {
-    unsigned CurFlag = Flags & ~(Flags - 1);
+    uint64_t CurFlag = Flags & ~(Flags - 1);
     Flags = Flags & ~CurFlag;
     CurStatus = std::max(
         CurStatus,
@@ -203,7 +215,7 @@ KeywordStatus clang::getKeywordStatus(const LangOptions &LangOpts,
   return CurStatus;
 }
 
-static bool IsKeywordInCpp(unsigned Flags) {
+static bool IsKeywordInCpp(uint64_t Flags) {
   return (Flags & (KEYCXX | KEYCXX11 | KEYCXX20 | BOOLSUPPORT | WCHARSUPPORT |
                    CHAR8SUPPORT)) != 0;
 }
@@ -219,7 +231,7 @@ static void MarkIdentifierAsKeywordInCpp(IdentifierTable &Table,
 /// identifiers because they are language keywords.  This causes the lexer to
 /// automatically map matching identifiers to specialized token codes.
 static void AddKeyword(StringRef Keyword,
-                       tok::TokenKind TokenCode, unsigned Flags,
+                       tok::TokenKind TokenCode, uint64_t Flags,
                        const LangOptions &LangOpts, IdentifierTable &Table) {
   KeywordStatus AddResult = getKeywordStatus(LangOpts, Flags);
 
@@ -825,7 +837,8 @@ IdentifierTable::getFutureCompatDiagKind(const IdentifierInfo &II,
                                          const LangOptions &LangOpts) {
   assert(II.isFutureCompatKeyword() && "diagnostic should not be needed");
 
-  unsigned Flags = llvm::StringSwitch<unsigned>(II.getName())
+  // uint64_t, not unsigned: the keyword flag set is wider than 32 bits.
+  uint64_t Flags = llvm::StringSwitch<uint64_t>(II.getName())
 #define KEYWORD(NAME, FLAGS) .Case(#NAME, FLAGS)
 #include "clang/Basic/TokenKinds.def"
 #undef KEYWORD
@@ -841,6 +854,12 @@ IdentifierTable::getFutureCompatDiagKind(const IdentifierInfo &II,
     if (((Flags & KEYCXX20) == KEYCXX20) ||
         ((Flags & CHAR8SUPPORT) == CHAR8SUPPORT))
       return diag::warn_cxx20_keyword;
+
+    // do-expressions are not modeled as a KEYCXX29 keyword class because
+    // 'do_return' is the only one, and it is gated on the feature's own
+    // LangOpt.
+    if ((Flags & KEYDOEXPR) == KEYDOEXPR)
+      return diag::warn_cxx29_keyword;
   } else {
     if ((Flags & KEYC99) == KEYC99)
       return diag::warn_c99_keyword;

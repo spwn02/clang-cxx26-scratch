@@ -276,9 +276,9 @@ Sema::Sema(Preprocessor &pp, ASTContext &ctxt, ASTConsumer &consumer,
       Context(ctxt), Consumer(consumer), Diags(PP.getDiagnostics()),
       SourceMgr(PP.getSourceManager()), APINotes(SourceMgr, LangOpts),
       AnalysisWarnings(*this), ThreadSafetyDeclCache(nullptr),
-      LateTemplateParser(nullptr), OpaqueParser(nullptr), CurContext(nullptr),
-      ExternalSource(nullptr), StackHandler(Diags), CurScope(nullptr),
-      Ident_super(nullptr), AMDGPUPtr(std::make_unique<SemaAMDGPU>(*this)),
+      CurContext(nullptr), ExternalSource(nullptr),
+      StackHandler(Diags), CurScope(nullptr), Ident_super(nullptr),
+      AMDGPUPtr(std::make_unique<SemaAMDGPU>(*this)),
       ARMPtr(std::make_unique<SemaARM>(*this)),
       AVRPtr(std::make_unique<SemaAVR>(*this)),
       BPFPtr(std::make_unique<SemaBPF>(*this)),
@@ -772,6 +772,9 @@ ExprResult Sema::ImpCastExprToType(Expr *E, QualType Ty,
     case CK_ArrayToPointerDecay:
     case CK_FunctionToPointerDecay:
     case CK_ToVoid:
+    case CK_TokenArrayToSequence:
+    case CK_SequenceToTokenArray:
+    case CK_NoReturnToAny:
     case CK_NonAtomicToAtomic:
     case CK_HLSLArrayRValue:
     case CK_HLSLAggregateSplatCast:
@@ -1258,6 +1261,8 @@ void Sema::ActOnEndOfTranslationUnit() {
             ? TUFragmentKind::Private
             : TUFragmentKind::Normal);
 
+    CleanupParserBridge();
+
     CheckDelayedMemberExceptionSpecs();
   } else {
     // If we are building a TU prefix for serialization, it is safe to transfer
@@ -1646,7 +1651,8 @@ DeclContext *Sema::getFunctionLevelDeclContext(bool AllowLambda) const {
 
   while (true) {
     if (isa<BlockDecl>(DC) || isa<EnumDecl>(DC) || isa<CapturedDecl>(DC) ||
-        isa<RequiresExprBodyDecl>(DC) || isa<ExpansionStmtDecl>(DC)) {
+        isa<RequiresExprBodyDecl>(DC) || isa<ExpansionStmtDecl>(DC) ||
+        isDoExprBodyContext(DC)) {
       DC = DC->getParent();
     } else if (!AllowLambda && isa<CXXMethodDecl>(DC) &&
                cast<CXXMethodDecl>(DC)->getOverloadedOperator() == OO_Call &&

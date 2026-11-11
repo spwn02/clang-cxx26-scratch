@@ -56,6 +56,7 @@ LANGOPT(CPlusPlus17       , 1, 0, NotCompatible, "C++17")
 LANGOPT(CPlusPlus20       , 1, 0, NotCompatible, "C++20")
 LANGOPT(CPlusPlus23       , 1, 0, NotCompatible, "C++23")
 LANGOPT(CPlusPlus26       , 1, 0, NotCompatible, "C++26")
+LANGOPT(CPlusPlus29       , 1, 0, NotCompatible, "C++29")
 LANGOPT(ObjC              , 1, 0, NotCompatible, "Objective-C")
 LANGOPT(ObjCDefaultSynthProperties , 1, 0, Benign,
         "Objective-C auto-synthesized properties")
@@ -116,6 +117,7 @@ LANGOPT(Coroutines        , 1, 0, NotCompatible, "C++20 coroutines")
 LANGOPT(CoroAlignedAllocation, 1, 0, NotCompatible, "prefer Aligned Allocation according to P2014 Option 2")
 LANGOPT(Contracts         , 1, 1, NotCompatible, "C++2c contracts")
 LANGOPT(DllExportInlines  , 1, 1, NotCompatible, "dllexported classes dllexport inline methods")
+LANGOPT(ExperimentalLibrary, 1, 0, NotCompatible, "enable unstable and experimental library features")
 LANGOPT(StdCppFloatMacros, 1, 0, Benign, "predefine the standard __STDCPP_FLOAT<N>_T__ macros of [cpp.predefined] (set for libc++)")
 
 LANGOPT(PointerAuthIntrinsics, 1, 0, NotCompatible, "pointer authentication intrinsics")
@@ -281,7 +283,10 @@ LANGOPT(ExpansionStatements , 1, 0, NotCompatible,
         "C++26 expansion statements")
 LANGOPT(AnnotationAttributes, 1, 0, NotCompatible,
         "C++26 annotation attributes")
-
+LANGOPT(DoExpressions       , 1, 0, NotCompatible,
+        "C++29 do-expressions (block expressions yielding values via 'do_return')")
+LANGOPT(PatternMatching , 1, 0, NotCompatible, "C++29 pattern matching (P2688)")
+LANGOPT(DivergingExpressions, 1, 0, NotCompatible, "C++29 diverging expressions and the bottom type std::noreturn_t (P3549)")
 LANGOPT(MSVCEnableStdcMacro , 1, 0, NotCompatible, "Define __STDC__ with '-fms-compatibility'")
 LANGOPT(SizedDeallocation , 1, 0, NotCompatible, "sized deallocation")
 LANGOPT(AlignedAllocation , 1, 0, NotCompatible, "aligned allocation")
@@ -388,6 +393,8 @@ LANGOPT(InstantiationDepth, 32, 1024, Benign,
         "maximum template instantiation depth")
 LANGOPT(ConstexprCallDepth, 32, 512, Benign,
         "maximum constexpr call depth")
+LANGOPT(MacroExpansionDepth, 32, 256, Benign,
+        "maximum depth of nested expression macro expansions")
 LANGOPT(ConstexprStepLimit, 32, 1048576, Benign,
         "maximum constexpr evaluation steps")
 LANGOPT(EnableNewConstInterp, 1, 0, Benign,

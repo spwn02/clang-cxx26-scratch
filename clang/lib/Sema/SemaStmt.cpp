@@ -410,6 +410,11 @@ void Sema::DiagnoseUnusedExprResult(const Stmt *S, unsigned DiagID) {
   if (!E)
     return;
 
+  // A diverging expression (P3549) is evaluated for its divergence; there is
+  // no result to have been left unused.
+  if (E->getType()->isNoReturnType())
+    return;
+
   DiagnoseUnused(*this, E, DiagID);
 }
 
@@ -1096,11 +1101,19 @@ static bool EqEnumVals(const std::pair<llvm::APSInt, EnumConstantDecl*>& lhs,
 /// GetTypeBeforeIntegralPromotion - Returns the pre-promotion type of
 /// potentially integral-promoted expression @p expr.
 static QualType GetTypeBeforeIntegralPromotion(const Expr *&E) {
-  if (const auto *FE = dyn_cast<FullExpr>(E))
-    E = FE->getSubExpr();
+  // A constant that stands for an interpolated value (a unique opaque value)
+  // can only be evaluated through the ConstantExpr that carries its value, so
+  // do not look through that wrapper.
+  auto LookThroughFullExpr = [](const Expr *E) {
+    if (const auto *FE = dyn_cast<FullExpr>(E))
+      if (!isa<OpaqueValueExpr>(FE->getSubExpr()->IgnoreParens()))
+        return FE->getSubExpr();
+    return E;
+  };
+  E = LookThroughFullExpr(E);
   while (const auto *ImpCast = dyn_cast<ImplicitCastExpr>(E)) {
     if (ImpCast->getCastKind() != CK_IntegralCast) break;
-    E = ImpCast->getSubExpr();
+    E = LookThroughFullExpr(ImpCast->getSubExpr());
   }
   return E->getType();
 }
@@ -2423,6 +2436,16 @@ VarDecl *BuildForRangeVarDecl(Sema &SemaRef, SourceLocation Loc,
 
 }
 
+StmtResult Sema::BuildMatchForRangeLoopVar(Scope *S, SourceLocation Loc) {
+  const std::string Depth = std::to_string(S->getDepth() / 2);
+  IdentifierInfo *Name = PP.getIdentifierInfo("__match_element" + Depth);
+  VarDecl *LoopVar = BuildForRangeVarDecl(
+      *this, Loc, Context.getAutoRRefDeductType(), Name->getName());
+  Decl *D = LoopVar;
+  DeclGroupPtrTy Group = BuildDeclaratorGroup(MutableArrayRef<Decl *>(&D, 1));
+  return ActOnDeclStmt(Group, Loc, Loc);
+}
+
 static bool ObjCEnumerationCollection(Expr *Collection) {
   return !Collection->isTypeDependent()
           && Collection->getType()->getAs<ObjCObjectPointerType>() != nullptr;
@@ -2722,7 +2745,7 @@ StmtResult Sema::BuildCXXForRangeStmt(
     // them in properly when we instantiate the loop.
     if (!LoopVar->isInvalidDecl() && Kind != BFRK_Check) {
       if (auto *DD = dyn_cast<DecompositionDecl>(LoopVar))
-        for (auto *Binding : DD->bindings()) {
+        for (auto *Binding : DD->all_bindings()) {
           if (!Binding->isParameterPack())
             Binding->setType(Context.DependentTy);
         }
@@ -3621,7 +3644,18 @@ StmtResult Sema::ActOnCapScopeReturnStmt(SourceLocation ReturnLoc,
 
     AutoType *AT = CurCap->ReturnType->getContainedAutoType();
     assert(AT && "lost auto type from lambda return type");
-    if (DeduceFunctionTypeFromReturnExpr(FD, ReturnLoc, RetValExp, AT)) {
+    // P3549: a diverging operand takes no part in the deduction.
+    if (!FD->isDependentContext() && deferDivergingReturn(RetValExp, AT)) {
+      if (!AT->isDeduced()) {
+        ExprResult ER = ActOnFinishFullExpr(RetValExp, ReturnLoc,
+                                            /*DiscardedValue=*/false);
+        if (ER.isInvalid())
+          return StmtError();
+        return ReturnStmt::Create(Context, ReturnLoc, ER.get(),
+                                  /*NRVOCandidate=*/nullptr);
+      }
+      // Already deduced: the operand converts to it below.
+    } else if (DeduceFunctionTypeFromReturnExpr(FD, ReturnLoc, RetValExp, AT)) {
       FD->setInvalidDecl();
       // FIXME: preserve the ill-formed return expression.
       return StmtError();
@@ -3692,6 +3726,12 @@ StmtResult Sema::ActOnCapScopeReturnStmt(SourceLocation ReturnLoc,
     // Delay processing for now.  TODO: there are lots of dependent
     // types we can conclusively prove aren't void.
   } else if (FnRetType->isVoidType()) {
+    // P3549: see BuildReturnStmt.
+    if (getLangOpts().DivergingExpressions && RetValExp &&
+        !isa<InitListExpr>(RetValExp) && !RetValExp->isTypeDependent() &&
+        !RetValExp->getType()->isVoidType() && RetValExp->isDiverging())
+      RetValExp =
+          ImpCastExprToType(RetValExp, Context.VoidTy, CK_ToVoid).get();
     if (RetValExp && !isa<InitListExpr>(RetValExp) &&
         !(getLangOpts().CPlusPlus &&
           (RetValExp->isTypeDependent() ||
@@ -3700,7 +3740,8 @@ StmtResult Sema::ActOnCapScopeReturnStmt(SourceLocation ReturnLoc,
           RetValExp->getType()->isVoidType())
         Diag(ReturnLoc, diag::ext_return_has_void_expr) << "literal" << 2;
       else {
-        Diag(ReturnLoc, diag::err_return_block_has_expr);
+        Diag(ReturnLoc, diag::err_return_block_has_expr)
+            << (CurLambda != nullptr);
         RetValExp = nullptr;
       }
     }
@@ -3795,39 +3836,40 @@ TypeLoc Sema::getReturnTypeLoc(FunctionDecl *FD) const {
       .getReturnLoc();
 }
 
-bool Sema::DeduceFunctionTypeFromReturnExpr(FunctionDecl *FD,
-                                            SourceLocation ReturnLoc,
-                                            Expr *RetExpr, const AutoType *AT) {
-  // If this is the conversion function for a lambda, we choose to deduce its
-  // type from the corresponding call operator, not from the synthesized return
-  // statement within it. See Sema::DeduceReturnType.
-  if (isLambdaConversionOperator(FD))
+bool Sema::deferDivergingReturn(Expr *&RetValExp, const AutoType *AT) {
+  if (!getLangOpts().DivergingExpressions || !RetValExp ||
+      RetValExp->isTypeDependent() || !RetValExp->isDiverging() ||
+      isa<InitListExpr>(RetValExp))
     return false;
+  // A [[noreturn]] call converts to the deduced type like a std::noreturn_t
+  // (except to void, which it already is).
+  if (!RetValExp->getType()->isNoReturnType() &&
+      !(AT->isDeduced() && AT->getDeducedType()->isVoidType()))
+    RetValExp =
+        BuildNoReturnConversion(RetValExp, Context.NoReturnTy, VK_PRValue);
+  if (!AT->isDeduced())
+    getCurFunction()->HasDivergingReturn = true;
+  return true;
+}
 
-  if (isa_and_nonnull<InitListExpr>(RetExpr)) {
+bool Sema::DeduceAutoTypeFromExpr(TypeLoc OrigResultType,
+                                  SourceLocation ReturnLoc, Expr *E,
+                                  QualType &Deduced, const AutoType *AT,
+                                  AutoTypeDeductionContext DeductionContext) {
+  if (isa_and_nonnull<InitListExpr>(E)) {
     //  If the deduction is for a return statement and the initializer is
     //  a braced-init-list, the program is ill-formed.
-    Diag(RetExpr->getExprLoc(),
+    Diag(E->getExprLoc(),
          getCurLambda() ? diag::err_lambda_return_init_list
                         : diag::err_auto_fn_return_init_list)
-        << RetExpr->getSourceRange();
+        << E->getSourceRange();
     return true;
   }
 
-  if (FD->isDependentContext()) {
-    // C++1y [dcl.spec.auto]p12:
-    //   Return type deduction [...] occurs when the definition is
-    //   instantiated even if the function body contains a return
-    //   statement with a non-type-dependent operand.
-    assert(AT->isDeduced() && "should have deduced to dependent type");
-    return false;
-  }
-
-  TypeLoc OrigResultType = getReturnTypeLoc(FD);
   //  In the case of a return with no operand, the initializer is considered
   //  to be void().
   CXXScalarValueInitExpr VoidVal(Context.VoidTy, nullptr, SourceLocation());
-  if (!RetExpr) {
+  if (!E) {
     // For a function with a deduced result type to return with omitted
     // expression, the result type as written must be 'auto' or
     // 'decltype(auto)', possibly cv-qualified or constrained, but not
@@ -3837,27 +3879,25 @@ bool Sema::DeduceFunctionTypeFromReturnExpr(FunctionDecl *FD,
           << OrigResultType.getType();
       return true;
     }
-    RetExpr = &VoidVal;
+    E = &VoidVal;
   }
 
-  QualType Deduced = AT->getDeducedType();
+  Deduced = AT->getDeducedType();
   {
     //  Otherwise, [...] deduce a value for U using the rules of template
     //  argument deduction.
-    auto RetExprLoc = RetExpr->getExprLoc();
-    TemplateDeductionInfo Info(RetExprLoc);
+    auto ELoc = E->getExprLoc();
+    TemplateDeductionInfo Info(ELoc);
     SourceLocation TemplateSpecLoc;
-    if (RetExpr->getType() == Context.OverloadTy) {
-      auto FindResult = OverloadExpr::find(RetExpr);
+    if (E->getType() == Context.OverloadTy) {
+      auto FindResult = OverloadExpr::find(E);
       if (FindResult.Expression)
         TemplateSpecLoc = FindResult.Expression->getNameLoc();
     }
     TemplateSpecCandidateSet FailedTSC(TemplateSpecLoc);
     TemplateDeductionResult Res = DeduceAutoType(
-        OrigResultType, RetExpr, Deduced, Info, /*DependentDeduction=*/false,
+        OrigResultType, E, Deduced, Info, /*DependentDeduction=*/false,
         /*IgnoreConstraints=*/false, &FailedTSC);
-    if (Res != TemplateDeductionResult::Success && FD->isInvalidDecl())
-      return true;
     switch (Res) {
     case TemplateDeductionResult::Success:
       break;
@@ -3869,7 +3909,10 @@ bool Sema::DeduceFunctionTypeFromReturnExpr(FunctionDecl *FD,
       //  each return statement. [...] if the type deduced is not the same in
       //  each deduction, the program is ill-formed.
       const LambdaScopeInfo *LambdaSI = getCurLambda();
-      if (LambdaSI && LambdaSI->HasImplicitReturnType)
+      if (DeductionContext == AutoTypeDeductionContext::MatchHandler)
+        Diag(ReturnLoc, diag::err_match_handler_type_mismatch)
+            << Info.SecondArg << Info.FirstArg;
+      else if (LambdaSI && LambdaSI->HasImplicitReturnType)
         Diag(ReturnLoc, diag::err_typecheck_missing_return_type_incompatible)
             << Info.SecondArg << Info.FirstArg << true /*IsLambda*/;
       else
@@ -3879,16 +3922,43 @@ bool Sema::DeduceFunctionTypeFromReturnExpr(FunctionDecl *FD,
       return true;
     }
     default:
-      Diag(RetExpr->getExprLoc(), diag::err_auto_fn_deduction_failure)
-          << OrigResultType.getType() << RetExpr->getType();
-      FailedTSC.NoteCandidates(*this, RetExprLoc);
+      Diag(E->getExprLoc(), diag::err_auto_fn_deduction_failure)
+          << OrigResultType.getType() << E->getType();
+      FailedTSC.NoteCandidates(*this, ELoc);
       return true;
     }
   }
 
   // If a local type is part of the returned type, mark its fields as
   // referenced.
-  LocalTypedefNameReferencer(*this).TraverseType(RetExpr->getType());
+  LocalTypedefNameReferencer(*this).TraverseType(E->getType());
+  return false;
+}
+
+bool Sema::DeduceFunctionTypeFromReturnExpr(FunctionDecl *FD,
+                                            SourceLocation ReturnLoc,
+                                            Expr *RetExpr, const AutoType *AT) {
+  // If this is the conversion function for a lambda, we choose to deduce its
+  // type from the corresponding call operator, not from the synthesized return
+  // statement within it. See Sema::DeduceReturnType.
+  if (isLambdaConversionOperator(FD))
+    return false;
+
+  if (FD->isDependentContext()) {
+    // C++1y [dcl.spec.auto]p12:
+    //   Return type deduction [...] occurs when the definition is
+    //   instantiated even if the function body contains a return
+    //   statement with a non-type-dependent operand.
+    assert(AT->isDeduced() && "should have deduced to dependent type");
+    return false;
+  }
+
+  TypeLoc OrigResultType = getReturnTypeLoc(FD);
+  QualType Deduced;
+  if (DeduceAutoTypeFromExpr(OrigResultType, ReturnLoc, RetExpr, Deduced, AT,
+                             AutoTypeDeductionContext::ReturnStatement)) {
+    return true;
+  }
 
   // CUDA: Kernel function must have 'void' return type.
   if (getLangOpts().CUDA && FD->hasAttr<CUDAGlobalAttr>() &&
@@ -3934,6 +4004,9 @@ Sema::ActOnReturnStmt(SourceLocation ReturnLoc, Expr *RetValExp,
 
   CheckInvalidBuiltinCountedByRef(RetVal.get(),
                                   BuiltinCountedByRefKind::ReturnArg);
+
+  if (isInSyntheticDoExprFunctionScope())
+    return StmtError(Diag(ReturnLoc, diag::err_return_outside_function));
 
   StmtResult R =
       BuildReturnStmt(ReturnLoc, RetVal.get(), /*AllowRecovery=*/true);
@@ -4014,7 +4087,10 @@ StmtResult Sema::BuildReturnStmt(SourceLocation ReturnLoc, Expr *RetValExp,
     FnRetType = FD->getReturnType();
     if (FD->hasAttrs())
       Attrs = &FD->getAttrs();
-    if (FD->isNoReturn() && !getCurFunction()->isCoroutine())
+    // Returning a diverging expression (P3549) never returns.
+    if (FD->isNoReturn() && !getCurFunction()->isCoroutine() &&
+        !(RetValExp && !RetValExp->isTypeDependent() &&
+          RetValExp->isDiverging()))
       Diag(ReturnLoc, diag::warn_noreturn_function_has_return_expr) << FD;
     if (FD->isMain() && RetValExp)
       if (isa<CXXBoolLiteralExpr>(RetValExp))
@@ -4074,7 +4150,20 @@ StmtResult Sema::BuildReturnStmt(SourceLocation ReturnLoc, Expr *RetValExp,
       // we saw a `return` whose expression had an error, don't keep
       // trying to deduce its return type.
       // (Some return values may be needlessly wrapped in RecoveryExpr).
-      if (FD->isInvalidDecl() ||
+      // P3549: a diverging operand takes no part in the deduction.
+      if (!FD->isInvalidDecl() && !FD->isDependentContext() &&
+          deferDivergingReturn(RetValExp, AT)) {
+        if (!AT->isDeduced()) {
+          ExprResult ER = ActOnFinishFullExpr(RetValExp, ReturnLoc,
+                                              /*DiscardedValue=*/false);
+          if (ER.isInvalid())
+            return StmtError();
+          return ReturnStmt::Create(Context, ReturnLoc, ER.get(),
+                                    /*NRVOCandidate=*/nullptr);
+        }
+        // Already deduced: the operand converts to it below.
+        FnRetType = FD->getReturnType();
+      } else if (FD->isInvalidDecl() ||
           DeduceFunctionTypeFromReturnExpr(FD, ReturnLoc, RetValExp, AT)) {
         FD->setInvalidDecl();
         if (!AllowRecovery)
@@ -4100,6 +4189,13 @@ StmtResult Sema::BuildReturnStmt(SourceLocation ReturnLoc, Expr *RetValExp,
   const VarDecl *NRVOCandidate = getCopyElisionCandidate(NRInfo, FnRetType);
 
   bool HasDependentReturnType = FnRetType->isDependentType();
+
+  // P3549: a diverging operand of a 'void' function's return is just
+  // evaluated, like a 'void' one.
+  if (FnRetType->isVoidType() && getLangOpts().DivergingExpressions &&
+      RetValExp && !RetValExp->isTypeDependent() &&
+      !RetValExp->getType()->isVoidType() && RetValExp->isDiverging())
+    RetValExp = ImpCastExprToType(RetValExp, Context.VoidTy, CK_ToVoid).get();
 
   ReturnStmt *Result = nullptr;
   if (FnRetType->isVoidType()) {
@@ -4511,6 +4607,11 @@ void Sema::DiagnoseExceptionUse(SourceLocation Loc, bool IsTry) {
   // target region compiled for a GPU architecture.
   if (IsOpenMPGPUTarget || getLangOpts().CUDA)
     // Delay error emission for the OpenMP device code.
+    return;
+
+  // P3549: 'decltype(throw 0)' is how std::noreturn_t is named; a throw-expression in an unevaluated operand throws
+  // nothing, so -fno-exceptions does not apply to it (C++29 only).
+  if (!IsTry && getLangOpts().DivergingExpressions && isUnevaluatedContext())
     return;
 
   // A throw-expression and a try-block are part of constant evaluation in C++26 ([expr.const], P3068R6): a constexpr

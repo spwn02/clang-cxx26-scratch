@@ -3859,6 +3859,9 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     return RValue::get(nullptr);
   }
   case Builtin::BI__assume:
+  case Builtin::BI__builtin_constexpr_diag:
+    // Only has an effect when manifestly constant-evaluated.
+    return RValue::get(nullptr);
   case Builtin::BI__builtin_assume: {
     if (E->getArg(0)->HasSideEffects(getContext()))
       return RValue::get(nullptr);
@@ -5908,6 +5911,27 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
         E->getCallee()->getType()->castAs<FunctionProtoType>(), E, true);
     return RValue::get(nullptr);
 
+  case Builtin::BI__builtin_pointer_tag_insert: {
+    // Tagging adds the tag as a byte offset (the low bits are zero), which keeps the provenance of the pointer.
+    llvm::Value *Ptr = EmitScalarExpr(E->getArg(0));
+    llvm::Value *Tag = EmitScalarExpr(E->getArg(1));
+    return RValue::get(Builder.CreatePtrAdd(Ptr, Tag, "tagged"));
+  }
+  case Builtin::BI__builtin_pointer_tag_get: {
+    llvm::Value *Ptr = EmitScalarExpr(E->getArg(0));
+    llvm::Value *Bits = EmitScalarExpr(E->getArg(1));
+    llvm::Type *IntTy = Bits->getType();
+    llvm::Value *Mask = Builder.CreateSub(Builder.CreateShl(llvm::ConstantInt::get(IntTy, 1), Bits), llvm::ConstantInt::get(IntTy, 1), "tag_mask");
+    return RValue::get(Builder.CreateAnd(Builder.CreatePtrToInt(Ptr, IntTy), Mask, "tag"));
+  }
+  case Builtin::BI__builtin_pointer_tag_strip: {
+    llvm::Value *Ptr = EmitScalarExpr(E->getArg(0));
+    llvm::Value *Bits = EmitScalarExpr(E->getArg(1));
+    llvm::Type *IntTy = Bits->getType();
+    llvm::Value *Mask = Builder.CreateSub(Builder.CreateShl(llvm::ConstantInt::get(IntTy, 1), Bits), llvm::ConstantInt::get(IntTy, 1), "tag_mask");
+    llvm::Value *Inverted = Builder.CreateNot(Mask, "inverted_mask");
+    return RValue::get(Builder.CreateIntrinsic(Intrinsic::ptrmask, {Ptr->getType(), IntTy}, {Ptr, Inverted}, nullptr, "untagged"));
+  }
   case Builtin::BI__builtin_is_aligned:
     return EmitBuiltinIsAligned(E);
   case Builtin::BI__builtin_align_up:

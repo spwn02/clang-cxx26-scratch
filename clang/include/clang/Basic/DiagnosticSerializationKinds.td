@@ -172,6 +172,9 @@ def err_module_no_size_mtime_for_header : Error<
   "for missing header file \"%2\"">;
 def err_module_unable_to_hash_content : Error<
   "failed to hash content for '%0' because memory buffer cannot be retrieved">;
+def warn_token_sequence_not_serialized : Warning<
+  "a token sequence containing an interpolated declaration description is not "
+  "fully preserved in a precompiled header or module: that token is lost">,
+  InGroup<DiagGroup<"token-sequence-serialization">>;
 } // let CategoryName
 } // let Component
-

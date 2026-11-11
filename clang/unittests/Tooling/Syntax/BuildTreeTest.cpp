@@ -95,6 +95,1543 @@ INSTANTIATE_TEST_SUITE_P(
       return Info.param.toShortString();
     });
 
+// C++29 pattern matching (P2688).
+class BuildSyntaxTreeMatchTest : public BuildSyntaxTreeTest {
+public:
+  BuildSyntaxTreeMatchTest() { ExtraArgs = {"-std=c++2d"}; }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    SyntaxTreeTests, BuildSyntaxTreeMatchTest,
+    testing::Values([] {
+      TestClangConfig Config;
+      Config.Language = Lang_CXX26;
+      Config.Target = "x86_64-pc-linux-gnu";
+      return Config;
+    }()),
+    [](const testing::TestParamInfo<TestClangConfig> &Info) {
+      return Info.param.toShortString();
+    });
+
+// C++29 pattern matching has nodes for selections, cases, guards, tests,
+// conditions and every kind of pattern.
+// A match selection expression: its cases hold a pattern, an optional guard,
+// `=>` and a statement (an expression handler is an expression statement).
+TEST_P(BuildSyntaxTreeMatchTest, MatchSelectionExpression) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int test(int a) {
+  return [[match (a) { case 0 => 1; case _ => 2; }]];
+}
+)cpp",
+      {R"txt(
+MatchSelectionExpression ReturnValue
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-ExpressionPattern Pattern
+| | `-IntegerLiteralExpression Expression
+| |   `-'0' LiteralToken
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-IntegerLiteralExpression Expression
+|   | `-'1' LiteralToken
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-IntegerLiteralExpression Expression
+|   | `-'2' LiteralToken
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// A match selection statement is a statement of its own (no `;` follows the
+// closing brace); patterns are not expressions: an or-pattern is a list of
+// patterns, a declaration pattern holds a declaration, and a guard is a node.
+TEST_P(BuildSyntaxTreeMatchTest, MatchSelectionStatement) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int use(int);
+void test(int a) {
+  [[match (a) {
+    case 0 or 1 => use(1);
+    case int v if (v > 3) => use(v);
+    case _ => use(0);
+  }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-OrPattern Pattern
+| | `-PatternAlternatives Alternatives
+| |   |-ExpressionPattern ListElement
+| |   | `-IntegerLiteralExpression Expression
+| |   |   `-'0' LiteralToken
+| |   |-'or' ListDelimiter
+| |   `-ExpressionPattern ListElement
+| |     `-IntegerLiteralExpression Expression
+| |       `-'1' LiteralToken
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'1' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DeclarationPattern Pattern
+| | `-SimpleDeclaration Declaration
+| |   |-'int'
+| |   `-DeclaratorList Declarators
+| |     `-SimpleDeclarator ListElement
+| |       `-'v'
+| |-MatchGuard Guard
+| | |-'if' IntroducerKeyword
+| | |-'('
+| | |-BinaryOperatorExpression
+| | | |-IdExpression LeftHandSide
+| | | | `-UnqualifiedId UnqualifiedId
+| | | |   `-'v'
+| | | |-'>' OperatorToken
+| | | `-IntegerLiteralExpression RightHandSide
+| | |   `-'3' LiteralToken
+| | `-')'
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IdExpression ListElement
+|   | |   `-UnqualifiedId UnqualifiedId
+|   | |     `-'v'
+|   | `-')' CloseParen
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'0' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// A single-pattern test.
+TEST_P(BuildSyntaxTreeMatchTest, MatchTest) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+bool test(int a) {
+  return [[match(a, case 1 or 2)]];
+}
+)cpp",
+      {R"txt(
+MatchTestExpression ReturnValue
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-','
+|-'case'
+|-OrPattern Pattern
+| `-PatternAlternatives Alternatives
+|   |-ExpressionPattern ListElement
+|   | `-IntegerLiteralExpression Expression
+|   |   `-'1' LiteralToken
+|   |-'or' ListDelimiter
+|   `-ExpressionPattern ListElement
+|     `-IntegerLiteralExpression Expression
+|       `-'2' LiteralToken
+`-')'
+)txt"}));
+}
+
+// A pattern condition, an operand of the `&&` chain of an if condition.
+TEST_P(BuildSyntaxTreeMatchTest, PatternConditionIf) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int use(int);
+void test(int a) {
+  [[if (a > 0 && case int x = a) use(x);]]
+}
+)cpp",
+      {R"txt(
+IfStatement Statement
+|-'if' IntroducerKeyword
+|-'('
+|-ExpressionStatement Condition
+| `-BinaryOperatorExpression Expression
+|   |-BinaryOperatorExpression LeftHandSide
+|   | |-IdExpression LeftHandSide
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'a'
+|   | |-'>' OperatorToken
+|   | `-IntegerLiteralExpression RightHandSide
+|   |   `-'0' LiteralToken
+|   |-'&&' OperatorToken
+|   `-PatternCondition RightHandSide
+|     |-'case' IntroducerKeyword
+|     |-DeclarationPattern Pattern
+|     | `-SimpleDeclaration Declaration
+|     |   |-'int'
+|     |   `-DeclaratorList Declarators
+|     |     `-SimpleDeclarator ListElement
+|     |       `-'x'
+|     |-'='
+|     `-IdExpression Subject
+|       `-UnqualifiedId UnqualifiedId
+|         `-'a'
+|-')'
+`-ExpressionStatement ThenStatement
+  |-CallExpression Expression
+  | |-IdExpression Callee
+  | | `-UnqualifiedId UnqualifiedId
+  | |   `-'use'
+  | |-'(' OpenParen
+  | |-CallArguments Arguments
+  | | `-IdExpression ListElement
+  | |   `-UnqualifiedId UnqualifiedId
+  | |     `-'x'
+  | `-')' CloseParen
+  `-';'
+)txt"}));
+}
+
+// A pattern condition in a while condition.
+TEST_P(BuildSyntaxTreeMatchTest, PatternConditionWhile) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+void test(int a) {
+  [[while (case int y = a) { break; }]]
+}
+)cpp",
+      {R"txt(
+WhileStatement Statement
+|-'while' IntroducerKeyword
+|-'('
+|-PatternCondition
+| |-'case' IntroducerKeyword
+| |-DeclarationPattern Pattern
+| | `-SimpleDeclaration Declaration
+| |   |-'int'
+| |   `-DeclaratorList Declarators
+| |     `-SimpleDeclarator ListElement
+| |       `-'y'
+| |-'='
+| `-IdExpression Subject
+|   `-UnqualifiedId UnqualifiedId
+|     `-'a'
+|-')'
+`-CompoundStatement BodyStatement
+  |-'{' OpenParen
+  |-BreakStatement Statement
+  | |-'break' IntroducerKeyword
+  | `-';'
+  `-'}' CloseParen
+)txt"}));
+}
+
+// A pattern condition in the condition of a for statement.
+TEST_P(BuildSyntaxTreeMatchTest, PatternConditionFor) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+void test(int a) {
+  [[for (int i = 0; case int z = i; ++i) {}]]
+}
+)cpp",
+      {R"txt(
+ForStatement Statement
+|-'for' IntroducerKeyword
+|-'('
+|-DeclarationStatement
+| |-SimpleDeclaration
+| | |-'int'
+| | `-DeclaratorList Declarators
+| |   `-SimpleDeclarator ListElement
+| |     |-'i'
+| |     |-'='
+| |     `-IntegerLiteralExpression
+| |       `-'0' LiteralToken
+| `-';'
+|-PatternCondition
+| |-'case' IntroducerKeyword
+| |-DeclarationPattern Pattern
+| | `-SimpleDeclaration Declaration
+| |   |-'int'
+| |   `-DeclaratorList Declarators
+| |     `-SimpleDeclarator ListElement
+| |       `-'z'
+| |-'='
+| `-IdExpression Subject
+|   `-UnqualifiedId UnqualifiedId
+|     `-'i'
+|-';'
+|-PrefixUnaryOperatorExpression
+| |-'++' OperatorToken
+| `-IdExpression Operand
+|   `-UnqualifiedId UnqualifiedId
+|     `-'i'
+|-')'
+`-CompoundStatement BodyStatement
+  |-'{' OpenParen
+  `-'}' CloseParen
+)txt"}));
+}
+
+// Several subjects are marked one by one; the decomposition patterns that match
+// the product of the subjects hold their elements in a list.
+TEST_P(BuildSyntaxTreeMatchTest, MultipleSubjects) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int use(int);
+void test(int a, int b) {
+  [[match (a, b) {
+    case [0, int v] => use(v);
+    case [_, _] => use(0);
+  }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-','
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'b'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DecompositionPattern Pattern
+| | |-'[' OpenParen
+| | |-PatternElements Elements
+| | | |-ExpressionPattern ListElement
+| | | | `-IntegerLiteralExpression Expression
+| | | |   `-'0' LiteralToken
+| | | |-',' ListDelimiter
+| | | `-DeclarationPattern ListElement
+| | |   `-SimpleDeclaration Declaration
+| | |     |-'int'
+| | |     `-DeclaratorList Declarators
+| | |       `-SimpleDeclarator ListElement
+| | |         `-'v'
+| | `-']' CloseParen
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IdExpression ListElement
+|   | |   `-UnqualifiedId UnqualifiedId
+|   | |     `-'v'
+|   | `-')' CloseParen
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DecompositionPattern Pattern
+| | |-'[' OpenParen
+| | |-PatternElements Elements
+| | | |-WildcardPattern ListElement
+| | | | `-'_' Wildcard
+| | | |-',' ListDelimiter
+| | | `-WildcardPattern ListElement
+| | |   `-'_' Wildcard
+| | `-']' CloseParen
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'0' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// The bare `...` of a decomposition pattern is a pattern of unknown kind.
+TEST_P(BuildSyntaxTreeMatchTest, DecompositionPack) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+struct P { int a; int b; int c; };
+int use(int);
+void test(P p) {
+  [[match (p) { case [auto &&first, ...] => use(first); }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'p'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DecompositionPattern Pattern
+| | |-'[' OpenParen
+| | |-PatternElements Elements
+| | | |-DeclarationPattern ListElement
+| | | | `-SimpleDeclaration Declaration
+| | | |   |-'auto'
+| | | |   `-DeclaratorList Declarators
+| | | |     `-SimpleDeclarator ListElement
+| | | |       |-'&&'
+| | | |       `-'first'
+| | | |-',' ListDelimiter
+| | | `-UnknownPattern ListElement
+| | |   `-'...'
+| | `-']' CloseParen
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IdExpression ListElement
+|   | |   `-UnqualifiedId UnqualifiedId
+|   | |     `-'first'
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// Alternative patterns: the braces are the delimiters, `{ }` holds no pattern.
+TEST_P(BuildSyntaxTreeMatchTest, AlternativePatterns) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int use(int);
+void test(int *p) {
+  [[match (p) { case { int &r } => use(r); case {} => use(0); }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'p'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-AlternativePattern Pattern
+| | |-'{' OpenParen
+| | |-DeclarationPattern Pattern
+| | | `-SimpleDeclaration Declaration
+| | |   |-'int'
+| | |   `-DeclaratorList Declarators
+| | |     `-SimpleDeclarator ListElement
+| | |       |-'&'
+| | |       `-'r'
+| | `-'}' CloseParen
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IdExpression ListElement
+|   | |   `-UnqualifiedId UnqualifiedId
+|   | |     `-'r'
+|   | `-')' CloseParen
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-AlternativePattern Pattern
+| | |-'{' OpenParen
+| | `-'}' CloseParen
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'0' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// In a template the source cases are built, not their instantiations.
+TEST_P(BuildSyntaxTreeMatchTest, TemplateSelection) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+template <class T>
+int test(T v) {
+  return [[match (v) { case int i => i; case _ => 0; }]];
+}
+)cpp",
+      {R"txt(
+MatchSelectionExpression ReturnValue
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'v'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DeclarationPattern Pattern
+| | `-SimpleDeclaration Declaration
+| |   |-'int'
+| |   `-DeclaratorList Declarators
+| |     `-SimpleDeclarator ListElement
+| |       `-'i'
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-IdExpression Expression
+|   | `-UnqualifiedId UnqualifiedId
+|   |   `-'i'
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-IntegerLiteralExpression Expression
+|   | `-'0' LiteralToken
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// A pattern from a macro expansion keeps the tokens of the expansion.
+TEST_P(BuildSyntaxTreeMatchTest, MacroPattern) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+#define GROUP(...) (__VA_ARGS__)
+int use(int);
+void test(int a) {
+  [[match (a) { case GROUP(0 or 1) => use(1); case _ => use(0); }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-ParenPattern Pattern
+| | |-'(' OpenParen unmodifiable
+| | |-OrPattern Pattern
+| | | `-PatternAlternatives Alternatives
+| | |   |-ExpressionPattern ListElement
+| | |   | `-IntegerLiteralExpression Expression
+| | |   |   `-'0' LiteralToken
+| | |   |-'or' ListDelimiter
+| | |   `-ExpressionPattern ListElement
+| | |     `-IntegerLiteralExpression Expression
+| | |       `-'1' LiteralToken
+| | `-')' CloseParen unmodifiable
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'1' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'0' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// The preamble is a sequence of declaration statements; the trailing result type
+// is not modelled yet (its tokens are leaves).
+TEST_P(BuildSyntaxTreeMatchTest, PreambleAndResultType) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int test(int a) {
+  return [[match (a) -> long { using I = long; case _ => 1; }]];
+}
+)cpp",
+      {R"txt(
+MatchSelectionExpression ReturnValue
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-')'
+|-'->'
+|-'long'
+|-'{' OpenParen
+|-DeclarationStatement Statement
+| |-TypeAliasDeclaration
+| | |-'using'
+| | |-'I'
+| | |-'='
+| | `-'long'
+| `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-IntegerLiteralExpression Expression
+|   | `-'1' LiteralToken
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// The condition of a guard can declare a variable.
+TEST_P(BuildSyntaxTreeMatchTest, GuardConditionVariable) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int use(int);
+int f(int);
+void test(int a) {
+  [[match (a) { case int v if (auto s = f(v)) => use(s); case _ => use(0); }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DeclarationPattern Pattern
+| | `-SimpleDeclaration Declaration
+| |   |-'int'
+| |   `-DeclaratorList Declarators
+| |     `-SimpleDeclarator ListElement
+| |       `-'v'
+| |-MatchGuard Guard
+| | |-'if' IntroducerKeyword
+| | |-'('
+| | |-SimpleDeclaration
+| | | |-'auto'
+| | | `-DeclaratorList Declarators
+| | |   `-SimpleDeclarator ListElement
+| | |     |-'s'
+| | |     |-'='
+| | |     `-CallExpression
+| | |       |-IdExpression Callee
+| | |       | `-UnqualifiedId UnqualifiedId
+| | |       |   `-'f'
+| | |       |-'(' OpenParen
+| | |       |-CallArguments Arguments
+| | |       | `-IdExpression ListElement
+| | |       |   `-UnqualifiedId UnqualifiedId
+| | |       |     `-'v'
+| | |       `-')' CloseParen
+| | `-')'
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IdExpression ListElement
+|   | |   `-UnqualifiedId UnqualifiedId
+|   | |     `-'s'
+|   | `-')' CloseParen
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'0' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// A guard can have an init-statement.
+TEST_P(BuildSyntaxTreeMatchTest, GuardInitStatement) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int use(int);
+struct St { bool ok() const; };
+St validate(int);
+void test(int a) {
+  [[match (a) { case int v if (St st = validate(v); st.ok()) => use(v); case _ => use(0); }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DeclarationPattern Pattern
+| | `-SimpleDeclaration Declaration
+| |   |-'int'
+| |   `-DeclaratorList Declarators
+| |     `-SimpleDeclarator ListElement
+| |       `-'v'
+| |-MatchGuard Guard
+| | |-'if' IntroducerKeyword
+| | |-'('
+| | |-DeclarationStatement
+| | | |-SimpleDeclaration
+| | | | |-'St'
+| | | | `-DeclaratorList Declarators
+| | | |   `-SimpleDeclarator ListElement
+| | | |     |-'st'
+| | | |     |-'='
+| | | |     `-CallExpression
+| | | |       |-IdExpression Callee
+| | | |       | `-UnqualifiedId UnqualifiedId
+| | | |       |   `-'validate'
+| | | |       |-'(' OpenParen
+| | | |       |-CallArguments Arguments
+| | | |       | `-IdExpression ListElement
+| | | |       |   `-UnqualifiedId UnqualifiedId
+| | | |       |     `-'v'
+| | | |       `-')' CloseParen
+| | | `-';'
+| | |-CallExpression
+| | | |-MemberExpression Callee
+| | | | |-IdExpression Object
+| | | | | `-UnqualifiedId UnqualifiedId
+| | | | |   `-'st'
+| | | | |-'.' AccessToken
+| | | | `-IdExpression Member
+| | | |   `-UnqualifiedId UnqualifiedId
+| | | |     `-'ok'
+| | | |-'(' OpenParen
+| | | `-')' CloseParen
+| | `-')'
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IdExpression ListElement
+|   | |   `-UnqualifiedId UnqualifiedId
+|   | |     `-'v'
+|   | `-')' CloseParen
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'0' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// A pack that stands for the rest of the elements.
+TEST_P(BuildSyntaxTreeMatchTest, DecompositionPacks) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+struct P { int a; int b; int c; };
+int use(int);
+void test(P p) {
+  [[match (p) {
+    case [auto &&...rest] => use(1);
+  }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'p'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DecompositionPattern Pattern
+| | |-'[' OpenParen
+| | |-PatternElements Elements
+| | | `-DeclarationPattern ListElement
+| | |   `-SimpleDeclaration Declaration
+| | |     |-'auto'
+| | |     `-DeclaratorList Declarators
+| | |       `-SimpleDeclarator ListElement
+| | |         |-'&&'
+| | |         |-'...'
+| | |         `-'rest'
+| | `-']' CloseParen
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'1' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// A pack between two elements.
+TEST_P(BuildSyntaxTreeMatchTest, DecompositionPackInTheMiddle) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+struct P { int a; int b; int c; };
+int use(int);
+void test(P p) {
+  [[match (p) { case [auto &&first, auto &&...middle, auto &&last] => use(first); }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'p'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DecompositionPattern Pattern
+| | |-'[' OpenParen
+| | |-PatternElements Elements
+| | | |-DeclarationPattern ListElement
+| | | | `-SimpleDeclaration Declaration
+| | | |   |-'auto'
+| | | |   `-DeclaratorList Declarators
+| | | |     `-SimpleDeclarator ListElement
+| | | |       |-'&&'
+| | | |       `-'first'
+| | | |-',' ListDelimiter
+| | | |-DeclarationPattern ListElement
+| | | | `-SimpleDeclaration Declaration
+| | | |   |-'auto'
+| | | |   `-DeclaratorList Declarators
+| | | |     `-SimpleDeclarator ListElement
+| | | |       |-'&&'
+| | | |       |-'...'
+| | | |       `-'middle'
+| | | |-',' ListDelimiter
+| | | `-DeclarationPattern ListElement
+| | |   `-SimpleDeclaration Declaration
+| | |     |-'auto'
+| | |     `-DeclaratorList Declarators
+| | |       `-SimpleDeclarator ListElement
+| | |         |-'&&'
+| | |         `-'last'
+| | `-']' CloseParen
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IdExpression ListElement
+|   | |   `-UnqualifiedId UnqualifiedId
+|   | |     `-'first'
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// Elements that a template pack expands to.
+TEST_P(BuildSyntaxTreeMatchTest, DecompositionTemplatePack) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int use(int);
+template <int... Values>
+void test(const auto &tuple) {
+  [[match (tuple) { case [Values...] => use(1); case _ => use(0); }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'tuple'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DecompositionPattern Pattern
+| | |-'[' OpenParen
+| | |-PatternElements Elements
+| | | `-ExpressionPattern ListElement
+| | |   `-UnknownExpression Expression
+| | |     |-IdExpression
+| | |     | `-UnqualifiedId UnqualifiedId
+| | |     |   `-'Values'
+| | |     `-'...'
+| | `-']' CloseParen
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'1' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'0' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// A decomposition pattern inside another.
+TEST_P(BuildSyntaxTreeMatchTest, NestedDecomposition) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+struct P { int a; int b; };
+struct N { P p; int d; };
+int use(int);
+void test(N n) {
+  [[match (n) { case [ [0, int x], int y] => use(y); case _ => use(0); }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'n'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-DecompositionPattern Pattern
+| | |-'[' OpenParen
+| | |-PatternElements Elements
+| | | |-DecompositionPattern ListElement
+| | | | |-'[' OpenParen
+| | | | |-PatternElements Elements
+| | | | | |-ExpressionPattern ListElement
+| | | | | | `-IntegerLiteralExpression Expression
+| | | | | |   `-'0' LiteralToken
+| | | | | |-',' ListDelimiter
+| | | | | `-DeclarationPattern ListElement
+| | | | |   `-SimpleDeclaration Declaration
+| | | | |     |-'int'
+| | | | |     `-DeclaratorList Declarators
+| | | | |       `-SimpleDeclarator ListElement
+| | | | |         `-'x'
+| | | | `-']' CloseParen
+| | | |-',' ListDelimiter
+| | | `-DeclarationPattern ListElement
+| | |   `-SimpleDeclaration Declaration
+| | |     |-'int'
+| | |     `-DeclaratorList Declarators
+| | |       `-SimpleDeclarator ListElement
+| | |         `-'y'
+| | `-']' CloseParen
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IdExpression ListElement
+|   | |   `-UnqualifiedId UnqualifiedId
+|   | |     `-'y'
+|   | `-')' CloseParen
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'0' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// A type pattern.
+TEST_P(BuildSyntaxTreeMatchTest, TypePattern) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int use(int);
+void test(int a) {
+  [[match (a) { case int => use(1); }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-TypePattern Pattern
+| | `-'int'
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'1' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// The handlers of a match selection statement are statements.
+TEST_P(BuildSyntaxTreeMatchTest, HandlerStatements) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int use(int);
+void test(int a) {
+  [[match (a) {
+    case 1 => { use(1); }
+    case 2 => return;
+    case _ => static_assert(true);
+  }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-ExpressionPattern Pattern
+| | `-IntegerLiteralExpression Expression
+| |   `-'1' LiteralToken
+| |-'=>' ArrowToken
+| `-CompoundStatement Statement
+|   |-'{' OpenParen
+|   |-ExpressionStatement Statement
+|   | |-CallExpression Expression
+|   | | |-IdExpression Callee
+|   | | | `-UnqualifiedId UnqualifiedId
+|   | | |   `-'use'
+|   | | |-'(' OpenParen
+|   | | |-CallArguments Arguments
+|   | | | `-IntegerLiteralExpression ListElement
+|   | | |   `-'1' LiteralToken
+|   | | `-')' CloseParen
+|   | `-';'
+|   `-'}' CloseParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-ExpressionPattern Pattern
+| | `-IntegerLiteralExpression Expression
+| |   `-'2' LiteralToken
+| |-'=>' ArrowToken
+| `-ReturnStatement Statement
+|   |-'return' IntroducerKeyword
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-DeclarationStatement Statement
+|   |-StaticAssertDeclaration
+|   | |-'static_assert'
+|   | |-'('
+|   | |-BoolLiteralExpression Condition
+|   | | `-'true' LiteralToken
+|   | `-')'
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// A match selection statement is a handler of another.
+TEST_P(BuildSyntaxTreeMatchTest, NestedMatchHandler) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int use(int);
+void test(int a, int b) {
+  [[match (a) { case 1 => match (b) { case _ => use(1); } case _ => use(0); }]]
+}
+)cpp",
+      {R"txt(
+MatchSelectionStatement Statement
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-')'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-ExpressionPattern Pattern
+| | `-IntegerLiteralExpression Expression
+| |   `-'1' LiteralToken
+| |-'=>' ArrowToken
+| `-MatchSelectionStatement Statement
+|   |-'match' IntroducerKeyword
+|   |-'('
+|   |-IdExpression Subject
+|   | `-UnqualifiedId UnqualifiedId
+|   |   `-'b'
+|   |-')'
+|   |-'{' OpenParen
+|   |-MatchCase Case
+|   | |-'case' IntroducerKeyword
+|   | |-WildcardPattern Pattern
+|   | | `-'_' Wildcard
+|   | |-'=>' ArrowToken
+|   | `-ExpressionStatement Statement
+|   |   |-CallExpression Expression
+|   |   | |-IdExpression Callee
+|   |   | | `-UnqualifiedId UnqualifiedId
+|   |   | |   `-'use'
+|   |   | |-'(' OpenParen
+|   |   | |-CallArguments Arguments
+|   |   | | `-IntegerLiteralExpression ListElement
+|   |   | |   `-'1' LiteralToken
+|   |   | `-')' CloseParen
+|   |   `-';'
+|   `-'}' CloseParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-CallExpression Expression
+|   | |-IdExpression Callee
+|   | | `-UnqualifiedId UnqualifiedId
+|   | |   `-'use'
+|   | |-'(' OpenParen
+|   | |-CallArguments Arguments
+|   | | `-IntegerLiteralExpression ListElement
+|   | |   `-'0' LiteralToken
+|   | `-')' CloseParen
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// `not return` is not modelled (its tokens are leaves).
+TEST_P(BuildSyntaxTreeMatchTest, NotReturnHandler) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int test(int a) {
+  return [[match (a) -> int { case 1 => not return throw 1; case _ => 5; }]];
+}
+)cpp",
+      {R"txt(
+MatchSelectionExpression ReturnValue
+|-'match' IntroducerKeyword
+|-'('
+|-IdExpression Subject
+| `-UnqualifiedId UnqualifiedId
+|   `-'a'
+|-')'
+|-'->'
+|-'int'
+|-'{' OpenParen
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-ExpressionPattern Pattern
+| | `-IntegerLiteralExpression Expression
+| |   `-'1' LiteralToken
+| |-'=>' ArrowToken
+| |-'not'
+| |-'return'
+| `-ExpressionStatement Statement
+|   |-UnknownExpression Expression
+|   | |-'throw'
+|   | `-IntegerLiteralExpression
+|   |   `-'1' LiteralToken
+|   `-';'
+|-MatchCase Case
+| |-'case' IntroducerKeyword
+| |-WildcardPattern Pattern
+| | `-'_' Wildcard
+| |-'=>' ArrowToken
+| `-ExpressionStatement Statement
+|   |-IntegerLiteralExpression Expression
+|   | `-'5' LiteralToken
+|   `-';'
+`-'}' CloseParen
+)txt"}));
+}
+
+// `match` names a type where no selection begins.
+TEST_P(BuildSyntaxTreeMatchTest, MatchIsATypeName) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+struct match { match(int); };
+void test() {
+  [[match first(0);]]
+}
+)cpp",
+      {R"txt(
+DeclarationStatement Statement
+|-SimpleDeclaration
+| |-'match'
+| `-DeclaratorList Declarators
+|   `-SimpleDeclarator ListElement
+|     `-UnknownExpression
+|       |-'first'
+|       |-'('
+|       |-IntegerLiteralExpression
+|       | `-'0' LiteralToken
+|       `-')'
+`-';'
+)txt"}));
+}
+
+// `match` stays an ordinary name where no selection begins.
+TEST_P(BuildSyntaxTreeMatchTest, MatchIsAnIdentifier) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+struct R { int result; };
+R *match(int);
+int test(int v) {
+  return [[match(v)->result]];
+}
+)cpp",
+      {R"txt(
+MemberExpression ReturnValue
+|-CallExpression Object
+| |-IdExpression Callee
+| | `-UnqualifiedId UnqualifiedId
+| |   `-'match'
+| |-'(' OpenParen
+| |-CallArguments Arguments
+| | `-IdExpression ListElement
+| |   `-UnqualifiedId UnqualifiedId
+| |     `-'v'
+| `-')' CloseParen
+|-'->' AccessToken
+`-IdExpression Member
+  `-UnqualifiedId UnqualifiedId
+    `-'result'
+)txt"}));
+}
+
+// The accessors of the match nodes find their parts by role.
+TEST_P(BuildSyntaxTreeMatchTest, Accessors) {
+  auto *TU = buildTree(R"cpp(
+int use(int);
+void test(int a, int b) {
+  match (a, b) { case [0, int v] if (v > 1) => use(v); case _ => use(0); }
+  if (case int x = a) use(x);
+}
+)cpp",
+                       GetParam());
+  ASSERT_TRUE(TU);
+  // The match selection statement is the first statement of the last
+  // declaration's body.
+  std::function<syntax::Node *(syntax::Node *)> Find =
+      [&](syntax::Node *N) -> syntax::Node * {
+    if (isa<syntax::MatchSelectionStatement>(N))
+      return N;
+    if (auto *T = dyn_cast<syntax::Tree>(N))
+      for (syntax::Node &C : T->getChildren())
+        if (auto *R = Find(&C))
+          return R;
+    return nullptr;
+  };
+  auto *Match = cast_or_null<syntax::MatchSelectionStatement>(Find(TU));
+  ASSERT_TRUE(Match);
+  EXPECT_TRUE(Match->getMatchKeyword());
+  EXPECT_EQ(Match->getSubjects().size(), 2u);
+  ASSERT_EQ(Match->getCases().size(), 2u);
+  syntax::MatchCase *First = Match->getCases()[0];
+  EXPECT_TRUE(First->getCaseKeyword());
+  auto *Decomposition =
+      dyn_cast_or_null<syntax::DecompositionPattern>(First->getPattern());
+  ASSERT_TRUE(Decomposition);
+  EXPECT_TRUE(First->getGuard());
+  EXPECT_TRUE(First->getGuard()->getIfKeyword());
+  EXPECT_TRUE(First->getArrow());
+  EXPECT_TRUE(First->getHandler());
+  syntax::MatchCase *Second = Match->getCases()[1];
+  EXPECT_TRUE(isa<syntax::WildcardPattern>(Second->getPattern()));
+  EXPECT_FALSE(Second->getGuard());
+}
+
+// C++29 do expressions (P2806): DoExpression and DoReturnStatement nodes.
+class BuildSyntaxTreeDoExprTest : public BuildSyntaxTreeTest {
+public:
+  BuildSyntaxTreeDoExprTest() {
+    ExtraArgs = {"-std=c++29"};
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    SyntaxTreeTests, BuildSyntaxTreeDoExprTest,
+    testing::Values([] {
+      TestClangConfig Config;
+      Config.Language = Lang_CXX26;
+      Config.Target = "x86_64-pc-linux-gnu";
+      return Config;
+    }()),
+    [](const testing::TestParamInfo<TestClangConfig> &Info) {
+      return Info.param.toShortString();
+    });
+
+TEST_P(BuildSyntaxTreeDoExprTest, DoExpression) {
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+int test(int a) {
+  return [[do { do_return a; }]];
+}
+)cpp",
+      {R"txt(
+DoExpression ReturnValue
+|-'do' IntroducerKeyword
+`-CompoundStatement BodyStatement
+  |-'{' OpenParen
+  |-DoReturnStatement Statement
+  | |-'do_return' IntroducerKeyword
+  | |-IdExpression ReturnValue
+  | | `-UnqualifiedId UnqualifiedId
+  | |   `-'a'
+  | `-';'
+  `-'}' CloseParen
+)txt"}));
+}
+
+TEST_P(BuildSyntaxTreeDoExprTest, CapturesResultTypeAndVoid) {
+  // The init-captures are the compiler's own bracketed init statement and show
+  // up as a CompoundStatement; `->` and the result type are not modelled and are
+  // unclassified tokens between the keyword and the body.
+  EXPECT_TRUE(treeDumpEqualOnAnnotations(
+      R"cpp(
+void test() {
+  (void)([[do [k = 1] -> int { do_return k; }]]);
+  (void)([[do { do_return; }]]);
+}
+)cpp",
+      {R"txt(
+DoExpression SubExpression
+|-'do' IntroducerKeyword
+|-CompoundStatement
+| |-'[' OpenParen
+| |-DeclarationStatement Statement
+| | `-SimpleDeclaration
+| |   `-DeclaratorList Declarators
+| |     `-SimpleDeclarator ListElement
+| |       |-'k'
+| |       |-'='
+| |       `-IntegerLiteralExpression
+| |         `-'1' LiteralToken
+| `-']' CloseParen
+|-'->'
+|-'int'
+`-CompoundStatement BodyStatement
+  |-'{' OpenParen
+  |-DoReturnStatement Statement
+  | |-'do_return' IntroducerKeyword
+  | |-IdExpression ReturnValue
+  | | `-UnqualifiedId UnqualifiedId
+  | |   `-'k'
+  | `-';'
+  `-'}' CloseParen
+)txt",
+       R"txt(
+DoExpression SubExpression
+|-'do' IntroducerKeyword
+`-CompoundStatement BodyStatement
+  |-'{' OpenParen
+  |-DoReturnStatement Statement
+  | |-'do_return' IntroducerKeyword
+  | `-';'
+  `-'}' CloseParen
+)txt"}));
+}
+
+TEST_P(BuildSyntaxTreeDoExprTest, Accessors) {
+  auto *Root = buildTree("int f() { return do { do_return 1; }; }", GetParam());
+  // Find the nodes by walking the tree.
+  syntax::DoExpression *DE = nullptr;
+  syntax::DoReturnStatement *DR = nullptr;
+  std::vector<syntax::Node *> Work = {Root};
+  while (!Work.empty()) {
+    auto *N = Work.back();
+    Work.pop_back();
+    if (auto *E = llvm::dyn_cast<syntax::DoExpression>(N))
+      DE = E;
+    if (auto *R = llvm::dyn_cast<syntax::DoReturnStatement>(N))
+      DR = R;
+    if (auto *T = llvm::dyn_cast<syntax::Tree>(N))
+      for (auto &C : T->getChildren())
+        Work.push_back(&C);
+  }
+  ASSERT_NE(DE, nullptr);
+  ASSERT_NE(DR, nullptr);
+  EXPECT_NE(DE->getIntroducerKeyword(), nullptr);
+  EXPECT_NE(DE->getBodyStatement(), nullptr);
+  EXPECT_NE(DR->getDoReturnKeyword(), nullptr);
+  EXPECT_NE(DR->getReturnValue(), nullptr);
+}
+
 TEST_P(BuildSyntaxTreeTest, Simple) {
   EXPECT_TRUE(treeDumpEqual(
       R"cpp(

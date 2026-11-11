@@ -720,12 +720,11 @@ private:
          Contexts.back().ContextKind != tok::l_brace) &&
         (!Parent ||
          Parent->isOneOf(tok::colon, tok::l_square, tok::l_paren,
-                         tok::kw_return, tok::kw_throw) ||
+                         tok::kw_return, tok::kw_do_return, tok::kw_throw) ||
          Parent->isUnaryOperator() ||
          // FIXME(bug 36976): ObjC return types shouldn't use TT_CastRParen.
          Parent->isOneOf(TT_ObjCForIn, TT_CastRParen) ||
-         (getBinOpPrecedence(Parent->Tok.getKind(), true, true) >
-          prec::Unknown));
+         (getBinOpPrecedence(Parent->Tok, true, true, false) > prec::Unknown));
     bool ColonFound = false;
 
     unsigned BindingIncrease = 1;
@@ -794,6 +793,7 @@ private:
                  Parent->isOneOf(TT_BinaryOperator, TT_TemplateCloser, tok::at,
                                  tok::comma, tok::l_paren, tok::l_square,
                                  tok::question, tok::colon, tok::kw_return,
+                                 tok::kw_do_return,
                                  // Should only be relevant to JavaScript:
                                  tok::kw_default)) {
         Left->setType(TT_ArrayInitializerLSquare);
@@ -2229,8 +2229,10 @@ private:
       if (Current.getPrecedence() != prec::Assignment)
         return false;
 
-      if (Line.First->isOneOf(tok::kw_using, tok::kw_return))
+      if (Line.First->isOneOf(tok::kw_using, tok::kw_return,
+                              tok::kw_do_return)) {
         return false;
+      }
       if (Line.First->is(tok::kw_template)) {
         assert(Current.Previous);
         if (Current.Previous->is(tok::kw_operator)) {
@@ -2306,7 +2308,8 @@ private:
                (!Current.Previous ||
                 Current.Previous->isNot(tok::kw_operator))) {
       Contexts.back().IsExpression = true;
-    } else if (Current.isOneOf(tok::kw_return, tok::kw_throw)) {
+    } else if (Current.isOneOf(tok::kw_return, tok::kw_do_return,
+                               tok::kw_throw)) {
       Contexts.back().IsExpression = true;
     } else if (Current.is(TT_TrailingReturnArrow)) {
       Contexts.back().IsExpression = false;
@@ -2452,6 +2455,14 @@ private:
                Line.MightBeFunctionDecl && Current.NestingLevel == 0 &&
                Current.Previous->isNoneOf(tok::kw_operator, tok::identifier)) {
       // not auto operator->() -> xxx;
+      Current.setType(TT_TrailingReturnArrow);
+    } else if (Current.is(tok::arrow) && Current.Previous &&
+               isDoExpressionResultArrow(Current)) {
+      // `do [captures] -> type { ... }` (P2806).
+      Current.setType(TT_TrailingReturnArrow);
+    } else if (Current.is(tok::arrow) && Current.Previous &&
+               isMatchResultArrow(Current)) {
+      // `match (subject) -> type { ... }` (P2688).
       Current.setType(TT_TrailingReturnArrow);
     } else if (Current.is(tok::arrow) && Current.Previous &&
                Current.Previous->is(tok::r_brace) &&
@@ -2804,7 +2815,8 @@ private:
       // If there is an identifier (or with a few exceptions a keyword) right
       // before the parentheses, this is unlikely to be a cast.
       if (LeftOfParens->Tok.getIdentifierInfo() &&
-          LeftOfParens->isNoneOf(Keywords.kw_in, tok::kw_return, tok::kw_case,
+          LeftOfParens->isNoneOf(Keywords.kw_in, tok::kw_return,
+                                 tok::kw_do_return, tok::kw_case,
                                  tok::kw_delete, tok::kw_throw)) {
         return false;
       }
@@ -2980,6 +2992,28 @@ private:
     return true;
   }
 
+  /// Whether \p Arrow is the `->` of the result type of a match selection
+  /// (P2688): `match (subject) -> T { ... }`.
+  static bool isMatchResultArrow(const FormatToken &Arrow) {
+    const FormatToken *Prev = Arrow.Previous;
+    if (!Prev || Prev->isNot(tok::r_paren) || !Prev->MatchingParen)
+      return false;
+    Prev = Prev->MatchingParen->Previous;
+    if (Prev && Prev->is(tok::kw_constexpr))
+      Prev = Prev->Previous;
+    return Prev && Prev->is(tok::kw_switch) && Prev->TokenText == "match";
+  }
+
+  /// Whether \p Arrow is the `->` of a do expression's result type (P2806):
+  /// `do -> T { ... }` or `do [captures] -> T { ... }`.
+  static bool isDoExpressionResultArrow(const FormatToken &Arrow) {
+    const FormatToken *Prev = Arrow.Previous;
+    if (Prev && Prev->is(tok::r_square) && Prev->MatchingParen)
+      Prev = Prev->MatchingParen->Previous;
+    return Prev && Prev->is(tok::kw_do) &&
+           doFollowsOperandPosition(Prev->getPreviousNonComment());
+  }
+
   /// Returns true if the token is used as a unary operator.
   bool determineUnaryOperatorByUsage(const FormatToken &Tok) {
     const FormatToken *PrevToken = Tok.getPreviousNonComment();
@@ -2996,7 +3030,8 @@ private:
             TT_ConditionalExpr, tok::l_paren, tok::comma, tok::colon, tok::semi,
             tok::equal, tok::question, tok::l_square, tok::l_brace,
             tok::kw_case, tok::kw_co_await, tok::kw_co_return, tok::kw_co_yield,
-            tok::kw_delete, tok::kw_return, tok::kw_throw)) {
+            tok::kw_delete, tok::kw_return, tok::kw_do_return,
+            tok::kw_throw)) {
       return true;
     }
 
@@ -3041,7 +3076,7 @@ private:
     const FormatToken *PrevToken = Tok.getPreviousNonComment();
     if (!PrevToken)
       return TT_UnaryOperator;
-    if (PrevToken->isTypeName(LangOpts))
+    if (PrevToken->isTypeName(LangOpts) || PrevToken->is(tok::kw_auto))
       return TT_PointerOrReference;
     if (PrevToken->isPlacementOperator() && Tok.is(tok::ampamp))
       return TT_BinaryOperator;
@@ -3240,7 +3275,7 @@ public:
   void parse(int Precedence = 0) {
     // Skip 'return' and ObjC selector colons as they are not part of a binary
     // expression.
-    while (Current && (Current->is(tok::kw_return) ||
+    while (Current && (Current->isOneOf(tok::kw_return, tok::kw_do_return) ||
                        (Current->is(tok::colon) &&
                         Current->isOneOf(TT_ObjCMethodExpr, TT_DictLiteral)))) {
       next();
@@ -3934,7 +3969,8 @@ static bool isFunctionDeclarationName(const LangOptions &LangOpts,
     if (Line.startsWith(tok::kw_friend))
       return true;
     if (Previous.Tok.getIdentifierInfo() &&
-        Previous.isNoneOf(tok::kw_return, tok::kw_co_return)) {
+        Previous.isNoneOf(tok::kw_return, tok::kw_do_return,
+                          tok::kw_co_return)) {
       return true;
     }
     if (Previous.is(tok::r_paren) && Previous.is(TT_TypeDeclarationParen)) {
@@ -4047,6 +4083,8 @@ bool TokenAnnotator::mustBreakForReturnType(const AnnotatedLine &Line) const {
 
   return false;
 }
+
+static bool isDoExpressionBodyBrace(const FormatToken &Brace);
 
 void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
   if (Line.Computed)
@@ -4211,6 +4249,11 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
     } else if (!Current->Finalized && Current->SpacesRequiredBefore == 0 &&
                spaceRequiredBefore(Line, *Current)) {
       Current->SpacesRequiredBefore = 1;
+    }
+
+    if (Current->is(tok::l_brace) && Current->isNot(TT_DoExpressionLBrace) &&
+        !Current->isTypeFinalized() && isDoExpressionBodyBrace(*Current)) {
+      Current->setType(TT_DoExpressionLBrace);
     }
 
     const auto &Children = Prev->Children;
@@ -4597,12 +4640,59 @@ bool TokenAnnotator::spaceRequiredBeforeParens(const FormatToken &Right) const {
   return false;
 }
 
+/// Whether \p Brace opens the body of a do expression (P2806):
+/// `do {`, `do [captures] {`, `do -> T {` or `do [captures] -> T {`.
+static bool isDoExpressionBodyBrace(const FormatToken &Brace) {
+  const FormatToken *Arrow = nullptr;
+  const FormatToken *T = Brace.getPreviousNonComment();
+  for (int Steps = 0; T && Steps < 32; ++Steps, T = T->getPreviousNonComment()) {
+    if (T->isOneOf(tok::semi, tok::l_brace, tok::r_brace, tok::equal,
+                   tok::kw_do)) {
+      break;
+    }
+    if (T->isOneOf(tok::arrow, TT_TrailingReturnArrow)) {
+      Arrow = T;
+      break;
+    }
+  }
+  const FormatToken *P =
+      Arrow ? Arrow->getPreviousNonComment() : Brace.getPreviousNonComment();
+  if (P && P->is(tok::r_square) && P->MatchingParen)
+    P = P->MatchingParen->getPreviousNonComment();
+  return P && P->is(tok::kw_do) &&
+         doFollowsOperandPosition(P->getPreviousNonComment());
+}
+
+static bool isDoExpressionKeyword(const FormatToken &Tok) {
+  return Tok.is(tok::kw_do) &&
+         doFollowsOperandPosition(Tok.getPreviousNonComment());
+}
+
 bool TokenAnnotator::spaceRequiredBetween(const AnnotatedLine &Line,
                                           const FormatToken &Left,
                                           const FormatToken &Right) const {
-  if (Left.is(tok::kw_return) &&
+  if (Left.isOneOf(tok::kw_return, tok::kw_do_return) &&
       Right.isNoneOf(tok::semi, tok::r_paren, tok::hashhash)) {
     return true;
+  }
+  // `case [a, b] =>` and `case {P} =>`: a decomposition or alternative pattern.
+  if (Left.is(tok::kw_case) && Right.isOneOf(tok::l_square, tok::l_brace))
+    return true;
+  // `do [captures] -> T { ... }` and `do { ... }` in operand position.
+  if (isDoExpressionKeyword(Left) &&
+      Right.isOneOf(tok::l_square, tok::l_brace, tok::arrow,
+                    TT_TrailingReturnArrow)) {
+    return true;
+  }
+  // `name!(...)`, `name!{...}`, `name![...]`: an expression macro invocation
+  // (P4380) is written as it was, with no space before the '!'.
+  if (Style.isCpp() && Right.is(tok::exclaim) && Right.Next &&
+      Right.Next->isOneOf(tok::l_paren, tok::l_square, tok::l_brace) &&
+      Left.isOneOf(tok::identifier, tok::greater) && Right.NewlinesBefore == 0 &&
+      Right.WhitespaceRange.getBegin() == Right.WhitespaceRange.getEnd() &&
+      Right.Next->WhitespaceRange.getBegin() ==
+          Right.Next->WhitespaceRange.getEnd()) {
+    return false;
   }
   if (Left.is(tok::kw_throw) && Right.is(tok::l_paren) && Right.MatchingParen &&
       Right.MatchingParen->is(TT_CastRParen)) {
@@ -4951,6 +5041,8 @@ bool TokenAnnotator::spaceRequiredBetween(const AnnotatedLine &Line,
       return true;
     if (Left.isOneOf(tok::pp_elif, tok::kw_for, tok::kw_while, tok::kw_switch,
                      tok::kw_case, TT_ForEachMacro, TT_ObjCForIn) ||
+        (Left.is(tok::kw_constexpr) && Left.Previous &&
+         Left.Previous->is(tok::kw_switch)) ||
         Left.isIf(Line.Type != LT_PreprocessorDirective) ||
         Right.is(TT_ConditionLParen)) {
       return Style.SpaceBeforeParensOptions.AfterControlStatements ||
@@ -5709,6 +5801,19 @@ bool TokenAnnotator::mustBreakBefore(const AnnotatedLine &Line,
                                      const FormatToken &Right) const {
   if (Right.NewlinesBefore > 1 && Style.MaxEmptyLinesToKeep > 0 &&
       (!Style.RemoveEmptyLinesInUnwrappedLines || &Right == Line.First)) {
+    return true;
+  }
+
+  // The body of a do expression (P2806).
+  if (Style.BraceWrapping.BeforeDoExpressionBody &&
+      Right.is(TT_DoExpressionLBrace)) {
+    return true;
+  }
+  // With the brace on its own line a non-empty body is laid out on lines of
+  // its own as well.
+  if (Style.BraceWrapping.BeforeDoExpressionBody && Right.Previous &&
+      Right.Previous->is(TT_DoExpressionLBrace) &&
+      !Right.Previous->Children.empty()) {
     return true;
   }
 

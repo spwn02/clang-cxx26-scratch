@@ -339,6 +339,9 @@ TypeSpecifierType BuiltinTypeLoc::getWrittenTypeSpec() const {
   case BuiltinType::WChar_U:
     return TST_wchar;
   case BuiltinType::MetaInfo:
+  case BuiltinType::TokenSequence:
+  case BuiltinType::MetaToken:
+  case BuiltinType::NoReturn:
   case BuiltinType::UChar:
   case BuiltinType::UShort:
   case BuiltinType::UInt:
@@ -767,9 +770,10 @@ void TemplateSpecializationTypeLoc::initializeArgLocs(
 static ConceptReference *createTrivialConceptReference(ASTContext &Context,
                                                        SourceLocation Loc,
                                                        const AutoType *AT) {
-  DeclarationNameInfo DNI =
-      DeclarationNameInfo(AT->getTypeConstraintConcept()->getDeclName(), Loc,
-                          AT->getTypeConstraintConcept()->getDeclName());
+  DeclarationName ConceptName =
+      Context.getNameForTemplate(AT->getTypeConstraintConcept(), Loc)
+          .getName();
+  DeclarationNameInfo DNI = DeclarationNameInfo(ConceptName, Loc, ConceptName);
   unsigned size = AT->getTypeConstraintArguments().size();
   llvm::SmallVector<TemplateArgumentLocInfo, 8> TALI(size);
   TemplateSpecializationTypeLoc::initializeArgLocs(

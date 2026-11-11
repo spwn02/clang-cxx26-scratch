@@ -18,6 +18,7 @@
 #include "clang/AST/DeclBase.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclGroup.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/OperationKinds.h"
@@ -521,6 +522,10 @@ class CFGBuilder {
   JumpTarget ContinueJumpTarget;
   JumpTarget BreakJumpTarget;
   JumpTarget SEHLeaveJumpTarget;
+  // Where a `do_return` of the innermost enclosing do-expression continues
+  // (the block holding the do-expression itself). Null outside a do-expression
+  // that is part of the CFG being built.
+  JumpTarget DoReturnJumpTarget;
   CFGBlock *SwitchTerminatedBlock = nullptr;
   CFGBlock *DefaultCaseBlock = nullptr;
 
@@ -562,6 +567,12 @@ class CFGBuilder {
   CFG::BuildOptions::ForcedBlkExprs::value_type *cachedEntry = nullptr;
   const Stmt *lastLookup = nullptr;
 
+  /// The opaque values that the construct being built binds itself (the
+  /// common expression of a conditional with an omitted middle operand, the
+  /// values of a pseudo-object expression, the common expression of an array
+  /// initialization loop): their source expressions are visited by the owner.
+  llvm::SmallPtrSet<const OpaqueValueExpr *, 8> OwnerBoundValues;
+
   // Caches boolean evaluations of expressions to avoid multiple re-evaluations
   // during construction of branches for chained logical operators.
   using CachedBoolEvalsTy = llvm::DenseMap<Expr *, TryResult>;
@@ -590,6 +601,24 @@ private:
   CFGBlock *VisitCompoundStmt(CompoundStmt *C, bool ExternallyDestructed);
   CFGBlock *VisitConditionalOperator(AbstractConditionalOperator *C,
                                      AddStmtChoice asc);
+  CFGBlock *VisitMatchTestExpr(MatchTestExpr *E, AddStmtChoice asc);
+  DeclStmt *makeHoldingVarDeclStmt(VarDecl *HoldingVar);
+  std::pair<CFGBlock *, CFGBlock *> VisitMatchTestExpr(MatchTestExpr *E,
+                                                       Stmt *Term,
+                                                       CFGBlock *TrueBlock,
+                                                       CFGBlock *FalseBlock);
+  std::pair<CFGBlock *, CFGBlock *> VisitMatchTestExpr(
+      MatchTestExpr *E, Stmt *Term, ArrayRef<CFGBlock *> TrueBlocks,
+      CFGBlock *FalseBlock,
+      std::optional<unsigned> SelectedInstantiation = std::nullopt);
+  using MatchTestSuccessBlocks =
+      llvm::DenseMap<const MatchTestInstantiation *, CFGBlock *>;
+  std::pair<CFGBlock *, CFGBlock *>
+  VisitCaseConditionChain(Expr *Condition, Stmt *Term,
+                          CFGBlock *DefaultTrueBlock, CFGBlock *FalseBlock,
+                          const MatchTestSuccessBlocks &SuccessBlocks,
+                          bool SelectConstexprInstantiation = false);
+  CFGBlock *VisitMatchSelectExpr(MatchSelectExpr *E, AddStmtChoice asc);
   CFGBlock *VisitContinueStmt(ContinueStmt *C);
   CFGBlock *VisitCXXBindTemporaryExpr(CXXBindTemporaryExpr *E,
                                       AddStmtChoice asc);
@@ -609,6 +638,9 @@ private:
   CFGBlock *VisitDeclSubExpr(DeclStmt *DS);
   CFGBlock *VisitDefaultStmt(DefaultStmt *D);
   CFGBlock *VisitDoStmt(DoStmt *D);
+  CFGBlock *VisitDoExpr(DoExpr *E, AddStmtChoice asc);
+  CFGBlock *VisitDoReturnStmt(DoReturnStmt *S);
+  CFGBlock *VisitCXXExpansionStmt(CXXExpansionStmt *E);
   CFGBlock *VisitExprWithCleanups(ExprWithCleanups *E,
                                   AddStmtChoice asc, bool ExternallyDestructed);
   CFGBlock *VisitForStmt(ForStmt *F);
@@ -1672,6 +1704,18 @@ std::unique_ptr<CFG> CFGBuilder::buildCFG(const Decl *D, Stmt *Statement) {
   if (const auto *FD = dyn_cast_or_null<FunctionDecl>(D))
     for (ParmVarDecl *PD : FD->parameters())
       paramScope = addLocalScopeForVarDecl(PD, paramScope);
+  // In a do-expression body, a top-level `break`/`continue` transfers to an
+  // enclosing loop that lives *outside* the body, thereby leaving the
+  // do-expression. Model that as an edge to a dedicated sink block with no
+  // successor (it does NOT reach the normal exit), so such escapes are kept
+  // distinct from an inner-loop `break` that exits its loop and then falls off
+  // the end of the do-expression body. (Loops/switches nested within the body
+  // override these targets locally as usual.)
+  if (BuildOpts.DoExpressionBody) {
+    CFGBlock *EscapeBlock = createBlock(/*add_successor=*/false);
+    BreakJumpTarget = JumpTarget(EscapeBlock, ScopePos);
+    ContinueJumpTarget = JumpTarget(EscapeBlock, ScopePos);
+  }
 
   if (BuildOpts.AddImplicitDtors)
     if (const CXXDestructorDecl *DD = dyn_cast_or_null<CXXDestructorDecl>(D))
@@ -2289,8 +2333,13 @@ CFGBlock *CFGBuilder::Visit(Stmt * S, AddStmtChoice asc,
     return nullptr;
   }
 
-  if (Expr *E = dyn_cast<Expr>(S))
-    S = E->IgnoreParens();
+  if (Expr *E = dyn_cast<Expr>(S)) {
+    // A resolved macro invocation is not looked through here (see below).
+    Expr *Inner = E;
+    while (auto *PE = dyn_cast<ParenExpr>(Inner))
+      Inner = PE->getSubExpr();
+    S = isa<CXXMacroInvocationExpr>(Inner) ? Inner : E->IgnoreParens();
+  }
 
   if (Context->getLangOpts().OpenMP)
     if (auto *D = dyn_cast<OMPExecutableDirective>(S))
@@ -2350,6 +2399,13 @@ CFGBlock *CFGBuilder::Visit(Stmt * S, AddStmtChoice asc,
 
     case Stmt::ConditionalOperatorClass:
       return VisitConditionalOperator(cast<ConditionalOperator>(S), asc);
+
+    case Stmt::MatchTestExprClass:
+    case Stmt::CaseConditionExprClass:
+      return VisitMatchTestExpr(cast<MatchTestExpr>(S), asc);
+
+    case Stmt::MatchSelectExprClass:
+      return VisitMatchSelectExpr(cast<MatchSelectExpr>(S), asc);
 
     case Stmt::ContinueStmtClass:
       return VisitContinueStmt(cast<ContinueStmt>(S));
@@ -2412,6 +2468,18 @@ CFGBlock *CFGBuilder::Visit(Stmt * S, AddStmtChoice asc,
     case Stmt::DoStmtClass:
       return VisitDoStmt(cast<DoStmt>(S));
 
+    case Stmt::DoExprClass:
+      return VisitDoExpr(cast<DoExpr>(S), asc);
+
+    case Stmt::DoReturnStmtClass:
+      return VisitDoReturnStmt(cast<DoReturnStmt>(S));
+
+    case Stmt::CXXIndeterminateExpansionStmtClass:
+    case Stmt::CXXIterableExpansionStmtClass:
+    case Stmt::CXXDestructurableExpansionStmtClass:
+    case Stmt::CXXInitListExpansionStmtClass:
+      return VisitCXXExpansionStmt(cast<CXXExpansionStmt>(S));
+
     case Stmt::ForStmtClass:
       return VisitForStmt(cast<ForStmt>(S));
 
@@ -2429,6 +2497,12 @@ CFGBlock *CFGBuilder::Visit(Stmt * S, AddStmtChoice asc,
 
     case Stmt::ConstantExprClass:
       return VisitConstantExpr(cast<ConstantExpr>(S), asc);
+
+    case Stmt::CXXMacroInvocationExprClass:
+      // A resolved invocation stands for its expansion, in which the
+      // arguments of the macro are unique opaque values (see
+      // OpaqueValueExprClass).
+      return Visit(cast<CXXMacroInvocationExpr>(S)->getExpansion(), asc);
 
     case Stmt::IndirectGotoStmtClass:
       return VisitIndirectGotoStmt(cast<IndirectGotoStmt>(S));
@@ -2470,8 +2544,21 @@ CFGBlock *CFGBuilder::Visit(Stmt * S, AddStmtChoice asc,
     case Stmt::ObjCMessageExprClass:
       return VisitObjCMessageExpr(cast<ObjCMessageExpr>(S), asc);
 
-    case Stmt::OpaqueValueExprClass:
+    case Stmt::OpaqueValueExprClass: {
+      // The argument of an expression macro is a unique opaque value that
+      // stands for its source expression, which is evaluated where the
+      // expansion uses it, and not at all if the expansion does not get there:
+      // that is what the program does (the right operand of an operator macro
+      // `or` is not evaluated when the left one decides, and the code
+      // generator branches the same way). A macro uses each argument once: using
+      // one twice is an error. The other opaque values are bound by their
+      // owners, which evaluate their source expressions themselves.
+      auto *OVE = cast<OpaqueValueExpr>(S);
+      if (OVE->isUnique() && OVE->getSourceExpr() &&
+          !OwnerBoundValues.contains(OVE))
+        return Visit(OVE->getSourceExpr(), asc);
       return Block;
+    }
 
     case Stmt::PseudoObjectExprClass:
       return VisitPseudoObjectExpr(cast<PseudoObjectExpr>(S));
@@ -2969,6 +3056,8 @@ CFGBlock *CFGBuilder::VisitConditionalOperator(AbstractConditionalOperator *C,
                                                AddStmtChoice asc) {
   const BinaryConditionalOperator *BCO = dyn_cast<BinaryConditionalOperator>(C);
   const OpaqueValueExpr *opaqueValue = (BCO ? BCO->getOpaqueValue() : nullptr);
+  if (opaqueValue)
+    OwnerBoundValues.insert(opaqueValue);
 
   // Create the confluence block that will "merge" the results of the ternary
   // expression.
@@ -3032,6 +3121,377 @@ CFGBlock *CFGBuilder::VisitConditionalOperator(AbstractConditionalOperator *C,
   return addStmt(condExpr);
 }
 
+static SmallVector<VarDecl *, 4>
+collectMatchPatternDecls(MatchPattern *Pattern,
+                         MatchPatternInstantiation *Instantiation) {
+  SmallVector<VarDecl *, 4> Decls;
+  auto Collect = [&](MatchPattern *P, auto &Recurse) -> void {
+    if (auto *Declaration = dyn_cast<DeclarationPattern>(P))
+      Decls.push_back(Declaration->getDeclaration());
+    if (auto *Decomposition = dyn_cast<DecompositionPattern>(P)) {
+      for (MatchPattern *Child :
+           Instantiation->getDecompositionPatterns(Decomposition))
+        Recurse(Child, Recurse);
+    } else {
+      for (MatchPattern *Child : P->children())
+        Recurse(Child, Recurse);
+    }
+  };
+  Collect(Pattern, Collect);
+  return Decls;
+}
+
+static bool forEachCaseConditionInstantiation(
+    Expr *Condition,
+    llvm::function_ref<void(const MatchTestInstantiation &)> Visit) {
+  if (!Condition)
+    return false;
+  Condition = Condition->IgnoreParens();
+  if (auto *Constant = dyn_cast<ConstantExpr>(Condition))
+    Condition = Constant->getSubExpr()->IgnoreParens();
+
+  if (auto *And = dyn_cast<BinaryOperator>(Condition);
+      And && And->getOpcode() == BO_LAnd)
+    return forEachCaseConditionInstantiation(And->getLHS(), Visit) |
+           forEachCaseConditionInstantiation(And->getRHS(), Visit);
+
+  auto *Match = dyn_cast<CaseConditionExpr>(Condition);
+  if (!Match || !Match->hasSemanticInstantiations())
+    return false;
+
+  for (const MatchTestInstantiation &Instantiation :
+       Match->getInstantiations()) {
+    Visit(Instantiation);
+    forEachCaseConditionInstantiation(Instantiation.Condition, Visit);
+  }
+  return true;
+}
+
+std::pair<CFGBlock *, CFGBlock *>
+CFGBuilder::VisitMatchTestExpr(MatchTestExpr *E, Stmt *Term,
+                               CFGBlock *TrueBlock, CFGBlock *FalseBlock) {
+  CFGBlock *TrueBlocks[] = {TrueBlock};
+  return VisitMatchTestExpr(E, Term, TrueBlocks, FalseBlock);
+}
+
+std::pair<CFGBlock *, CFGBlock *> CFGBuilder::VisitCaseConditionChain(
+    Expr *Condition, Stmt *Term, CFGBlock *DefaultTrueBlock,
+    CFGBlock *FalseBlock, const MatchTestSuccessBlocks &SuccessBlocks,
+    bool SelectConstexprInstantiation) {
+  Condition = Condition->IgnoreParens();
+  if (auto *Constant = dyn_cast<ConstantExpr>(Condition)) {
+    SelectConstexprInstantiation |= tryEvaluateBool(Constant).isTrue();
+    Condition = Constant->getSubExpr()->IgnoreParens();
+  }
+
+  if (auto *And = dyn_cast<BinaryOperator>(Condition);
+      And && And->getOpcode() == BO_LAnd) {
+    auto RHS = VisitCaseConditionChain(And->getRHS(), Term, DefaultTrueBlock,
+                                       FalseBlock, SuccessBlocks,
+                                       SelectConstexprInstantiation);
+    auto LHS =
+        VisitCaseConditionChain(And->getLHS(), And, RHS.first, FalseBlock,
+                                SuccessBlocks, SelectConstexprInstantiation);
+    return {LHS.first, RHS.second};
+  }
+
+  if (auto *Match = dyn_cast<CaseConditionExpr>(Condition)) {
+    CFGBlock *MatchFalseBlock = FalseBlock;
+    if (!Match->getInstantiations().empty()) {
+      if (SelectConstexprInstantiation && Match->hasSemanticInstantiations()) {
+        for (unsigned I = 0; I != Match->getInstantiations().size(); ++I) {
+          const MatchTestInstantiation &Instantiation =
+              Match->getInstantiations()[I];
+          if (!Instantiation.Handler)
+            continue;
+
+          CFGBlock *Success = SuccessBlocks.lookup(&Instantiation);
+          if (!Success)
+            Success = DefaultTrueBlock;
+          if (Instantiation.Condition) {
+            SaveAndRestore saveBlock(Block), saveSucc(Succ);
+            Block = nullptr;
+            Success =
+                VisitCaseConditionChain(Instantiation.Condition, Term, Success,
+                                        MatchFalseBlock, SuccessBlocks,
+                                        /*SelectConstexprInstantiation=*/true)
+                    .first;
+          }
+          CFGBlock *Successors[] = {Success};
+          return VisitMatchTestExpr(Match, Term, Successors, MatchFalseBlock,
+                                    I);
+        }
+      }
+
+      SmallVector<CFGBlock *, 4> CandidateSuccessors;
+      CandidateSuccessors.reserve(Match->getInstantiations().size());
+      for (const MatchTestInstantiation &Instantiation :
+           Match->getInstantiations()) {
+        CFGBlock *Success = nullptr;
+        CFGBlock *CandidateDefault = DefaultTrueBlock;
+        if (auto It = SuccessBlocks.find(&Instantiation);
+            It != SuccessBlocks.end())
+          CandidateDefault = It->second;
+        else if (Match->hasSemanticInstantiations())
+          CandidateDefault = MatchFalseBlock;
+
+        if (Instantiation.Condition) {
+          SaveAndRestore saveBlock(Block), saveSucc(Succ);
+          Block = nullptr;
+          Success = VisitCaseConditionChain(Instantiation.Condition, Term,
+                                            CandidateDefault, MatchFalseBlock,
+                                            SuccessBlocks,
+                                            SelectConstexprInstantiation)
+                        .first;
+        } else {
+          Success = CandidateDefault;
+        }
+        CandidateSuccessors.push_back(Success);
+      }
+      return VisitMatchTestExpr(Match, Term, CandidateSuccessors,
+                                MatchFalseBlock);
+    }
+    return VisitMatchTestExpr(Match, Term, DefaultTrueBlock, MatchFalseBlock);
+  }
+
+  CFGBlock *ExitBlock = createBlock(false);
+  ExitBlock->setTerminator(Term);
+  TryResult KnownVal = SelectConstexprInstantiation
+                           ? TryResult(true)
+                           : tryEvaluateBool(Condition);
+  addSuccessor(ExitBlock, DefaultTrueBlock, !KnownVal.isFalse());
+  addSuccessor(ExitBlock, FalseBlock, !KnownVal.isTrue());
+  Block = ExitBlock;
+  CFGBlock *EntryBlock = addStmt(Condition);
+  return {EntryBlock ? EntryBlock : ExitBlock, ExitBlock};
+}
+
+DeclStmt *CFGBuilder::makeHoldingVarDeclStmt(VarDecl *HoldingVar) {
+  // The variable that holds the subject of a match is declared before the
+  // patterns are tested; the declaration evaluates the subject.
+  return new (Context) DeclStmt(DeclGroupRef(HoldingVar),
+                                HoldingVar->getBeginLoc(),
+                                HoldingVar->getEndLoc());
+}
+
+std::pair<CFGBlock *, CFGBlock *> CFGBuilder::VisitMatchTestExpr(
+    MatchTestExpr *E, Stmt *Term, ArrayRef<CFGBlock *> TrueBlocks,
+    CFGBlock *FalseBlock, std::optional<unsigned> SelectedInstantiation) {
+  if (E->hasSemanticInstantiations() && E->getInstantiations().empty()) {
+    Succ = FalseBlock;
+    Block = nullptr;
+    CFGBlock *EntryBlock;
+    if (VarDecl *HoldingVar = E->getHoldingVar())
+      EntryBlock = addStmt(makeHoldingVarDeclStmt(HoldingVar));
+    else
+      EntryBlock = addStmt(E->getSubject());
+    return {EntryBlock ? EntryBlock : FalseBlock, nullptr};
+  }
+
+  TryResult KnownVal =
+      SelectedInstantiation ? TryResult(true) : tryEvaluateBool(E);
+  auto BuildCandidate = [&](MatchPattern *Pattern,
+                            MatchPatternInstantiation *PatternInstantiation,
+                            const MatchGuard &Guard, bool PatternIsIrrefutable,
+                            CFGBlock *TrueBlock, CFGBlock *CandidateFalseBlock,
+                            bool IsFinalCandidate) {
+    CFGBlock *SuccessBlock = TrueBlock;
+    if (Guard.hasGuard()) {
+      Block = createBlock(false);
+      Block->setTerminator(Term ? Term : E);
+      addSuccessor(Block, TrueBlock,
+                   /* IsReachable = */ !KnownVal.isFalse());
+      addSuccessor(Block, CandidateFalseBlock,
+                   /* IsReachable = */
+                   !(IsFinalCandidate && KnownVal.isTrue()));
+      if (Expr *Condition = Guard.Condition)
+        addStmt(Condition);
+      if (VarDecl *ConditionVariable = Guard.ConditionVariable) {
+        DeclStmt *DS = new (Context) DeclStmt(DeclGroupRef(ConditionVariable),
+                                              ConditionVariable->getBeginLoc(),
+                                              ConditionVariable->getEndLoc());
+        addStmt(DS);
+      }
+      if (Stmt *Init = Guard.Init)
+        addStmt(Init);
+      SuccessBlock = Block;
+    }
+
+    Succ = SuccessBlock;
+    CFGBlock *PatternBodyBlock = SuccessBlock;
+    SmallVector<VarDecl *, 4> PatternDecls =
+        collectMatchPatternDecls(Pattern, PatternInstantiation);
+    for (VarDecl *D : llvm::reverse(PatternDecls)) {
+      DeclStmt *DS = new (Context)
+          DeclStmt(DeclGroupRef(D), D->getBeginLoc(), D->getEndLoc());
+      Block = nullptr;
+      PatternBodyBlock = addStmt(DS);
+      Succ = PatternBodyBlock;
+    }
+
+    CFGBlock *PatternBlock = createBlock(false);
+    PatternBlock->setTerminator(Term ? Term : E);
+    addSuccessor(PatternBlock, PatternBodyBlock,
+                 /* IsReachable = */
+                 Guard.hasGuard() || !KnownVal.isFalse());
+    // The terminator branches two ways even when the pattern always matches;
+    // consumers of the CFG (the static analyzer, bug report visitors) rely on
+    // a conditional terminator having two successors, so the edge for a failed
+    // match is kept and marked unreachable.
+    addSuccessor(PatternBlock, CandidateFalseBlock,
+                 /* IsReachable = */
+                 !PatternIsIrrefutable &&
+                     !(IsFinalCandidate && KnownVal.isTrue()));
+    return PatternBlock;
+  };
+
+  CFGBlock *PatternBlock = nullptr;
+  CFGBlock *CandidateEntry = FalseBlock;
+  if (!E->getInstantiations().empty()) {
+    if (SelectedInstantiation) {
+      assert(*SelectedInstantiation < E->getInstantiations().size());
+      assert(TrueBlocks.size() == 1);
+      const MatchTestInstantiation &Instantiation =
+          E->getInstantiations()[*SelectedInstantiation];
+      CandidateEntry = PatternBlock = BuildCandidate(
+          Instantiation.Pattern, Instantiation.PatternInstantiation,
+          Instantiation.Guard, Instantiation.PatternIsIrrefutable,
+          TrueBlocks.front(), FalseBlock,
+          /*IsFinalCandidate=*/true);
+    } else {
+      assert((TrueBlocks.size() == 1 ||
+              TrueBlocks.size() == E->getInstantiations().size()) &&
+             "expected either a shared or per-instantiation successor");
+      for (unsigned I = E->getInstantiations().size(); I-- > 0;) {
+        const MatchTestInstantiation &Instantiation = E->getInstantiations()[I];
+        CFGBlock *TrueBlock =
+            TrueBlocks.size() == 1 ? TrueBlocks.front() : TrueBlocks[I];
+        CandidateEntry = PatternBlock = BuildCandidate(
+            Instantiation.Pattern, Instantiation.PatternInstantiation,
+            Instantiation.Guard, Instantiation.PatternIsIrrefutable, TrueBlock,
+            CandidateEntry,
+            /* IsFinalCandidate = */
+            I == E->getInstantiations().size() - 1);
+      }
+    }
+  } else {
+    assert(TrueBlocks.size() == 1);
+    CandidateEntry = PatternBlock = BuildCandidate(
+        E->getPattern(), E->getPatternInstantiation(), E->getGuard(),
+        E->isPatternIrrefutable(), TrueBlocks.front(), FalseBlock,
+        /* IsFinalCandidate = */ true);
+  }
+
+  Succ = CandidateEntry;
+  Block = nullptr;
+  CFGBlock *EntryBlock;
+  if (VarDecl *HoldingVar = E->getHoldingVar())
+    EntryBlock = addStmt(makeHoldingVarDeclStmt(HoldingVar));
+  else
+    EntryBlock = addStmt(E->getSubject());
+  return {EntryBlock ? EntryBlock : CandidateEntry, PatternBlock};
+}
+
+CFGBlock *CFGBuilder::VisitMatchTestExpr(MatchTestExpr *E, AddStmtChoice asc) {
+  CFGBlock *ConfluenceBlock = Block ? Block : createBlock();
+  if (asc.alwaysAdd(*this, E))
+    appendStmt(ConfluenceBlock, E);
+  return VisitMatchTestExpr(E, nullptr, ConfluenceBlock, ConfluenceBlock).first;
+}
+
+CFGBlock *CFGBuilder::VisitMatchSelectExpr(MatchSelectExpr *E,
+                                           AddStmtChoice asc) {
+  SaveAndRestore save_scope_pos(ScopePos);
+  if (Stmt *Init = E->getInitStmt())
+    addLocalScopeForStmt(Init);
+  addAutomaticObjHandling(ScopePos, save_scope_pos.get(), E);
+
+  CFGBlock *ConfluenceBlock = Block ? Block : createBlock();
+  if (!E->getType()->isVoidType() && asc.alwaysAdd(*this, E))
+    appendStmt(ConfluenceBlock, E);
+
+  auto IsUnguardedWildcard = [&](const MatchCaseInstantiation &Case) {
+    return isa<WildcardPattern>(Case.Pattern->IgnoreParens()) &&
+           !Case.Guard.hasGuard();
+  };
+  auto IsWildcard = [&](const MatchCaseInstantiation &Case) {
+    return isa<WildcardPattern>(Case.Pattern->IgnoreParens());
+  };
+
+  auto Cases = E->getCaseInstantiations();
+  auto LastCase = llvm::find_if(Cases, IsUnguardedWildcard);
+  if (LastCase != Cases.end())
+    Cases = Cases.take_front(std::distance(Cases.begin(), LastCase) + 1);
+
+  // If no case matches, a void match completes normally while a non-void
+  // match terminates. Omit that unmatched-case edge when Sema proved that
+  // every runtime state is covered.
+  CFGBlock *NextCaseBlock = E->getType()->isVoidType() && !E->isFullyCovered()
+                                ? ConfluenceBlock
+                                : nullptr;
+  for (const MatchCaseInstantiation &Case : llvm::reverse(Cases)) {
+    Succ = Case.isNonReturning() ? nullptr : ConfluenceBlock;
+    Block = nullptr;
+    CFGBlock *HandlerBlock = addStmt(Case.Handler);
+    if (!HandlerBlock)
+      HandlerBlock = Case.isNonReturning() ? nullptr : ConfluenceBlock;
+    if (badCFG)
+      return nullptr;
+
+    CFGBlock *CaseBodyBlock = HandlerBlock;
+    if (Case.Guard.hasGuard()) {
+      Block = createBlock(false);
+      Block->setTerminator(E);
+      addSuccessor(Block, HandlerBlock);
+      addSuccessor(Block, NextCaseBlock);
+      if (Expr *Guard = Case.Guard.Condition)
+        addStmt(Guard);
+      if (VarDecl *ConditionVariable = Case.Guard.ConditionVariable) {
+        DeclStmt *DS = new (Context)
+            DeclStmt(DeclGroupRef(ConditionVariable),
+                     ConditionVariable->getBeginLoc(),
+                     ConditionVariable->getEndLoc());
+        addStmt(DS);
+      }
+      if (Stmt *Init = Case.Guard.Init)
+        addStmt(Init);
+      CaseBodyBlock = Block;
+    }
+
+    Succ = CaseBodyBlock;
+    CFGBlock *PatternBodyBlock = CaseBodyBlock;
+    SmallVector<VarDecl *, 4> PatternDecls =
+        collectMatchPatternDecls(Case.Pattern, Case.PatternInstantiation);
+    for (VarDecl *D : llvm::reverse(PatternDecls)) {
+      DeclStmt *DS = new (Context)
+          DeclStmt(DeclGroupRef(D), D->getBeginLoc(), D->getEndLoc());
+      Block = nullptr;
+      PatternBodyBlock = addStmt(DS);
+      Succ = PatternBodyBlock;
+    }
+
+    Block = createBlock(false);
+    Block->setTerminator(E);
+    addSuccessor(Block, PatternBodyBlock);
+
+    if (!IsWildcard(Case))
+      addSuccessor(Block, NextCaseBlock);
+    NextCaseBlock = Block;
+  }
+
+  Succ = NextCaseBlock;
+  Block = nullptr;
+  CFGBlock *EntryBlock;
+  if (VarDecl *HoldingVar = E->getHoldingVar())
+    EntryBlock = addStmt(makeHoldingVarDeclStmt(HoldingVar));
+  else
+    EntryBlock = addStmt(E->getSubject());
+
+  if (Stmt *Init = E->getInitStmt())
+    EntryBlock = addStmt(Init);
+  return EntryBlock;
+}
+
 CFGBlock *CFGBuilder::VisitDeclStmt(DeclStmt *DS) {
   // Check if the Decl is for an __label__.  If so, elide it from the
   // CFG entirely.
@@ -3067,6 +3527,16 @@ CFGBlock *CFGBuilder::VisitDeclStmt(DeclStmt *DS) {
 /// DeclStmts and initializers in them.
 CFGBlock *CFGBuilder::VisitDeclSubExpr(DeclStmt *DS) {
   assert(DS->isSingleDecl() && "Can handle single declarations only.");
+
+  // An expansion statement (`template for`) is represented as a DeclStmt
+  // wrapping an ExpansionStmtDecl. When analyzing a do-expression body, model
+  // its instantiations so control flow within them (e.g. do_return) is visible.
+  if (const auto *ESD = dyn_cast<ExpansionStmtDecl>(DS->getSingleDecl())) {
+    if (BuildOpts.DoExpressionBody)
+      if (CXXExpansionStmt *Exp = ESD->getStmt())
+        return VisitCXXExpansionStmt(Exp);
+    return Block;
+  }
 
   if (const auto *TND = dyn_cast<TypedefNameDecl>(DS->getSingleDecl())) {
     // If we encounter a VLA, process its size expressions.
@@ -3128,7 +3598,8 @@ CFGBlock *CFGBuilder::VisitDeclSubExpr(DeclStmt *DS) {
   // If we bind to a tuple-like type, we iterate over the HoldingVars, and
   // create a DeclStmt for each of them.
   if (const auto *DD = dyn_cast<DecompositionDecl>(VD)) {
-    for (auto *BD : llvm::reverse(DD->bindings())) {
+    auto Bindings = DD->all_bindings();
+    for (auto *BD : llvm::reverse(Bindings)) {
       if (auto *VD = BD->getHoldingVar()) {
         DeclGroupRef DG(VD);
         DeclStmt *DSNew =
@@ -3253,9 +3724,62 @@ CFGBlock *CFGBuilder::VisitIfStmt(IfStmt *I) {
     }
   }
 
+  Expr *Condition = I->isConsteval() ? nullptr : I->getCond();
+  bool IsCaseCondition = MatchTestExpr::containsCaseCondition(Condition);
+  MatchTestExpr *MatchCondition =
+      I->getConditionVariable() ? nullptr
+                                : MatchTestExpr::findInCondition(Condition);
+
   // Process the true branch.
   CFGBlock *ThenBlock;
-  {
+  SmallVector<CFGBlock *, 4> MatchThenBlocks;
+  MatchTestSuccessBlocks CaseSuccessBlocks;
+  bool FailedToBuildCaseHandler = false;
+  bool HasSemanticCaseCondition = false;
+  if (IsCaseCondition) {
+    HasSemanticCaseCondition = forEachCaseConditionInstantiation(
+        Condition, [&](const MatchTestInstantiation &Instantiation) {
+          if (!Instantiation.Handler)
+            return;
+          SaveAndRestore saveBlock(Block), saveSucc(Succ);
+          Block = nullptr;
+          if (!isa<CompoundStmt>(Instantiation.Handler))
+            addLocalScopeAndDtors(Instantiation.Handler);
+          CFGBlock *CandidateThen = addStmt(Instantiation.Handler);
+          if (!CandidateThen) {
+            CandidateThen = createBlock(false);
+            addSuccessor(CandidateThen, saveSucc.get());
+          } else if (Block && badCFG) {
+            FailedToBuildCaseHandler = true;
+            return;
+          }
+          CaseSuccessBlocks[&Instantiation] = CandidateThen;
+        });
+  }
+  if (FailedToBuildCaseHandler)
+    return nullptr;
+
+  if (HasSemanticCaseCondition) {
+    ThenBlock = CaseSuccessBlocks.empty() ? ElseBlock
+                                          : CaseSuccessBlocks.begin()->second;
+  } else if (MatchCondition && MatchCondition->hasConditionInstantiations()) {
+    for (const MatchTestInstantiation &Instantiation :
+         MatchCondition->getInstantiations()) {
+      SaveAndRestore sv(Succ);
+      Block = nullptr;
+      if (!isa<CompoundStmt>(Instantiation.Handler))
+        addLocalScopeAndDtors(Instantiation.Handler);
+      CFGBlock *CandidateThen = addStmt(Instantiation.Handler);
+      if (!CandidateThen) {
+        CandidateThen = createBlock(false);
+        addSuccessor(CandidateThen, sv.get());
+      } else if (Block && badCFG) {
+        return nullptr;
+      }
+      MatchThenBlocks.push_back(CandidateThen);
+    }
+    ThenBlock = MatchThenBlocks.front();
+  } else {
     Stmt *Then = I->getThen();
     assert(Then);
     SaveAndRestore sv(Succ);
@@ -3288,11 +3812,22 @@ CFGBlock *CFGBuilder::VisitIfStmt(IfStmt *I) {
   // control-flow transfer of '&&' or '||' go directly into the then/else
   // blocks directly.
   BinaryOperator *Cond =
-      (I->isConsteval() || I->getConditionVariable())
+      I->getConditionVariable() || MatchCondition || IsCaseCondition
           ? nullptr
-          : dyn_cast<BinaryOperator>(I->getCond()->IgnoreParens());
+          : dyn_cast_or_null<BinaryOperator>(Condition);
   CFGBlock *LastBlock;
-  if (Cond && Cond->isLogicalOp())
+  if (IsCaseCondition)
+    LastBlock = VisitCaseConditionChain(Condition, I, ThenBlock, ElseBlock,
+                                        CaseSuccessBlocks)
+                    .first;
+  else if (MatchCondition)
+    LastBlock =
+        (MatchThenBlocks.empty()
+             ? VisitMatchTestExpr(MatchCondition, I, ThenBlock, ElseBlock)
+             : VisitMatchTestExpr(MatchCondition, I, MatchThenBlocks,
+                                  ElseBlock))
+            .first;
+  else if (Cond && Cond->isLogicalOp())
     LastBlock = VisitLogicalOperator(Cond, I, ThenBlock, ElseBlock).first;
   else {
     // Now create a new block containing the if statement.
@@ -3305,6 +3840,16 @@ CFGBlock *CFGBuilder::VisitIfStmt(IfStmt *I) {
     TryResult KnownVal;
     if (!I->isConsteval())
       KnownVal = tryEvaluateBool(I->getCond());
+    else if (BuildOpts.ConstevalCondition !=
+             CFG::BuildOptions::CCK_Unknown) {
+      // The surrounding context's constant-evaluatedness fixes which branch of
+      // an `if consteval` is live. The then-branch is the consteval branch for
+      // a non-negated `if consteval`, and the non-consteval branch for an
+      // `if !consteval`.
+      bool IsConstantContext =
+          BuildOpts.ConstevalCondition == CFG::BuildOptions::CCK_AlwaysConstant;
+      KnownVal = TryResult(I->isNonNegatedConsteval() == IsConstantContext);
+    }
 
     // Add the successors. If we know that specific branches are
     // unreachable, inform addSuccessor() of that knowledge.
@@ -3626,6 +4171,11 @@ CFGBlock *CFGBuilder::VisitGCCAsmStmt(GCCAsmStmt *G, AddStmtChoice asc) {
 
 CFGBlock *CFGBuilder::VisitForStmt(ForStmt *F) {
   CFGBlock *LoopSuccessor = nullptr;
+  bool IsCaseCondition = MatchTestExpr::containsCaseCondition(F->getCond());
+  auto *MatchCondition = MatchTestExpr::findInCondition(F->getCond());
+  SmallVector<CFGBlock *, 4> MatchBodyBlocks;
+  MatchTestSuccessBlocks CaseSuccessBlocks;
+  bool HasSemanticCaseCondition = false;
 
   // Save local scope position because in case of condition variable ScopePos
   // won't be restored when traversing AST.
@@ -3681,42 +4231,91 @@ CFGBlock *CFGBuilder::VisitForStmt(ForStmt *F) {
     // variable (if any).
     addAutomaticObjHandling(ScopePos, LoopBeginScopePos, F);
 
-    if (Stmt *I = F->getInc()) {
-      // Generate increment code in its own basic block.  This is the target of
-      // continue statements.
-      Succ = addStmt(I);
-    }
+    if (IsCaseCondition) {
+      bool FailedToBuildCaseHandler = false;
+      HasSemanticCaseCondition = forEachCaseConditionInstantiation(
+          F->getCond(), [&](const MatchTestInstantiation &Instantiation) {
+            if (!Instantiation.Handler)
+              return;
+            Block = nullptr;
+            Succ = TransitionBlock;
+            CFGBlock *IncrementBlock = Instantiation.Increment
+                                           ? addStmt(Instantiation.Increment)
+                                           : TransitionBlock;
+            ContinueJumpTarget = JumpTarget(IncrementBlock, ContinueScopePos);
+            ContinueJumpTarget.block->setLoopTarget(F);
 
-    // Finish up the increment (or empty) block if it hasn't been already.
-    if (Block) {
-      assert(Block == Succ);
-      if (badCFG)
+            Block = nullptr;
+            Succ = IncrementBlock;
+            if (!isa<CompoundStmt>(Instantiation.Handler))
+              addLocalScopeAndDtors(Instantiation.Handler);
+            CFGBlock *CandidateBody = addStmt(Instantiation.Handler);
+            if (!CandidateBody)
+              CandidateBody = IncrementBlock;
+            else if (Block && badCFG) {
+              FailedToBuildCaseHandler = true;
+              return;
+            }
+            CaseSuccessBlocks[&Instantiation] = CandidateBody;
+          });
+      if (FailedToBuildCaseHandler)
         return nullptr;
-      Block = nullptr;
+      if (HasSemanticCaseCondition)
+        BodyBlock = CaseSuccessBlocks.empty()
+                        ? TransitionBlock
+                        : CaseSuccessBlocks.begin()->second;
     }
 
-   // The starting block for the loop increment is the block that should
-   // represent the 'loop target' for looping back to the start of the loop.
-   ContinueJumpTarget = JumpTarget(Succ, ContinueScopePos);
-   ContinueJumpTarget.block->setLoopTarget(F);
+    if (!HasSemanticCaseCondition && MatchCondition &&
+        MatchCondition->hasConditionInstantiations()) {
+      for (const MatchTestInstantiation &Instantiation :
+           MatchCondition->getInstantiations()) {
+        Block = nullptr;
+        Succ = TransitionBlock;
+        CFGBlock *IncrementBlock = Instantiation.Increment
+                                       ? addStmt(Instantiation.Increment)
+                                       : TransitionBlock;
+        ContinueJumpTarget = JumpTarget(IncrementBlock, ContinueScopePos);
+        ContinueJumpTarget.block->setLoopTarget(F);
 
+        Block = nullptr;
+        Succ = IncrementBlock;
+        if (!isa<CompoundStmt>(Instantiation.Handler))
+          addLocalScopeAndDtors(Instantiation.Handler);
+        CFGBlock *CandidateBody = addStmt(Instantiation.Handler);
+        if (!CandidateBody)
+          CandidateBody = IncrementBlock;
+        else if (Block && badCFG)
+          return nullptr;
+        MatchBodyBlocks.push_back(CandidateBody);
+      }
+      BodyBlock = MatchBodyBlocks.front();
+    } else if (!HasSemanticCaseCondition) {
+      if (Stmt *I = F->getInc()) {
+        // Generate increment code in its own basic block. This is the target
+        // of continue statements.
+        Succ = addStmt(I);
+      }
 
-    // If body is not a compound statement create implicit scope
-    // and add destructors.
-    if (!isa<CompoundStmt>(F->getBody()))
-      addLocalScopeAndDtors(F->getBody());
+      if (Block) {
+        assert(Block == Succ);
+        if (badCFG)
+          return nullptr;
+        Block = nullptr;
+      }
 
-    // Now populate the body block, and in the process create new blocks as we
-    // walk the body of the loop.
-    BodyBlock = addStmt(F->getBody());
+      ContinueJumpTarget = JumpTarget(Succ, ContinueScopePos);
+      ContinueJumpTarget.block->setLoopTarget(F);
 
-    if (!BodyBlock) {
-      // In the case of "for (...;...;...);" we can have a null BodyBlock.
-      // Use the continue jump target as the proxy for the body.
-      BodyBlock = ContinueJumpTarget.block;
+      if (!isa<CompoundStmt>(F->getBody()))
+        addLocalScopeAndDtors(F->getBody());
+      BodyBlock = addStmt(F->getBody());
+
+      if (!BodyBlock)
+        BodyBlock = ContinueJumpTarget.block; // for (...);
+      else if (badCFG)
+        return nullptr;
     }
-    else if (badCFG)
-      return nullptr;
   }
 
   // Because of short-circuit evaluation, the condition of the loop can span
@@ -3727,6 +4326,22 @@ CFGBlock *CFGBuilder::VisitForStmt(ForStmt *F) {
   do {
     Expr *C = F->getCond();
     SaveAndRestore save_scope_pos(ScopePos);
+
+    if (IsCaseCondition) {
+      std::tie(EntryConditionBlock, ExitConditionBlock) =
+          VisitCaseConditionChain(C, F, BodyBlock, LoopSuccessor,
+                                  CaseSuccessBlocks);
+      break;
+    }
+
+    if (auto *Match =
+            dyn_cast_or_null<MatchTestExpr>(C ? C->IgnoreParens() : nullptr)) {
+      std::tie(EntryConditionBlock, ExitConditionBlock) =
+          MatchBodyBlocks.empty()
+              ? VisitMatchTestExpr(Match, F, BodyBlock, LoopSuccessor)
+              : VisitMatchTestExpr(Match, F, MatchBodyBlocks, LoopSuccessor);
+      break;
+    }
 
     // Specially handle logical operators, which have a slightly
     // more optimal CFG representation.
@@ -3969,6 +4584,13 @@ CFGBlock *CFGBuilder::VisitPseudoObjectExpr(PseudoObjectExpr *E) {
 
   CFGBlock *lastBlock = Block;
 
+  // The opaque values of the semantics are bound here, and all of them before
+  // any is visited (the semantics are visited in reverse order, and a later
+  // one uses the value an earlier one binds).
+  for (unsigned i = 0, n = E->getNumSemanticExprs(); i != n; ++i)
+    if (auto *OVE = dyn_cast<OpaqueValueExpr>(E->getSemanticExpr(i)))
+      OwnerBoundValues.insert(OVE);
+
   // Before that, evaluate all of the semantics in order.  In
   // CFG-land, that means appending them in reverse order.
   for (unsigned i = E->getNumSemanticExprs(); i != 0; ) {
@@ -3988,6 +4610,11 @@ CFGBlock *CFGBuilder::VisitPseudoObjectExpr(PseudoObjectExpr *E) {
 
 CFGBlock *CFGBuilder::VisitWhileStmt(WhileStmt *W) {
   CFGBlock *LoopSuccessor = nullptr;
+  bool IsCaseCondition = MatchTestExpr::containsCaseCondition(W->getCond());
+  auto *MatchCondition = MatchTestExpr::findInCondition(W->getCond());
+  SmallVector<CFGBlock *, 4> MatchBodyBlocks;
+  MatchTestSuccessBlocks CaseSuccessBlocks;
+  bool HasSemanticCaseCondition = false;
 
   // Save local scope position because in case of condition variable ScopePos
   // won't be restored when traversing AST.
@@ -4036,18 +4663,63 @@ CFGBlock *CFGBuilder::VisitWhileStmt(WhileStmt *W) {
     // Loop body should end with destructor of Condition variable (if any).
     addAutomaticObjHandling(ScopePos, LoopBeginScopePos, W);
 
-    // If body is not a compound statement create implicit scope
-    // and add destructors.
-    if (!isa<CompoundStmt>(W->getBody()))
-      addLocalScopeAndDtors(W->getBody());
+    if (IsCaseCondition) {
+      bool FailedToBuildCaseHandler = false;
+      HasSemanticCaseCondition = forEachCaseConditionInstantiation(
+          W->getCond(), [&](const MatchTestInstantiation &Instantiation) {
+            if (!Instantiation.Handler)
+              return;
+            Succ = ContinueJumpTarget.block;
+            Block = nullptr;
+            if (!isa<CompoundStmt>(Instantiation.Handler))
+              addLocalScopeAndDtors(Instantiation.Handler);
+            CFGBlock *CandidateBody = addStmt(Instantiation.Handler);
+            if (!CandidateBody)
+              CandidateBody = ContinueJumpTarget.block;
+            else if (Block && badCFG) {
+              FailedToBuildCaseHandler = true;
+              return;
+            }
+            CaseSuccessBlocks[&Instantiation] = CandidateBody;
+          });
+      if (FailedToBuildCaseHandler)
+        return nullptr;
+      if (HasSemanticCaseCondition)
+        BodyBlock = CaseSuccessBlocks.empty()
+                        ? ContinueJumpTarget.block
+                        : CaseSuccessBlocks.begin()->second;
+    }
 
-    // Create the body.  The returned block is the entry to the loop body.
-    BodyBlock = addStmt(W->getBody());
+    if (!HasSemanticCaseCondition && MatchCondition &&
+        MatchCondition->hasConditionInstantiations()) {
+      for (const MatchTestInstantiation &Instantiation :
+           MatchCondition->getInstantiations()) {
+        Succ = ContinueJumpTarget.block;
+        Block = nullptr;
+        if (!isa<CompoundStmt>(Instantiation.Handler))
+          addLocalScopeAndDtors(Instantiation.Handler);
+        CFGBlock *CandidateBody = addStmt(Instantiation.Handler);
+        if (!CandidateBody)
+          CandidateBody = ContinueJumpTarget.block;
+        else if (Block && badCFG)
+          return nullptr;
+        MatchBodyBlocks.push_back(CandidateBody);
+      }
+      BodyBlock = MatchBodyBlocks.front();
+    } else if (!HasSemanticCaseCondition) {
+      // If body is not a compound statement create implicit scope
+      // and add destructors.
+      if (!isa<CompoundStmt>(W->getBody()))
+        addLocalScopeAndDtors(W->getBody());
 
-    if (!BodyBlock)
-      BodyBlock = ContinueJumpTarget.block; // can happen for "while(...) ;"
-    else if (Block && badCFG)
-      return nullptr;
+      // Create the body. The returned block is the entry to the loop body.
+      BodyBlock = addStmt(W->getBody());
+
+      if (!BodyBlock)
+        BodyBlock = ContinueJumpTarget.block; // while (...) ;
+      else if (Block && badCFG)
+        return nullptr;
+    }
   }
 
   // Because of short-circuit evaluation, the condition of the loop can span
@@ -4057,6 +4729,21 @@ CFGBlock *CFGBuilder::VisitWhileStmt(WhileStmt *W) {
 
   do {
     Expr *C = W->getCond();
+
+    if (IsCaseCondition) {
+      std::tie(EntryConditionBlock, ExitConditionBlock) =
+          VisitCaseConditionChain(C, W, BodyBlock, LoopSuccessor,
+                                  CaseSuccessBlocks);
+      break;
+    }
+
+    if (auto *Match = dyn_cast<MatchTestExpr>(C->IgnoreParens())) {
+      std::tie(EntryConditionBlock, ExitConditionBlock) =
+          MatchBodyBlocks.empty()
+              ? VisitMatchTestExpr(Match, W, BodyBlock, LoopSuccessor)
+              : VisitMatchTestExpr(Match, W, MatchBodyBlocks, LoopSuccessor);
+      break;
+    }
 
     // Specially handle logical operators, which have a slightly
     // more optimal CFG representation.
@@ -4130,12 +4817,14 @@ CFGBlock *CFGBuilder::VisitArrayInitLoopExpr(ArrayInitLoopExpr *A,
 
   CFGBlock *B = Block;
 
-  if (CFGBlock *R = Visit(A->getSubExpr()))
-    B = R;
-
   auto *OVE = dyn_cast<OpaqueValueExpr>(A->getCommonExpr());
   assert(OVE && "ArrayInitLoopExpr->getCommonExpr() should be wrapped in an "
                 "OpaqueValueExpr!");
+  OwnerBoundValues.insert(OVE);
+
+  if (CFGBlock *R = Visit(A->getSubExpr()))
+    B = R;
+
   if (CFGBlock *R = Visit(OVE->getSourceExpr()))
     B = R;
 
@@ -4298,6 +4987,118 @@ CFGBlock *CFGBuilder::VisitCXXTypeidExpr(CXXTypeidExpr *S, AddStmtChoice asc) {
 
   // Return block without CFG for unevaluated operands.
   return Block;
+}
+
+CFGBlock *CFGBuilder::VisitDoExpr(DoExpr *E, AddStmtChoice asc) {
+  // When the statement being analyzed is itself a do-expression body, a nested
+  // do-expression is opaque to the reachability of the enclosing body: for
+  // fall-off-the-end analysis it is a value-producing expression that
+  // completes normally. Its own do_return/return/break/continue and init
+  // statements belong to it, so we do not descend into its body.
+  if (BuildOpts.DoExpressionBody) {
+    if (asc.alwaysAdd(*this, E)) {
+      autoCreateBlock();
+      appendStmt(Block, E);
+    }
+    return Block;
+  }
+
+  // Otherwise the do-expression is part of the function's control flow. The
+  // do-expression element sits in a block of its own that every `do_return`
+  // of the body jumps to; the value of the do-expression is the operand of the
+  // `do_return` that reached it (as for the branches of `?:`). The body falls
+  // into the same block when it is left without a `do_return`, which is
+  // ill-formed and diagnosed elsewhere. `return`, `break`, `continue` and
+  // `goto` in the body refer to the enclosing function and loops and keep
+  // working through the ordinary jump targets.
+  if (E->isTypeDependent())
+    return VisitStmt(E, asc);
+
+  SaveAndRestore save_scope_pos(ScopePos);
+  const LocalScope::const_iterator DoScopePos = ScopePos;
+
+  autoCreateBlock();
+  if (badCFG)
+    return nullptr;
+  if (asc.alwaysAdd(*this, E))
+    appendStmt(Block, E);
+  CFGBlock *AfterBlock = Block;
+  Succ = AfterBlock;
+  Block = nullptr;
+
+  if (Stmt *Init = E->getInitStmt())
+    addLocalScopeForStmt(Init);
+
+  CFGBlock *BodyBlock;
+  {
+    SaveAndRestore save_target(DoReturnJumpTarget,
+                               JumpTarget(AfterBlock, DoScopePos));
+    BodyBlock = addStmt(E->getBody());
+    if (badCFG)
+      return nullptr;
+  }
+  if (!BodyBlock)
+    BodyBlock = AfterBlock;
+  Succ = Block ? Block : BodyBlock;
+
+  if (Stmt *Init = E->getInitStmt()) {
+    if (CFGBlock *InitBlock = addStmt(Init))
+      BodyBlock = InitBlock;
+    if (badCFG)
+      return nullptr;
+  }
+  return Block ? Block : BodyBlock;
+}
+
+CFGBlock *CFGBuilder::VisitDoReturnStmt(DoReturnStmt *S) {
+  // Within a do-expression body, `do_return` yields the do-expression's value
+  // and leaves the body, transferring control to the do-expression's end.
+  // Model it like a return: the current block ends here and flows to that end.
+  // When the do-expression is the statement being analyzed, the end is the exit
+  // block. Without a do-expression to return to (a stray do_return), it is an
+  // ordinary statement.
+  if (!BuildOpts.DoExpressionBody && !DoReturnJumpTarget.block)
+    return VisitStmt(S, AddStmtChoice::AlwaysAdd);
+
+  if (badCFG)
+    return nullptr;
+
+  Block = createBlock(false);
+  addAutomaticObjHandling(ScopePos,
+                          BuildOpts.DoExpressionBody
+                              ? LocalScope::const_iterator()
+                              : DoReturnJumpTarget.scopePosition,
+                          S);
+  if (!Block->hasNoReturnElement())
+    addSuccessor(Block, BuildOpts.DoExpressionBody ? &cfg->getExit()
+                                                   : DoReturnJumpTarget.block);
+  appendStmt(Block, S);
+
+  if (Expr *O = S->getOperand())
+    return Visit(O, AddStmtChoice::AlwaysAdd, /*ExternallyDestructed=*/true);
+  return Block;
+}
+
+CFGBlock *CFGBuilder::VisitCXXExpansionStmt(CXXExpansionStmt *E) {
+  // An expansion statement (`template for`) is a compile-time-unrolled sequence
+  // of its instantiations. Model it like a compound statement of those
+  // instantiation bodies, in order, so control flow within them (e.g.
+  // do_return, or falling off the end) is visible. A dependent (not-yet
+  // expanded) expansion has no instantiations to model; treat it as opaque.
+  if (E->hasDependentSize())
+    return Block;
+
+  CFGBlock *LastBlock = Block;
+  for (unsigned I = E->getNumInstantiations(); I-- > 0;) {
+    Stmt *Inst = E->getInstantiation(I);
+    if (!Inst)
+      continue;
+    if (CFGBlock *NewBlock = Visit(Inst, AddStmtChoice::AlwaysAdd))
+      LastBlock = NewBlock;
+    if (badCFG)
+      return nullptr;
+  }
+  return LastBlock;
 }
 
 CFGBlock *CFGBuilder::VisitDoStmt(DoStmt *D) {
@@ -4607,6 +5408,24 @@ static bool shouldAddCase(bool &switchExclusivelyCovered,
 }
 
 CFGBlock *CFGBuilder::VisitCaseStmt(CaseStmt *CS) {
+  // A `case` with no enclosing switch can occur when analyzing a do-expression
+  // body that lexically contains a label of an outer switch (an ill-formed
+  // jump-into-do-expression that is diagnosed elsewhere). Rather than crash,
+  // model it like a plain label so a CFG can still be built.
+  if (BuildOpts.DoExpressionBody && !SwitchTerminatedBlock) {
+    if (Stmt *Sub = CS->getSubStmt())
+      addStmt(Sub);
+    CFGBlock *CaseBlock = Block;
+    if (!CaseBlock)
+      CaseBlock = createBlock();
+    CaseBlock->setLabel(CS);
+    if (badCFG)
+      return nullptr;
+    Block = nullptr;
+    Succ = CaseBlock;
+    return CaseBlock;
+  }
+
   // CaseStmts are essentially labels, so they are the first statement in a
   // block.
   CFGBlock *TopBlock = nullptr, *LastBlock = nullptr;

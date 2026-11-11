@@ -135,6 +135,44 @@ const Expr *Expr::skipRValueSubobjectAdjustments(
   return E;
 }
 
+bool Expr::isDiverging() const {
+  const Expr *E = this;
+  while (true) {
+    E = E->IgnoreParens();
+    if (const auto *FE = dyn_cast<FullExpr>(E))
+      E = FE->getSubExpr();
+    else if (const auto *BTE = dyn_cast<CXXBindTemporaryExpr>(E))
+      E = BTE->getSubExpr();
+    else if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(E))
+      E = MTE->getSubExpr();
+    else if (const auto *CE = dyn_cast<CastExpr>(E);
+             CE && (CE->getCastKind() == CK_NoReturnToAny ||
+                    CE->getCastKind() == CK_ToVoid ||
+                    CE->getCastKind() == CK_NoOp))
+      E = CE->getSubExpr();
+    else
+      break;
+  }
+
+  if (E->getType()->isNoReturnType() || isa<CXXThrowExpr>(E))
+    return true;
+
+  if (const auto *CE = dyn_cast<CallExpr>(E)) {
+    if (const auto *FD = dyn_cast_or_null<FunctionDecl>(CE->getCalleeDecl()))
+      if (FD->isNoReturn())
+        return true;
+    // An indirect call through a pointer to a noreturn function type.
+    QualType CalleeTy = CE->getCallee()->getType();
+    if (const auto *PT = CalleeTy->getAs<PointerType>())
+      CalleeTy = PT->getPointeeType();
+    else if (const auto *RT = CalleeTy->getAs<ReferenceType>())
+      CalleeTy = RT->getPointeeType();
+    if (const auto *FT = CalleeTy->getAs<FunctionType>())
+      return FT->getNoReturnAttr();
+  }
+  return false;
+}
+
 bool Expr::isKnownToHaveBooleanValue(bool Semantic) const {
   const Expr *E = IgnoreParens();
 
@@ -1946,6 +1984,9 @@ bool CastExpr::CastConsistency() const {
   case CK_HLSLMatrixTruncation:
   case CK_HLSLElementwiseCast:
   case CK_HLSLAggregateSplatCast:
+  case CK_TokenArrayToSequence:
+  case CK_SequenceToTokenArray:
+  case CK_NoReturnToAny:
   CheckNoBasePath:
     assert(path_empty() && "Cast kind should not have a base path!");
     break;
@@ -2919,6 +2960,28 @@ bool Expr::isUnusedResultAWarning(const Expr *&WarnE, SourceLocation &Loc,
     R1 = getSourceRange();
     return true;
   }
+
+  case DoExprClass: {
+    // Discarded-value do-expression: only warn if the result type is
+    // non-void (since `do_return value;` paths produce an unused value).
+    if (getType()->isVoidType())
+      return false;
+    WarnE = this;
+    Loc = cast<DoExpr>(this)->getDoLoc();
+    R1 = getSourceRange();
+    return true;
+  }
+  case MatchTestExprClass:
+  case CaseConditionExprClass:
+  case MatchSelectExprClass:
+    if (HasSideEffects(Ctx))
+      return false;
+    if (getType()->isVoidType())
+      return false;
+    WarnE = this;
+    Loc = getExprLoc();
+    R1 = getSourceRange();
+    return true;
   case CXXFunctionalCastExprClass:
   case CStyleCastExprClass: {
     // Ignore an explicit cast to void, except in C++98 if the operand is a
@@ -3410,6 +3473,11 @@ bool Expr::isConstantInitializer(ASTContext &Ctx, bool IsForRef,
 
     break;
   }
+  case CXXMacroInvocationExprClass: {
+    const auto *MI = cast<CXXMacroInvocationExpr>(this);
+    return MI->isResolved() &&
+           MI->getExpansion()->isConstantInitializer(Ctx, false, Culprit);
+  }
   case ConstantExprClass: {
     // FIXME: We should be able to return "true" here, but it can lead to extra
     // error messages. E.g. in Sema/array-init.c.
@@ -3749,6 +3817,14 @@ bool Expr::HasSideEffects(const ASTContext &Ctx,
   case RequiresExprClass:
   case CXXReflectExprClass:
   case CXXMetafunctionExprClass:
+  case CXXBuiltinInjectExprClass:
+  case CXXBuiltinReportTokensExprClass:
+  case CXXTokenInterpolationListExprClass:
+  case CXXBuiltinIdExprClass:
+  case CXXBuiltinStrLiteralExprClass:
+  case CXXBuiltinTokenizeExprClass:
+  case CXXBuiltinStringizeExprClass:
+  case CXXTokenSequenceExprClass:
   case CXXSpliceExprClass:
   case CXXDependentMemberSpliceExprClass:
   case StackLocationExprClass:
@@ -3764,6 +3840,12 @@ bool Expr::HasSideEffects(const ASTContext &Ctx,
   case OpenACCAsteriskSizeExprClass:
     // These never have a side-effect.
     return false;
+
+  case CXXMacroInvocationExprClass: {
+    const auto *MI = cast<CXXMacroInvocationExpr>(this);
+    return !MI->isResolved() ||
+           MI->getExpansion()->HasSideEffects(Ctx, IncludePossibleEffects);
+  }
 
   case ConstantExprClass: {
     // FIXME: Move this into the "return false;" block above.
@@ -3810,6 +3892,68 @@ bool Expr::HasSideEffects(const ASTContext &Ctx,
     // StmtExprs have a side-effect if any substatement does.
     SideEffectFinder Finder(Ctx, IncludePossibleEffects);
     Finder.Visit(cast<StmtExpr>(this)->getSubStmt());
+    return Finder.hasSideEffects();
+  }
+
+  case DoExprClass: {
+    // Do-expressions have a side-effect if any init statement or body
+    // substatement does.
+    const auto *DE = cast<DoExpr>(this);
+    SideEffectFinder Finder(Ctx, IncludePossibleEffects);
+    if (DE->hasInitStmt())
+      Finder.Visit(DE->getInitStmt());
+    Finder.Visit(DE->getBody());
+    return Finder.hasSideEffects();
+  }
+
+  case MatchTestExprClass:
+  case CaseConditionExprClass: {
+    const auto *ME = cast<MatchTestExpr>(this);
+    SideEffectFinder Finder(Ctx, IncludePossibleEffects);
+    Finder.Visit(ME->getHoldingVar() && ME->getHoldingVar()->getInit()
+                     ? ME->getHoldingVar()->getInit()
+                     : ME->getSubject());
+    visitMatchPatternEvaluation(
+        ME->getPattern(), ME->getPatternInstantiation(),
+        [&](const Decl *D) { Finder.VisitDecl(D); },
+        [&](const Stmt *S) { Finder.Visit(S); });
+    const MatchGuard &Guard = ME->getGuard();
+    if (Guard.Init)
+      Finder.Visit(Guard.Init);
+    if (Guard.ConditionVariable) {
+      Finder.VisitDecl(Guard.ConditionVariable);
+      if (Guard.ConditionVariable->getInit())
+        Finder.Visit(Guard.ConditionVariable->getInit());
+    }
+    if (Guard.Condition)
+      Finder.Visit(Guard.Condition);
+    return Finder.hasSideEffects();
+  }
+
+  case MatchSelectExprClass: {
+    const auto *ME = cast<MatchSelectExpr>(this);
+    SideEffectFinder Finder(Ctx, IncludePossibleEffects);
+    if (const Stmt *Init = ME->getInitStmt())
+      Finder.Visit(Init);
+    Finder.Visit(ME->getHoldingVar() && ME->getHoldingVar()->getInit()
+                     ? ME->getHoldingVar()->getInit()
+                     : ME->getSubject());
+    for (const MatchCaseInstantiation &Case : ME->getCaseInstantiations()) {
+      visitMatchPatternEvaluation(
+          Case.Pattern, Case.PatternInstantiation,
+          [&](const Decl *D) { Finder.VisitDecl(D); },
+          [&](const Stmt *S) { Finder.Visit(S); });
+      if (Case.Guard.Init)
+        Finder.Visit(Case.Guard.Init);
+      if (Case.Guard.ConditionVariable) {
+        Finder.VisitDecl(Case.Guard.ConditionVariable);
+        if (Case.Guard.ConditionVariable->getInit())
+          Finder.Visit(Case.Guard.ConditionVariable->getInit());
+      }
+      if (Case.Guard.Condition)
+        Finder.Visit(Case.Guard.Condition);
+      Finder.Visit(Case.Handler);
+    }
     return Finder.hasSideEffects();
   }
 

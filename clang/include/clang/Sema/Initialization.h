@@ -41,6 +41,7 @@ namespace clang {
 class CXXBaseSpecifier;
 class CXXConstructorDecl;
 class ObjCMethodDecl;
+class Scope;
 class Sema;
 
 /// Describes an entity that is being initialized.
@@ -131,6 +132,16 @@ public:
     /// object initialized via parenthesized aggregate initialization.
     EK_ParenAggInitMember,
 
+    /// The entity being initialized is the result of a match expression arm.
+    EK_MatchExprResult,
+
+    /// The entity being initialized is the result of a do-expression
+    /// ('do_return' operand). Like EK_Result, but the lifetime boundary is
+    /// the do-expression, not the enclosing function: references to
+    /// declarations outside the do-expression are checked when the completed
+    /// do-expression is consumed, not here.
+    EK_DoExprResult,
+
     // Note: err_init_conversion_failed in DiagnosticSemaKinds.td uses this
     // enum as an index for its first %select.  When modifying this list,
     // that diagnostic text needs to be updated as well.
@@ -185,6 +196,15 @@ private:
     SourceLocation Location;
   };
 
+  struct DE {
+    /// The location of the 'do_return'.
+    SourceLocation Location;
+
+    /// The scope immediately outside the do-expression, used to distinguish
+    /// body locals from enclosing declarations.
+    Scope *OuterScope;
+  };
+
   union {
     /// When Kind == EK_Variable, EK_Member, EK_Binding, or
     /// EK_TemplateParameter, the variable, binding, or template parameter.
@@ -203,6 +223,10 @@ private:
     TypeSourceInfo *TypeInfo;
 
     struct LN LocAndNRVO;
+
+    /// When Kind == EK_DoExprResult, the 'do_return' location and the scope
+    /// outside the do-expression.
+    struct DE DoExprResult;
 
     /// When Kind == EK_Base, the base specifier that provides the
     /// base class. The integer specifies whether the base is an inherited
@@ -315,6 +339,21 @@ public:
   static InitializedEntity InitializeStmtExprResult(SourceLocation ReturnLoc,
                                             QualType Type) {
     return InitializedEntity(EK_StmtExprResult, ReturnLoc, Type);
+  }
+
+  static InitializedEntity InitializeMatchExprResult(SourceLocation Loc,
+                                                      QualType Type) {
+    return InitializedEntity(EK_MatchExprResult, Loc, Type);
+  }
+
+  static InitializedEntity InitializeDoExprResult(SourceLocation DoReturnLoc,
+                                                   QualType Type,
+                                                   Scope *OuterScope) {
+    InitializedEntity Result;
+    Result.Kind = EK_DoExprResult;
+    Result.Type = Type;
+    Result.DoExprResult = {DoReturnLoc, OuterScope};
+    return Result;
   }
 
   static InitializedEntity InitializeBlock(SourceLocation BlockVarLoc,
@@ -522,11 +561,23 @@ public:
     return getKind() == EK_Member && Variable.IsDefaultMemberInit;
   }
 
-  /// Determine the location of the 'return' keyword when initializing
-  /// the result of a function call.
+  /// Determine the source location for a function, statement-expression, or
+  /// match-expression result initialization.
   SourceLocation getReturnLoc() const {
-    assert(getKind() == EK_Result && "No 'return' location!");
+    assert((getKind() == EK_Result || getKind() == EK_StmtExprResult ||
+            getKind() == EK_MatchExprResult) &&
+           "No result location!");
     return LocAndNRVO.Location;
+  }
+
+  SourceLocation getDoExprResultLoc() const {
+    assert(getKind() == EK_DoExprResult && "Not a do-expression result!");
+    return DoExprResult.Location;
+  }
+
+  Scope *getDoExprOuterScope() const {
+    assert(getKind() == EK_DoExprResult && "Not a do-expression result!");
+    return DoExprResult.OuterScope;
   }
 
   /// Determine the location of the 'throw' keyword when initializing
@@ -947,7 +998,11 @@ public:
 
     /// Initialize an aggreagate with parenthesized list of values.
     /// This is a C++20 feature.
-    SK_ParenthesizedListInit
+    SK_ParenthesizedListInit,
+
+    /// Initialize an object or reference of any type from a diverging
+    /// expression of type std::noreturn_t (P3549).
+    SK_NoReturnConversion
   };
 
   /// A single step in the initialization sequence.
@@ -1133,6 +1188,10 @@ public:
 
     /// HLSL intialization list flattening failed.
     FK_HLSLInitListFlatteningFailed,
+
+    /// An object of type std::noreturn_t initialized by something other than
+    /// a std::noreturn_t (P3549).
+    FK_NoReturnObjectInit,
   };
 
 private:
@@ -1392,6 +1451,9 @@ public:
   void AddOCLZeroOpaqueTypeStep(QualType T);
 
   void AddParenthesizedListInitStep(QualType T);
+
+  /// Add a step converting a std::noreturn_t to \p T (P3549).
+  void AddNoReturnConversionStep(QualType T);
 
   /// Only used when initializing structured bindings from an array with
   /// direct-list-initialization. Unwrap the initializer list to get the array

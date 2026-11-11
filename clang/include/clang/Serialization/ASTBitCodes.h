@@ -1129,6 +1129,15 @@ enum PredefinedTypeIDs {
   /// \brief The 'std::meta::info' type
   PREDEF_TYPE_META_INFO_ID = 75,
 
+  /// \brief The 'std::meta::token_sequence' type
+  PREDEF_TYPE_TOKEN_SEQUENCE_ID = 76,
+
+  /// \brief The 'std::meta::token' type
+  PREDEF_TYPE_META_TOKEN_ID = 77,
+
+  /// \brief The 'std::noreturn_t' type (P3549)
+  PREDEF_TYPE_NORETURN_ID = 78,
+
 /// OpenCL image types with auto numeration
 #define IMAGE_TYPE(ImgType, Id, SingletonId, Access, Suffix)                   \
   PREDEF_TYPE_##Id##_ID,
@@ -1170,7 +1179,7 @@ enum PredefinedTypeIDs {
 ///
 /// Type IDs for non-predefined types will start at
 /// NUM_PREDEF_TYPE_IDs.
-const unsigned NUM_PREDEF_TYPE_IDS = 520;
+const unsigned NUM_PREDEF_TYPE_IDS = 523;
 
 // Ensure we do not overrun the predefined types we reserved
 // in the enum PredefinedTypeIDs above.
@@ -1951,6 +1960,10 @@ enum StmtCode {
   EXPR_CONCEPT_SPECIALIZATION,            // ConceptSpecializationExpr
   EXPR_REQUIRES,                          // RequiresExpr
 
+  EXPR_MATCH_TEST,                        // MatchTestExpr
+  EXPR_CASE_CONDITION,                    // CaseConditionExpr
+  EXPR_MATCH_SELECT,                      // MatchSelectExpr
+
   // CUDA
   EXPR_CUDA_KERNEL_CALL, // CUDAKernelCallExpr
 
@@ -2063,7 +2076,15 @@ enum StmtCode {
 
   // C++2c reflection (CXX26)
   EXPR_REFLECT,
+  EXPR_TOKEN_SEQUENCE,
   EXPR_METAFUNCTION,
+  EXPR_BUILTIN_INJECT,
+  EXPR_BUILTIN_REPORT_TOKENS,
+  EXPR_BUILTIN_ID,
+  EXPR_BUILTIN_STR_LITERAL,
+  EXPR_BUILTIN_TOKENIZE,
+  EXPR_BUILTIN_STRINGIZE,
+  EXPR_MACRO_INVOCATION,
   EXPR_SPLICE,
   EXPR_DEPENDENT_MEMBER_SPLICE,
   EXPR_STACK_LOCATION,
@@ -2083,6 +2104,9 @@ enum StmtCode {
 
   // contracts
   STMT_CXX_CONTRACT,
+  // do-expressions
+  EXPR_DO,
+  STMT_DO_RETURN,
 
   // FixedPointLiteral
   EXPR_FIXEDPOINT_LITERAL,

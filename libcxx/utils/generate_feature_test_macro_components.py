@@ -263,7 +263,7 @@ feature_test_macros = [
         },
         {
             "name": "__cpp_lib_bitops",
-            "values": {"c++20": 201907},
+            "values": {"c++20": 201907, "c++29": 202607},  # P3104R6 Bit permutations
             "headers": ["bit"],
         },
         {
@@ -352,7 +352,7 @@ feature_test_macros = [
         },
         {
             "name": "__cpp_lib_constant_wrapper",
-            "values": {"c++26": 202603},  # P3948R1, P3978R3 (string literals: P4206R0 is C++29)
+            "values": {"c++26": 202603, "c++29": 202606},  # P3948R1, P3978R3; P4206R0 (C++29: no string support)
             "headers": ["utility"],
         },
         {
@@ -655,7 +655,7 @@ feature_test_macros = [
         },
         {
             "name": "__cpp_lib_expected",
-            "values": {"c++23": 202211},
+            "values": {"c++23": 202211, "c++29": 202606},  # P3798R1 The unexpected in std::expected
             "headers": ["expected"],
         },
         {
@@ -1047,7 +1047,7 @@ feature_test_macros = [
         },
         {
             "name": "__cpp_lib_hazard_pointer",
-            "values": {"c++26": 202306},  # P2530R3 Hazard Pointers for C++26
+            "values": {"c++26": 202306, "c++29": 202606},  # P2530R3 Hazard Pointers for C++26, P3428R4 Hazard Pointer Batches (C++29)
             "headers": ["hazard_pointer"],
         },
         {
@@ -1263,6 +1263,11 @@ feature_test_macros = [
             "headers": ["memory"],
         },
         {
+            "name": "__cpp_lib_map_lookup",
+            "values": {"c++29": 202606},  # P3091R6 Better Lookups for map, unordered_map, and flat_map
+            "headers": ["flat_map", "map", "unordered_map"],
+        },
+        {
             "name": "__cpp_lib_map_try_emplace",
             "values": {"c++17": 201411},
             "headers": ["map"],
@@ -1283,6 +1288,11 @@ feature_test_macros = [
                 "c++23": 202207,
                 "c++26": 202406,  # P2389R2 dextents Index Type Parameter
             },
+            "headers": ["mdspan"],
+        },
+        {
+            "name": "__cpp_lib_mdspan_copy",
+            "values": {"c++29": 202606},  # P3242R4 Copy and fill for mdspan
             "headers": ["mdspan"],
         },
         {
@@ -1395,6 +1405,11 @@ feature_test_macros = [
             },  # P2075R6 Philox as an extension of the C++ RNG engines
             # Note the paper mentions 202310L as value, which differs from the typical procedure.
             "headers": ["random"],
+        },
+        {
+            "name": "__cpp_lib_pointer_tag_pair",
+            "values": {"c++29": 202606},  # P3125R6 constexpr pointer tagging
+            "headers": ["memory"],
         },
         {
             "name": "__cpp_lib_polymorphic",
@@ -1669,7 +1684,12 @@ feature_test_macros = [
         },
         {
             "name": "__cpp_lib_simd",
-            "values": {"c++26": 202603},  # P1928R15 std::simd -- merge data-parallel types from the Parallelism TS 2, P3690R1
+            "values": {"c++26": 202603, "c++29": 202606},  # P1928R15 std::simd -- merge data-parallel types from the Parallelism TS 2, P3690R1; P3319R6 iota (the draft N5054 has 202606)
+            "headers": ["simd"],
+        },
+        {
+            "name": "__cpp_lib_simd_bitops",
+            "values": {"c++29": 202607},  # P3772R2 std::simd overloads for bit permutations, P3793R2 shl/shr
             "headers": ["simd"],
         },
         {
@@ -1819,6 +1839,13 @@ feature_test_macros = [
             "headers": ["text_encoding"],
         },
         {
+            "name": "__cpp_lib_thread_attributes",
+            "values": {"c++29": 202606},  # P2019R9 Thread attributes
+            "headers": ["thread"],
+            "test_suite_guard": "_LIBCPP_HAS_THREADS",
+            "libcxx_guard": "_LIBCPP_HAS_THREADS",
+        },
+        {
             "name": "__cpp_lib_three_way_comparison",
             "values": {"c++20": 201907},
             "headers": ["compare"],
@@ -1838,6 +1865,7 @@ feature_test_macros = [
             "values": {
                 "c++17": 201611,
                 "c++26": 202306,  # P2497R0 Testing for success or failure of <charconv> functions
+                "c++29": 202606,  # P3505R4 Fix the default floating-point representation in std::format
             },
             "headers": ["charconv"],
         },
@@ -1931,6 +1959,11 @@ feature_test_macros = [
             "headers": ["variant"],
         },
         {
+            "name": "__cpp_lib_view_interface",
+            "values": {"c++29": 202606},  # P3052R2 view_interface::at
+            "headers": ["ranges"],
+        },
+        {
             "name": "__cpp_lib_void_t",
             "values": {"c++17": 201411},
             "headers": ["type_traits"],
@@ -1977,7 +2010,7 @@ lit_markup = {
 
 
 def get_std_dialects():
-    std_dialects = ["c++14", "c++17", "c++20", "c++23", "c++26"]
+    std_dialects = ["c++14", "c++17", "c++20", "c++23", "c++26", "c++29"]
     return list(std_dialects)
 
 

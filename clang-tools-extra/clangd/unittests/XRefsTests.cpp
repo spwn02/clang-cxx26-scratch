@@ -281,6 +281,72 @@ TEST(HighlightsTest, ControlFlow) {
   }
 }
 
+TEST(HighlightsTest, DoExpressions) {
+  const char *Tests[] = {
+      R"cpp(
+        // do_return highlights the other do_returns of the same body and `do`.
+        int f(bool b) {
+          return [[do]] {
+            if (b) [[do_re^turn]] 1;
+            [[do_return]] 2;
+          };
+        }
+      )cpp",
+      R"cpp(
+        // The cursor on `do` finds the do_returns.
+        int f(bool b) {
+          return [[d^o]] {
+            if (b) [[do_return]] 1;
+            [[do_return]] 2;
+          };
+        }
+      )cpp",
+      R"cpp(
+        // A nested do expression owns its do_returns.
+        int f(bool b) {
+          return [[do]] {
+            int y = do { do_return 5; };
+            [[do_re^turn]] y;
+          };
+        }
+      )cpp",
+      R"cpp(
+        int f(bool b) {
+          return do {
+            int y = [[do]] { [[do_ret^urn]] 5; };
+            do_return y;
+          };
+        }
+      )cpp",
+      R"cpp(
+        // return in a do body is the function's return, do_return is not one.
+        int f(bool b) {
+          if (b) [[ret^urn]] 0;
+          int x = do { if (b) [[return]] 1; do_return 2; };
+          [[return]] x;
+        }
+      )cpp",
+      R"cpp(
+        // break and continue in a do body belong to the enclosing loop.
+        int f() {
+          [[wh^ile]] (true) {
+            int x = do { if (x) [[break]]; do_return 1; };
+            [[continue]];
+          }
+          return 0;
+        }
+      )cpp",
+  };
+  for (const char *Test : Tests) {
+    Annotations T(Test);
+    auto TU = TestTU::withCode(T.code());
+    TU.ExtraArgs.push_back("-std=c++29");
+    auto AST = TU.build();
+    EXPECT_THAT(findDocumentHighlights(AST, T.point()), highlightsFrom(T))
+        << Test;
+  }
+}
+
 MATCHER_P3(sym, Name, Decl, DefOrNone, "") {
   std::optional<Range> Def = DefOrNone;
   if (Name != arg.Name) {
@@ -2099,6 +2165,90 @@ TEST(FindType, Index) {
               ElementsAre(sym("X", A.range(), Def.range())));
 }
 
+TEST(DoExpressionNavigation, FindTypeDefinitionAndReferences) {
+  Annotations Code(R"cpp(
+    struct $Target[[Target]] {};
+    Target t;
+    Target use() {
+      return do [$cap[[k]] = t] {
+        Target $local[[local]] = k;
+        do_return $ref[[lo^cal]];
+      };
+    }
+  )cpp");
+  TestTU TU = TestTU::withCode(Code.code());
+  TU.ExtraArgs.push_back("-std=c++29");
+  auto AST = TU.build();
+  // Go to definition of a body local used in do_return.
+  EXPECT_THAT(locateSymbolAt(AST, Code.point(), TU.index().get()),
+              ElementsAre(sym("local", Code.range("local"), Code.range("local"))));
+  // Find references of the body local.
+  EXPECT_THAT(findReferences(AST, Code.point(), 0, nullptr).References,
+              UnorderedElementsAre(rangeIs(Code.range("local")),
+                                   rangeIs(Code.range("ref"))));
+}
+
+// P4380 token sequences: an interpolation and the name of a macro at its call
+// site navigate like the code around them (#392).
+TEST(TokenSequenceNavigation, InterpolationAndMacroName) {
+  Annotations Code(R"cpp(
+namespace std::meta {
+template <class... Ts> consteval auto id(Ts const &...) -> int;
+using token = decltype(id("x"));
+class token_sequence {
+public:
+  constexpr token_sequence() noexcept = default;
+  friend consteval auto operator+=(token_sequence &, const token_sequence &)
+      -> token_sequence &;
+  friend consteval auto operator+(token_sequence, const token_sequence &)
+      -> token_sequence;
+};
+} // namespace std::meta
+using std::meta::token_sequence;
+    consteval token_sequence f(int $count[[count]]) {
+      return @@{ x = \($ref[[co$interp^unt]]) };
+    }
+    __macro $macro[[inc]](int x) { return @@{ (\(x) + 1) }; }
+    int use() { return $use[[i$call^nc]]!(1); }
+  )cpp");
+  TestTU TU = TestTU::withCode(withReflectionOperator(Code.code()));
+  TU.ExtraArgs.push_back("-std=c++2d");
+  auto AST = TU.build();
+  EXPECT_THAT(
+      locateSymbolAt(AST, Code.point("interp"), TU.index().get()),
+      ElementsAre(sym("count", Code.range("count"), Code.range("count"))));
+  EXPECT_THAT(findReferences(AST, Code.point("interp"), 0, nullptr).References,
+              UnorderedElementsAre(rangeIs(Code.range("count")),
+                                   rangeIs(Code.range("ref"))));
+  EXPECT_THAT(
+      locateSymbolAt(AST, Code.point("call"), TU.index().get()),
+      ElementsAre(sym("inc", Code.range("macro"), Code.range("macro"))));
+  EXPECT_THAT(findReferences(AST, Code.point("call"), 0, nullptr).References,
+              UnorderedElementsAre(rangeIs(Code.range("macro")),
+                                   rangeIs(Code.range("use"))));
+}
+
+TEST(DoExpressionNavigation, GoToTypeOfDoReturn) {
+  Annotations HeaderA(R"cpp(
+    struct $Target[[Target]] {};
+    Target t;
+  )cpp");
+  auto TU = TestTU::withHeaderCode(HeaderA.code());
+  TU.ExtraArgs.push_back("-std=c++29");
+  for (const llvm::StringRef Case : {
+           "Target f() { return do { ^do_return t; }; }",
+           "auto x = ^do { do_return t; };",
+       }) {
+    Annotations A(Case);
+    TU.Code = A.code().str();
+    ParsedAST AST = TU.build();
+    EXPECT_THAT(findType(AST, A.point(), nullptr),
+                ElementsAre(sym("Target", HeaderA.range("Target"),
+                                HeaderA.range("Target"))))
+        << Case;
+  }
+}
+
 void checkFindRefs(llvm::StringRef Test, bool UseIndex = false) {
   Annotations T(Test);
   auto TU = TestTU::withCode(T.code());
@@ -2348,6 +2498,86 @@ TEST(FindReferences, WithinAST) {
       )cpp"};
   for (const char *Test : Tests)
     checkFindRefs(Test);
+}
+
+TEST(FindReferences, PatternMatching) {
+  // The variables a pattern declares (P2688): a use finds the declaration in
+  // the pattern and the other uses, from every pattern kind.
+  const char *Tests[] = {
+      R"cpp(// declaration pattern with a guard
+        int f(int x) {
+          return match (x) {
+            case 0 => 1;
+            case auto $def(f)[[y]] if ($(f)[[y]] > 5) => $(f)[[^y]];
+            case _ => 2;
+          };
+        }
+      )cpp",
+      R"cpp(// decomposition pattern in a pattern condition
+        struct P { int a, b; };
+        int f(P p) {
+          if (case [0, auto $def(f)[[b]]] = p)
+            return $(f)[[^b]];
+          return 0;
+        }
+      )cpp",
+      R"cpp(// the subject is referenced from the match
+        int f(int $def(f)[[sub]]) {
+          return match ($(f)[[^sub]]) { case 0 => 1; case _ => $(f)[[sub]]; };
+        }
+      )cpp",
+  };
+  for (const char *Test : Tests) {
+    Annotations T(Test);
+    auto TU = TestTU::withCode(T.code());
+    TU.ExtraArgs.push_back("-std=c++2d");
+    auto AST = TU.build();
+    ASSERT_TRUE(AST.getDiagnostics().empty()) << Test;
+    std::vector<Matcher<ReferencesResult::Reference>> Expected;
+    for (const auto &[R, Context] : T.rangesWithPayload())
+      Expected.push_back(AllOf(rangeIs(R), containerIs(Context), attrsAre(0u)));
+    for (const auto &[R, Context] : T.rangesWithPayload("def"))
+      Expected.push_back(AllOf(rangeIs(R), containerIs(Context),
+                               attrsAre(ReferencesResult::Definition |
+                                        ReferencesResult::Declaration)));
+    for (const auto &P : T.points())
+      EXPECT_THAT(findReferences(AST, P, 0, nullptr, /*AddContext*/ true)
+                      .References,
+                  UnorderedElementsAreArray(Expected))
+          << Test;
+  }
+}
+
+TEST(LocateSymbol, PatternMatching) {
+  struct {
+    const char *Code;
+    const char *Name;
+  } Tests[] = {
+      {R"cpp(
+        int f(int x) {
+          return match (x) { case auto [[y]] if (y > 5) => ^y; case _ => 0; };
+        }
+      )cpp",
+       "y"},
+      {R"cpp(
+        struct P { int a, b; };
+        int f(P p) {
+          if (case [auto [[a]], 1] = p) return ^a;
+          return 0;
+        }
+      )cpp",
+       "a"},
+  };
+  for (const auto &Test : Tests) {
+    Annotations T(Test.Code);
+    auto TU = TestTU::withCode(T.code());
+    TU.ExtraArgs.push_back("-std=c++2d");
+    auto AST = TU.build();
+    ASSERT_TRUE(AST.getDiagnostics().empty()) << Test.Code;
+    EXPECT_THAT(locateSymbolAt(AST, T.point()),
+                ElementsAre(sym(Test.Name, T.range(), T.range())))
+        << Test.Code;
+  }
 }
 
 TEST(FindReferences, ConceptsWithinAST) {

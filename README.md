@@ -11,15 +11,15 @@ Earlier standards (`-std=c++03` through `-std=c++23`) are supported.
 ## Release
 
 The current release is
-[`cxx26-2026.10.27`](https://github.com/spwn02/clang-cxx26/releases/tag/cxx26-2026.10.27),
+[`cxx26-2026.10.30`](https://github.com/spwn02/clang-cxx26/releases/tag/cxx26-2026.10.30),
 a Linux x86_64 toolchain with Clang, clangd, clang-tidy, lld, libc++, libc++abi,
 libunwind, the compiler-rt runtimes and the libc++ `import std` module sources.
 
 ```bash
-gh release download cxx26-2026.10.27 --repo spwn02/clang-cxx26
-sha256sum -c clang-cxx26-2026.10.27-linux-x86_64.SHA256SUMS
-zstd -dc clang-cxx26-2026.10.27-linux-x86_64.tar.zst | tar -x
-source clang-cxx26-2026.10.27/share/clang-cxx26/activate.sh   # sets CC, CXX, PATH and the library path
+gh release download cxx26-2026.10.30 --repo spwn02/clang-cxx26
+sha256sum -c clang-cxx26-2026.10.30-linux-x86_64.SHA256SUMS
+zstd -dc clang-cxx26-2026.10.30-linux-x86_64.tar.zst | tar -x
+source clang-cxx26-2026.10.30/share/clang-cxx26/activate.sh   # sets CC, CXX, PATH and the library path
 $CXX -std=c++26 hello.cpp
 ```
 
@@ -35,9 +35,9 @@ headers and `crtbeginS.o`/`libgcc`) and `zstd` to unpack the archive. CMake's `i
 needs CMake 4.4 or newer and Ninja 1.11 or newer.
 
 Platform: the published toolchain is a Linux x86_64 archive. The compiler and libc++ also build from source on
-macOS arm64 (Apple Silicon) and on Windows with the MSVC ABI (`clang-cl`), where six small
-programs (hello world, reflection, expansion statements, contracts, `std::execution` and `<simd>`) compile and run; there are
-no binary releases for them yet. See the
+macOS arm64 (Apple Silicon) and on Windows with the MSVC ABI (`clang-cl`), where eight small
+programs (hello world, reflection, expansion statements, contracts, `std::execution`, `<simd>`, a constexpr exception and
+`std::text_encoding`) compile and run; there are no binary releases for them yet. See the
 [FAQ](cxx26/FAQ.md#which-platforms-are-supported) for what was checked and the known issues.
 
 ## Try it
@@ -135,6 +135,10 @@ int main() {
   std::println("{} {}", last, std::simd::reduce(x));
 }
 ```
+
+## C++29 (work in progress)
+
+C++29 work is developed on the branch `cxx29`, which is branched from `cxx26` and is not part of any release yet. `-std=c++29` (alias `-std=c++2d`) is the language mode, with `_LIBCPP_STD_VER 29`; the baseline draft is N5054. Implemented: `do` expressions (P2806), token sequence injection (P4380) and seventeen library papers of the C++29 draft, each wired through clangd, clang-tidy, clang-format and the other tools before it counted as done. Implemented with the same rule: pattern matching (P2688R6), with `std::alternative_traits`. Planned: the networking work (P4048, P4100). The plan is tracked in the GitHub milestones whose names start with `C++29`. The release line stays `cxx26`; C++29 snapshots are tagged `cxx29-YYYY.MM.DD`, published as pre-releases, and installed separately.
 
 ## Differences from stock Clang
 

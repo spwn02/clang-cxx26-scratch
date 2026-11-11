@@ -1109,6 +1109,28 @@ class CursorKind(BaseEnumeration):
     # Represents a C++26 pack indexing expression.
     PACK_INDEXING_EXPR = 156
 
+    # Represents a C++29 do expression (P2806).
+    DO_EXPR = 157
+
+    # Represents a C++29 token sequence literal (P4380), ^^{ tokens }.
+    TOKEN_SEQUENCE_EXPR = 158
+
+    # Represents a C++29 expression macro invocation (P4380), name!(args).
+    MACRO_INVOCATION_EXPR = 159
+
+    # Represents a C++29 token injection builtin (P4380): queue_injection,
+    # report_tokens, id, str_lit, tokenize, stringize or an interpolation list.
+    TOKEN_INJECTION_EXPR = 160
+
+    # Represents a C++29 match selection (P2688), match (subject) { case ... }.
+    MATCH_SELECT_EXPR = 161
+
+    # Represents a C++29 match test (P2688), match (subject, case pattern).
+    MATCH_TEST_EXPR = 162
+
+    # Represents a C++29 pattern condition (P2688), case pattern = subject.
+    CASE_CONDITION_EXPR = 163
+
     # A statement whose specific kind is not exposed via this interface.
     #
     # Unexposed statements have the same operations as any other kind of
@@ -1490,6 +1512,9 @@ class CursorKind(BaseEnumeration):
 
     # OpenACC cache Construct.
     OPEN_ACC_CACHE_CONSTRUCT = 333
+
+    # Represents a C++29 do_return statement (P2806).
+    DO_RETURN_STMT = 334
 
     ###
     # Other Kinds
@@ -2646,6 +2671,7 @@ class TypeKind(BaseEnumeration):
     HLSLRESOURCE = 179
     HLSLATTRIBUTEDRESOURCE = 180
     HLSLINLINESPIRV = 181
+    NORETURN = 182
 
 class RefQualifierKind(BaseEnumeration):
     """Describes a specific ref-qualifier of a type."""

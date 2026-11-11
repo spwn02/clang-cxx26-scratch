@@ -2345,6 +2345,152 @@ extern const internal::VariadicDynCastAllOfMatcher<Stmt, CoreturnStmt>
 ///   matches 'return 1'
 extern const internal::VariadicDynCastAllOfMatcher<Stmt, ReturnStmt> returnStmt;
 
+/// Matches a token sequence literal (P4380), a C++29 feature.
+///
+/// Given
+/// \code
+///   auto t = ^^{ a + b };
+/// \endcode
+/// tokenSequenceExpr()
+///   matches '^^{ a + b }'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, CXXTokenSequenceExpr> tokenSequenceExpr;
+
+/// Matches an expression macro invocation (P4380), a C++29 feature.
+///
+/// Given
+/// \code
+///   int x = add!(1, 2);
+/// \endcode
+/// macroInvocationExpr()
+///   matches 'add!(1, 2)'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, CXXMacroInvocationExpr> macroInvocationExpr;
+
+/// Matches std::meta::queue_injection (P4380), a C++29 feature.
+///
+/// Given
+/// \code
+///   std::meta::queue_injection(ts);
+/// \endcode
+/// queueInjectionExpr()
+///   matches 'std::meta::queue_injection(ts)'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinInjectExpr> queueInjectionExpr;
+
+/// Matches std::meta::report_tokens (P4380), a C++29 feature.
+///
+/// Given
+/// \code
+///   std::meta::report_tokens("m", ts);
+/// \endcode
+/// reportTokensExpr()
+///   matches 'std::meta::report_tokens("m", ts)'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinReportTokensExpr> reportTokensExpr;
+
+/// Matches a token interpolation list (P4380), a C++29 feature.
+///
+/// Given
+/// \code
+///   ^^{ \(a, b) }
+/// \endcode
+/// tokenInterpolationListExpr()
+///   matches '\(a, b)'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, CXXTokenInterpolationListExpr> tokenInterpolationListExpr;
+
+/// Matches std::meta::id (P4380), a C++29 feature.
+///
+/// Given
+/// \code
+///   auto i = std::meta::id("x");
+/// \endcode
+/// builtinIdExpr()
+///   matches 'std::meta::id("x")'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinIdExpr> builtinIdExpr;
+
+/// Matches std::meta::str_lit (P4380), a C++29 feature.
+///
+/// Given
+/// \code
+///   auto i = std::meta::str_lit("x");
+/// \endcode
+/// builtinStrLiteralExpr()
+///   matches 'std::meta::str_lit("x")'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinStrLiteralExpr> builtinStrLiteralExpr;
+
+/// Matches std::meta::tokenize (P4380), a C++29 feature.
+///
+/// Given
+/// \code
+///   auto i = std::meta::tokenize("x");
+/// \endcode
+/// builtinTokenizeExpr()
+///   matches 'std::meta::tokenize("x")'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinTokenizeExpr> builtinTokenizeExpr;
+
+/// Matches std::meta::stringize (P4380), a C++29 feature.
+///
+/// Given
+/// \code
+///   auto i = std::meta::stringize(ts);
+/// \endcode
+/// builtinStringizeExpr()
+///   matches 'std::meta::stringize(ts)'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, CXXBuiltinStringizeExpr> builtinStringizeExpr;
+
+/// Matches do expressions (P2806), a C++29 feature.
+///
+/// Given
+/// \code
+///   int x = do { do_return 1; };
+/// \endcode
+/// doExpr()
+///   matches 'do { do_return 1; }'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, DoExpr> doExpr;
+
+/// Matches match selections (P2688), a C++29 feature.
+///
+/// Given
+/// \code
+///   int f(int x) { return match (x) { case 0 => 1; case _ => 2; }; }
+/// \endcode
+/// matchSelectExpr()
+///   matches 'match (x) { case 0 => 1; case _ => 2; }'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, MatchSelectExpr>
+    matchSelectExpr;
+
+/// Matches match tests (P2688) and pattern conditions, a C++29 feature.
+///
+/// Given
+/// \code
+///   bool f(int x) { return match(x, case 1 || 2); }
+///   int g(int x) { if (case auto y = x) return y; return 0; }
+/// \endcode
+/// matchTestExpr()
+///   matches 'match(x, case 1 || 2)' and 'case auto y = x'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, MatchTestExpr>
+    matchTestExpr;
+
+/// Matches pattern conditions (P2688), a C++29 feature.
+///
+/// Given
+/// \code
+///   bool f(int x) { return match(x, case 1); }
+///   int g(int x) { if (case auto y = x) return y; return 0; }
+/// \endcode
+/// caseConditionExpr()
+///   matches 'case auto y = x'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, CaseConditionExpr>
+    caseConditionExpr;
+
+/// Matches do_return statements (P2806), a C++29 feature.
+///
+/// Given
+/// \code
+///   int x = do { do_return 1; };
+/// \endcode
+/// doReturnStmt()
+///   matches 'do_return 1'
+extern const internal::VariadicDynCastAllOfMatcher<Stmt, DoReturnStmt>
+    doReturnStmt;
+
 /// Matches goto statements.
 ///
 /// Given
@@ -5787,7 +5933,8 @@ AST_POLYMORPHIC_MATCHER(isConsteval,
 AST_POLYMORPHIC_MATCHER(isConstexpr,
                         AST_POLYMORPHIC_SUPPORTED_TYPES(VarDecl,
                                                         FunctionDecl,
-                                                        IfStmt)) {
+                                                        IfStmt,
+                                                        MatchSelectExpr)) {
   return Node.isConstexpr();
 }
 
@@ -8412,6 +8559,81 @@ AST_MATCHER_P(Decl, hasAttr, attr::Kind, AttrKind) {
   return false;
 }
 
+/// Matches the operand of a do_return statement
+///
+/// Given
+/// \code
+///   int x = do { do_return a + b; };
+/// \endcode
+/// doReturnStmt(hasDoReturnValue(binaryOperator()))
+///   matches 'do_return a + b'
+/// with binaryOperator()
+///   matching 'a + b'
+AST_MATCHER_P(DoReturnStmt, hasDoReturnValue, internal::Matcher<Expr>,
+              InnerMatcher) {
+  if (const auto *Operand = Node.getOperand())
+    return InnerMatcher.matches(*Operand, Finder, Builder);
+  return false;
+}
+
+/// Matches a match selection or a match test whose subject (as written)
+/// matches \c InnerMatcher.
+///
+/// Given
+/// \code
+///   int f(int a) { return match (a + 1) { case _ => 0; }; }
+/// \endcode
+/// matchSelectExpr(hasMatchSubject(binaryOperator()))
+///   matches the match selection.
+AST_POLYMORPHIC_MATCHER_P(hasMatchSubject,
+                          AST_POLYMORPHIC_SUPPORTED_TYPES(MatchSelectExpr,
+                                                          MatchTestExpr),
+                          internal::Matcher<Expr>, InnerMatcher) {
+  const Expr *Subject = Node.getSubject();
+  if (const VarDecl *Holding = Node.getHoldingVar())
+    if (const Expr *Init = Holding->getInit())
+      Subject = Init;
+  return Subject &&
+         InnerMatcher.matches(*Subject->IgnoreImplicit(), Finder, Builder);
+}
+
+/// Matches a match selection with a case whose handler matches
+/// \c InnerMatcher.
+///
+/// Given
+/// \code
+///   int f(int x) { return match (x) { case 0 => 1; case _ => x + 2; }; }
+/// \endcode
+/// matchSelectExpr(hasCaseHandler(binaryOperator()))
+///   matches the match selection.
+AST_MATCHER_P(MatchSelectExpr, hasCaseHandler, internal::Matcher<Stmt>,
+              InnerMatcher) {
+  return llvm::any_of(Node.getCases(), [&](const MatchCase &Case) {
+    return Case.Handler && InnerMatcher.matches(*Case.Handler, Finder, Builder);
+  });
+}
+
+/// Matches variables declared by a pattern (P2688), a C++29 feature.
+///
+/// Given
+/// \code
+///   int f(int x) { return match (x) { case auto y => y; }; }
+/// \endcode
+/// varDecl(isPatternVariable())
+///   matches 'auto y' in the pattern.
+AST_MATCHER(VarDecl, isPatternVariable) { return Node.isPatternVariable(); }
+
+/// Matches a do expression that spells its result type.
+///
+/// Given
+/// \code
+///   int a = do -> int { do_return 1; };
+///   int b = do { do_return 2; };
+/// \endcode
+/// doExpr(hasExplicitResultType())
+///   matches the first do expression only
+AST_MATCHER(DoExpr, hasExplicitResultType) { return Node.hasExplicitType(); }
+
 /// Matches the return value expression of a return statement
 ///
 /// Given
@@ -8504,9 +8726,10 @@ AST_MATCHER_P(BindingDecl, forDecomposition, internal::Matcher<ValueDecl>,
 /// matches the decomposition decl with 'f' bound to "fBinding".
 AST_MATCHER_P2(DecompositionDecl, hasBinding, unsigned, N,
                internal::Matcher<BindingDecl>, InnerMatcher) {
-  if (Node.bindings().size() <= N)
+  auto Bindings = Node.source_leaf_bindings();
+  if (Bindings.size() <= N)
     return false;
-  return InnerMatcher.matches(*Node.bindings()[N], Finder, Builder);
+  return InnerMatcher.matches(*Bindings[N], Finder, Builder);
 }
 
 /// Matches any binding of a DecompositionDecl.
@@ -8528,7 +8751,7 @@ AST_MATCHER_P2(DecompositionDecl, hasBinding, unsigned, N,
 /// matches the decomposition decl with 'f' bound to "fBinding".
 AST_MATCHER_P(DecompositionDecl, hasAnyBinding, internal::Matcher<BindingDecl>,
               InnerMatcher) {
-  return llvm::any_of(Node.bindings(), [&](const auto *Binding) {
+  return llvm::any_of(Node.source_leaf_bindings(), [&](const auto *Binding) {
     return InnerMatcher.matches(*Binding, Finder, Builder);
   });
 }

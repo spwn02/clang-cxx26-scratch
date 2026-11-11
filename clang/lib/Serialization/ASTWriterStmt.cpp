@@ -17,7 +17,9 @@
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/ExprOpenMP.h"
+#include "clang/AST/MatchPattern.h"
 #include "clang/AST/StmtVisitor.h"
+#include "clang/Basic/DiagnosticSerialization.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ASTRecordWriter.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
@@ -454,6 +456,13 @@ void ASTStmtWriter::VisitCoreturnStmt(CoreturnStmt *S) {
   Code = serialization::STMT_CORETURN;
 }
 
+void ASTStmtWriter::VisitDoReturnStmt(DoReturnStmt *S) {
+  VisitStmt(S);
+  Record.AddSourceLocation(S->getKeywordLoc());
+  Record.AddStmt(S->getOperand());
+  Code = serialization::STMT_DO_RETURN;
+}
+
 void ASTStmtWriter::VisitCoroutineSuspendExpr(CoroutineSuspendExpr *E) {
   VisitExpr(E);
   Record.AddSourceLocation(E->getKeywordLoc());
@@ -489,10 +498,43 @@ void ASTStmtWriter::VisitCXXReflectExpr(CXXReflectExpr *E) {
   if (E->hasDependentSubExpr()) {
     Record.AddStmt(E->getDependentSubExpr());
   } else {
+    // FIXME: Identifier reflections currently round-trip through PCH/modules
+    // as a Null reflection (see PropertiesBase.td). Implement proper
+    // serialization when this becomes load-bearing.
     Record.AddAPValue(E->getReflection());
     Record.AddSourceRange(E->getOperandRange());
   }
   Code = serialization::EXPR_REFLECT;
+}
+
+void ASTStmtWriter::VisitCXXTokenSequenceExpr(CXXTokenSequenceExpr *E) {
+  VisitExpr(E);
+  Record.writeUInt32(E->getNumInterpolationExprs());
+  Record.AddSourceLocation(E->getOperatorLoc());
+  // The token array is written by the TokenSequence case of PropertiesBase.td.
+  // An annotation token that carries anything other than a type, a template
+  // name or an expression cannot be written: it is read back as tok::unknown.
+  if (E->getValue().isTokenSequence())
+    for (const Token &T : E->getValue().getTokenSequence())
+      if (T.isAnnotation() &&
+          !T.isOneOf(tok::annot_typename, tok::annot_template_name,
+                     tok::annot_primary_expr, tok::annot_token_seq_expr,
+                     tok::annot_splice)) {
+        Record.getASTContext().getDiagnostics().Report(
+            E->getBeginLoc(), diag::warn_token_sequence_not_serialized);
+        break;
+      }
+  Record.AddAPValue(E->getValue());
+  // The tokens that name a template or macro parameter, by index.
+  Record.writeUInt32(E->getParamBindings().size());
+  for (const TokenSequenceParamBinding &B : E->getParamBindings()) {
+    Record.writeUInt32(B.TokenIndex);
+    Record.AddDeclRef(B.Param);
+  }
+  for (Stmt *S : E->children())
+    Record.AddStmt(S);
+  Record.AddSourceRange(E->getOperandRange());
+  Code = serialization::EXPR_TOKEN_SEQUENCE;
 }
 
 void ASTStmtWriter::VisitCXXMetafunctionExpr(CXXMetafunctionExpr *E) {
@@ -509,6 +551,118 @@ void ASTStmtWriter::VisitCXXMetafunctionExpr(CXXMetafunctionExpr *E) {
   }
 
   Code = serialization::EXPR_METAFUNCTION;
+}
+
+void ASTStmtWriter::VisitCXXBuiltinInjectExpr(CXXBuiltinInjectExpr *E) {
+  VisitExpr(E);
+  Record.AddSourceLocation(E->getKwLoc());
+  Record.AddSourceLocation(E->getLParenLoc());
+  Record.AddSourceLocation(E->getRParenLoc());
+  Record.push_back(E->hasTargetNS());
+  Record.AddStmt(E->getOperand());
+  if (E->hasTargetNS())
+    Record.AddStmt(E->getTargetNS());
+  Code = serialization::EXPR_BUILTIN_INJECT;
+}
+
+void ASTStmtWriter::VisitCXXTokenInterpolationListExpr(
+    CXXTokenInterpolationListExpr *E) {
+  llvm_unreachable("token interpolation lists are not serialized");
+}
+
+void ASTStmtWriter::VisitCXXBuiltinReportTokensExpr(
+    CXXBuiltinReportTokensExpr *E) {
+  VisitExpr(E);
+  Record.AddSourceLocation(E->getKwLoc());
+  Record.AddSourceLocation(E->getLParenLoc());
+  Record.AddSourceLocation(E->getRParenLoc());
+  Record.AddStmt(E->getMessage());
+  Record.AddStmt(E->getMsgSizeCall());
+  Record.AddStmt(E->getMsgDataCall());
+  Record.AddStmt(E->getOperand());
+  Code = serialization::EXPR_BUILTIN_REPORT_TOKENS;
+}
+
+void ASTStmtWriter::VisitCXXBuiltinIdExpr(CXXBuiltinIdExpr *E) {
+  VisitExpr(E);
+  Record.push_back(E->getNumArgs());
+  Record.AddSourceLocation(E->getKwLoc());
+  Record.AddSourceLocation(E->getLParenLoc());
+  Record.AddSourceLocation(E->getRParenLoc());
+  // Per arg: original, then nullable (size, data) calls.
+  for (unsigned I = 0; I < E->getNumArgs(); ++I) {
+    Record.AddStmt(E->getArg(I));
+    Record.AddStmt(E->getSizeCall(I));
+    Record.AddStmt(E->getDataCall(I));
+  }
+  Code = serialization::EXPR_BUILTIN_ID;
+}
+
+void ASTStmtWriter::VisitCXXBuiltinStrLiteralExpr(CXXBuiltinStrLiteralExpr *E) {
+  VisitExpr(E);
+  Record.push_back(E->getNumArgs());
+  Record.AddSourceLocation(E->getKwLoc());
+  Record.AddSourceLocation(E->getLParenLoc());
+  Record.AddSourceLocation(E->getRParenLoc());
+  for (unsigned I = 0; I < E->getNumArgs(); ++I) {
+    Record.AddStmt(E->getArg(I));
+    Record.AddStmt(E->getSizeCall(I));
+    Record.AddStmt(E->getDataCall(I));
+  }
+  Code = serialization::EXPR_BUILTIN_STR_LITERAL;
+}
+
+void ASTStmtWriter::VisitCXXBuiltinTokenizeExpr(CXXBuiltinTokenizeExpr *E) {
+  VisitExpr(E);
+  Record.push_back(E->getNumArgs());
+  Record.AddSourceLocation(E->getKwLoc());
+  Record.AddSourceLocation(E->getLParenLoc());
+  Record.AddSourceLocation(E->getRParenLoc());
+  for (unsigned I = 0; I < E->getNumArgs(); ++I) {
+    Record.AddStmt(E->getArg(I));
+    Record.AddStmt(E->getSizeCall(I));
+    Record.AddStmt(E->getDataCall(I));
+  }
+  Code = serialization::EXPR_BUILTIN_TOKENIZE;
+}
+
+void ASTStmtWriter::VisitCXXMacroInvocationExpr(CXXMacroInvocationExpr *E) {
+  VisitExpr(E);
+  Record.push_back(E->getNumArgs());
+  Record.push_back(E->isArrow());
+  Record.push_back(E->areArgsUnparsed());
+  Record.AddDeclarationNameInfo(E->getMemberNameInfo());
+  Record.AddSourceLocation(E->getOperatorLoc());
+  Record.AddSourceLocation(E->getExclaimLoc());
+  Record.AddSourceLocation(E->getLParenLoc());
+  Record.AddSourceLocation(E->getRParenLoc());
+  // The environment the unparsed arguments are parsed in at instantiation: the
+  // context the invocation was written in, the template parameters in scope
+  // there, and the explicit template arguments of a member invocation.
+  Record.AddDeclRef(E->getUnparsedContext()
+                        ? Decl::castFromDeclContext(E->getUnparsedContext())
+                        : nullptr);
+  Record.push_back(E->getUnparsedTemplateParams().size());
+  for (NamedDecl *P : E->getUnparsedTemplateParams())
+    Record.AddDeclRef(P);
+  Record.push_back(E->getMemberTemplateArgs() != nullptr);
+  if (E->getMemberTemplateArgs())
+    Record.AddASTTemplateArgumentListInfo(E->getMemberTemplateArgs());
+  Record.AddStmt(E->getCallee());
+  Record.AddStmt(E->getBase());
+  Record.AddStmt(E->getExpansion());
+  for (Expr *Arg : E->getArgs())
+    Record.AddStmt(Arg);
+  Code = serialization::EXPR_MACRO_INVOCATION;
+}
+
+void ASTStmtWriter::VisitCXXBuiltinStringizeExpr(CXXBuiltinStringizeExpr *E) {
+  VisitExpr(E);
+  Record.AddSourceLocation(E->getKwLoc());
+  Record.AddSourceLocation(E->getLParenLoc());
+  Record.AddSourceLocation(E->getRParenLoc());
+  Record.AddStmt(E->getOperand());
+  Code = serialization::EXPR_BUILTIN_STRINGIZE;
 }
 
 void ASTStmtWriter::VisitCXXSpliceExpr(CXXSpliceExpr *E) {
@@ -760,6 +914,7 @@ void ASTStmtWriter::VisitRequiresExpr(RequiresExpr *E) {
         Record.AddStmt(cast<Expr *>(ExprReq->Value));
       if (ExprReq->getKind() == concepts::Requirement::RK_Compound) {
         Record.AddSourceLocation(ExprReq->NoexceptLoc);
+        Record.AddStmt(ExprReq->NoexceptCondition);
         const auto &RetReq = ExprReq->getReturnTypeRequirement();
         if (RetReq.isSubstitutionFailure()) {
           Record.push_back(2);
@@ -1556,6 +1711,21 @@ void ASTStmtWriter::VisitStmtExpr(StmtExpr *E) {
   Record.AddSourceLocation(E->getRParenLoc());
   Record.push_back(E->getTemplateDepth());
   Code = serialization::EXPR_STMT;
+}
+
+void ASTStmtWriter::VisitDoExpr(DoExpr *E) {
+  VisitExpr(E);
+  Record.AddStmt(E->getInitStmt());
+  Record.AddStmt(E->getBody());
+  Record.AddSourceLocation(E->getDoLoc());
+  Record.AddSourceLocation(E->getLBraceLoc());
+  Record.AddSourceLocation(E->getRBraceLoc());
+  Record.push_back(E->hasExplicitType());
+  if (E->hasExplicitType())
+    Record.AddTypeSourceInfo(E->getExplicitType());
+  Record.push_back(E->getTemplateDepth());
+  Record.AddDeclRef(E->getNRVOCandidate());
+  Code = serialization::EXPR_DO;
 }
 
 void ASTStmtWriter::VisitChooseExpr(ChooseExpr *E) {
@@ -2574,6 +2744,283 @@ void ASTStmtWriter::VisitOpaqueValueExpr(OpaqueValueExpr *E) {
   Record.AddSourceLocation(E->getLocation());
   Record.push_back(E->isUnique());
   Code = serialization::EXPR_OPAQUE_VALUE;
+}
+
+//===----------------------------------------------------------------------===//
+// Pattern Matching
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// Writes the pattern-matching structures that hang off a MatchTestExpr or a
+/// MatchSelectExpr. Patterns, pattern instantiations and projections are
+/// shared inside one expression (a MatchPatternInfo is found by the identity of
+/// its pattern), so each is written once and later references use its index.
+/// Indices are assigned after the contents are written (children first); the
+/// reader assigns them in the same order. Expressions are queued with AddStmt
+/// and read back in the same order with readSubStmt/readSubExpr.
+class MatchWriter {
+  ASTRecordWriter &R;
+  llvm::DenseMap<const MatchPattern *, unsigned> Patterns;
+  llvm::DenseMap<const MatchPatternInstantiation *, unsigned> Instantiations;
+  llvm::DenseMap<const MatchProjection *, unsigned> Projections;
+
+public:
+  explicit MatchWriter(ASTRecordWriter &R) : R(R) {}
+
+  void guard(const MatchGuard &G) {
+    R.AddStmt(G.Init);
+    R.AddDeclRef(G.ConditionVariable);
+    R.AddStmt(G.Condition);
+  }
+
+  void patternList(ArrayRef<MatchPattern *> List) {
+    R.push_back(List.size());
+    for (const MatchPattern *P : List)
+      pattern(P);
+  }
+
+  void pattern(const MatchPattern *P) {
+    if (!P) {
+      R.push_back(0);
+      return;
+    }
+    if (auto It = Patterns.find(P); It != Patterns.end()) {
+      R.push_back(1);
+      R.push_back(It->second);
+      return;
+    }
+    R.push_back(2 + P->getMatchPatternClass());
+    R.push_back(static_cast<unsigned>(P->getDependence()));
+    switch (P->getMatchPatternClass()) {
+    case MatchPattern::WildcardPatternClass: {
+      auto *W = cast<WildcardPattern>(P);
+      R.AddSourceLocation(W->getBeginLoc());
+      R.push_back(W->isPackExpansion());
+      break;
+    }
+    case MatchPattern::ExpressionPatternClass: {
+      auto *X = cast<ExpressionPattern>(P);
+      R.AddStmt(const_cast<Expr *>(X->getExpr()));
+      R.push_back(X->isPackExpansion());
+      break;
+    }
+    case MatchPattern::ParenPatternClass: {
+      auto *Paren = cast<ParenPattern>(P);
+      R.AddSourceRange(Paren->getParens());
+      pattern(Paren->getSubPattern());
+      break;
+    }
+    case MatchPattern::DeclarationPatternClass: {
+      auto *D = cast<DeclarationPattern>(P);
+      R.AddDeclRef(D->getDeclaration());
+      R.AddDeclRef(D->getPackSourceDeclaration());
+      R.AddSourceRange(SourceRange(D->getBeginLoc(), D->getEndLoc()));
+      break;
+    }
+    case MatchPattern::TypePatternClass:
+      R.AddTypeSourceInfo(cast<TypePattern>(P)->getTypeSourceInfo());
+      break;
+    case MatchPattern::OrPatternClass: {
+      auto *O = cast<OrPattern>(P);
+      patternList(O->alternatives());
+      R.push_back(O->orLocations().size());
+      for (SourceLocation Loc : O->orLocations())
+        R.AddSourceLocation(Loc);
+      R.push_back(O->bindings().size());
+      for (VarDecl *D : O->bindings())
+        R.AddDeclRef(D);
+      break;
+    }
+    case MatchPattern::AlternativePatternClass: {
+      auto *A = cast<AlternativePattern>(P);
+      R.push_back(A->getAlternativeKind());
+      R.AddSourceRange(A->getDiscriminatorRange());
+      R.AddSourceRange(A->getBraces());
+      R.AddIdentifierRef(A->getName());
+      pattern(A->getSelector());
+      R.push_back(A->getTypeConstraintSelector() != nullptr);
+      if (A->getTypeConstraintSelector())
+        R.AddConceptReference(A->getTypeConstraintSelector());
+      R.AddSourceLocation(A->getColonLoc());
+      pattern(A->getSubPattern());
+      break;
+    }
+    case MatchPattern::DecompositionPatternClass: {
+      auto *D = cast<DecompositionPattern>(P);
+      patternList(D->patterns());
+      R.AddSourceRange(D->getSquares());
+      break;
+    }
+    }
+    unsigned ID = Patterns.size();
+    Patterns[P] = ID;
+  }
+
+  void projection(const MatchProjection *M) {
+    if (!M) {
+      R.push_back(0);
+      return;
+    }
+    if (auto It = Projections.find(M); It != Projections.end()) {
+      R.push_back(1);
+      R.push_back(It->second);
+      return;
+    }
+    R.push_back(2);
+    R.push_back(M->getKind());
+    R.AddDeclRef(M->getHoldingVar());
+    R.AddDeclRef(M->getIntermediateVar());
+    R.AddDeclRef(M->getConditionVar());
+    R.AddDeclRef(M->getProjectedVar());
+    R.AddDeclRef(M->getDecomposedDecl());
+    R.AddStmt(M->getConditionExpr());
+    R.AddStmt(M->getProjectedExpr());
+    unsigned ID = Projections.size();
+    Projections[M] = ID;
+  }
+
+  template <class T> void bytes(ArrayRef<T> Values) {
+    R.push_back(Values.size());
+    for (T V : Values)
+      R.push_back(V);
+  }
+
+  void info(const MatchPatternInfo &I) {
+    pattern(I.Pattern);
+    R.AddStmt(I.Condition);
+    projection(I.Projection);
+    R.AddTypeRef(I.CheckedSubjectType);
+    R.AddTypeRef(I.AlternativeTraitsType);
+    R.push_back(I.AlternativeTypes.size());
+    for (QualType T : I.AlternativeTypes)
+      R.AddTypeRef(T);
+    bytes(I.ProjectableAlternatives);
+    bytes(I.EmptyAlternatives);
+    R.push_back(I.AlternativeValues.size());
+    for (Expr *E : I.AlternativeValues)
+      R.AddStmt(E);
+    bytes(I.SelectedAlternatives);
+    bytes(I.ViableOrAlternatives);
+    patternList(I.ExpandedPatterns);
+    R.AddTypeRef(I.OpenAlternativeType);
+    unsigned Flags = 0;
+    Flags |= I.IsExhaustive << 0;
+    Flags |= I.HasParameterizedIndexName << 1;
+    Flags |= I.IsAlternativeValuePattern << 2;
+    Flags |= I.IsOpenAlternative << 3;
+    Flags |= I.IsOpenAlternativeInitialization << 4;
+    Flags |= I.TypePatternResolved << 5;
+    Flags |= I.TypePatternMatches << 6;
+    Flags |= I.HasExpandedPatterns << 7;
+    R.push_back(Flags);
+  }
+
+  void instantiation(const MatchPatternInstantiation *I) {
+    if (!I) {
+      R.push_back(0);
+      return;
+    }
+    if (auto It = Instantiations.find(I); It != Instantiations.end()) {
+      R.push_back(1);
+      R.push_back(It->second);
+      return;
+    }
+    R.push_back(2);
+    pattern(I->getPattern());
+    R.push_back(I->infos().size());
+    for (const MatchPatternInfo &Info : I->infos())
+      info(Info);
+    unsigned ID = Instantiations.size();
+    Instantiations[I] = ID;
+  }
+
+  void testInstantiation(const MatchTestInstantiation &T) {
+    pattern(T.Pattern);
+    R.AddSourceLocation(T.IfLoc);
+    guard(T.Guard);
+    instantiation(T.PatternInstantiation);
+    R.push_back(T.PatternIsIrrefutable);
+    R.AddStmt(T.Condition);
+    R.AddStmt(T.Handler);
+    R.AddStmt(T.Increment);
+  }
+
+  void caseCommon(MatchPattern *Pattern, SourceLocation IfLoc,
+                  const MatchGuard &Guard, Stmt *Handler) {
+    pattern(Pattern);
+    R.AddSourceLocation(IfLoc);
+    guard(Guard);
+    R.AddStmt(Handler);
+  }
+
+  void caseTail(const MatchPatternInstantiation *PI,
+                ArrayRef<const Attr *> Attrs, SourceLocation NotReturnLoc) {
+    instantiation(PI);
+    R.AddAttributes(Attrs);
+    R.AddSourceLocation(NotReturnLoc);
+  }
+};
+} // namespace
+
+void ASTStmtWriter::VisitMatchTestExpr(MatchTestExpr *E) {
+  VisitExpr(E);
+  MatchWriter W(Record);
+  Record.AddDeclRef(E->getHoldingVar());
+  Record.AddStmt(E->getSubject());
+  Record.AddSourceLocation(E->getMatchLoc());
+  Record.AddSourceLocation(E->getRParenLoc());
+  W.pattern(E->getPattern());
+  W.instantiation(E->getPatternInstantiation());
+  Record.AddSourceLocation(E->getIfLoc());
+  W.guard(E->getGuard());
+  Record.push_back(E->getInstantiations().size());
+  for (const MatchTestInstantiation &I : E->getInstantiations())
+    W.testInstantiation(I);
+  Record.push_back(E->isPatternIrrefutable());
+  Record.push_back(E->needsCaseInstantiation());
+  Record.push_back(E->hasSemanticInstantiations());
+  Record.push_back(E->hasSubjectProduct());
+  Code = serialization::EXPR_MATCH_TEST;
+}
+
+void ASTStmtWriter::VisitCaseConditionExpr(CaseConditionExpr *E) {
+  VisitMatchTestExpr(E);
+  Code = serialization::EXPR_CASE_CONDITION;
+}
+
+void ASTStmtWriter::VisitMatchSelectExpr(MatchSelectExpr *E) {
+  VisitExpr(E);
+  MatchWriter W(Record);
+  Record.push_back(E->getNumPreambleStatements());
+  Record.push_back(E->getNumCases());
+  Record.push_back(E->getNumCaseInstantiations());
+  Record.AddStmt(E->getInitStmt());
+  Record.AddDeclRef(E->getHoldingVar());
+  Record.AddStmt(E->getSubject());
+  Record.AddSourceLocation(E->getMatchLoc());
+  Record.push_back(E->isConstexpr());
+  Record.push_back(E->isFullyCovered());
+  Record.push_back(E->isStatement());
+  Record.push_back(E->hasSubjectProduct());
+  Record.push_back(E->getOrigResultType().isNull() ? 0 : 1);
+  if (!E->getOrigResultType().isNull()) {
+    Record.AddTypeRef(E->getOrigResultType().getType());
+    Record.AddTypeLoc(E->getOrigResultType());
+  }
+  Record.AddSourceRange(E->getBraces());
+  for (Stmt *S : E->getPreamble())
+    Record.AddStmt(S);
+  for (const MatchCase &C : E->getCases()) {
+    W.caseCommon(C.Pattern, C.IfLoc, C.Guard, C.Handler);
+    Record.push_back(C.MaybeUseful);
+    W.caseTail(C.PatternInstantiation, C.Attributes, C.NotReturnLoc);
+  }
+  for (const MatchCaseInstantiation &C : E->getCaseInstantiations()) {
+    W.caseCommon(C.Pattern, C.IfLoc, C.Guard, C.Handler);
+    Record.push_back(C.CaseIndex);
+    W.caseTail(C.PatternInstantiation, C.Attributes, C.NotReturnLoc);
+  }
+  Code = serialization::EXPR_MATCH_SELECT;
 }
 
 //===----------------------------------------------------------------------===//

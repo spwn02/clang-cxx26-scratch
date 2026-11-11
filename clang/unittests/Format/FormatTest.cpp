@@ -23301,6 +23301,164 @@ TEST_F(FormatTest, FormatsWithWebKitStyle) {
                Style);
 }
 
+TEST_F(FormatTest, FormatsMatchSelections) {
+  // P2688 pattern matching: `match` selections, tests and pattern conditions.
+  verifyFormat("int f(int x) {\n"
+               "  return match (x) {\n"
+               "    case 0 => 10;\n"
+               "    case 1 || 2 => 20;\n"
+               "    case auto y if (y > 5) => y;\n"
+               "    case [auto a, auto b] => a + b;\n"
+               "    case {auto &&alt} => 1;\n"
+               "    case _ => -1;\n"
+               "  };\n"
+               "}");
+  verifyFormat("void f(int x) {\n"
+               "  match (x) {\n"
+               "    case 0 => {\n"
+               "      run();\n"
+               "    }\n"
+               "    case _ =>;\n"
+               "  }\n"
+               "}");
+  verifyFormat("auto r = match constexpr (x) -> int {\n"
+               "  case 0 => 1;\n"
+               "  case _ => 2;\n"
+               "};");
+  verifyFormat("auto z = match (x) -> std::pair<int, int> {\n"
+               "  case 0 => {1, 2};\n"
+               "  case _ => std::pair{3, 4};\n"
+               "};");
+  verifyFormat("bool t = match (x, case 1 || 2);");
+  verifyFormat("if (case [0, auto b] = p)\n"
+               "  return b;");
+  verifyFormat("while (case {auto &&n} = next())\n"
+               "  process(n);");
+  // `match` is an ordinary identifier elsewhere.
+  verifyFormat("void match(int x) { other(x); }");
+  verifyFormat("int r = match(3);");
+  verifyFormat("match(3);");
+  verifyFormat("struct S {\n"
+               "  match(int x) {}\n"
+               "};");
+  // A switch nested in a handler keeps its colons.
+  verifyFormat("int f(int x) {\n"
+               "  return match (x) {\n"
+               "    case 0 =>\n"
+               "      do {\n"
+               "        switch (x) {\n"
+               "        case 1:\n"
+               "          do_return 2;\n"
+               "        }\n"
+               "        do_return 3;\n"
+               "      };\n"
+               "    case _ => 4;\n"
+               "  };\n"
+               "}");
+}
+
+TEST_F(FormatTest, FormatsDoExpressions) {
+  // P2806 do expressions: `do` in operand position is not a do-while.
+  verifyFormat("int x = do {\n"
+               "  if (b)\n"
+               "    do_return 1;\n"
+               "  do_return 2;\n"
+               "};");
+  verifyFormat("int x = do { do_return 1; };");
+  verifyFormat("int y = do [k = 1] -> int { do_return k + 1; };");
+  verifyFormat("int y = do -> int { do_return 1; };");
+  verifyFormat("return do { do_return 0; };");
+  // The expression goes on after the closing brace.
+  verifyFormat("int z = do {\n"
+               "  int t = do { do_return 5; };\n"
+               "  do_return t * 2;\n"
+               "} + 1;");
+  verifyFormat("int d = 1 + do { do_return 2; } * 3;");
+  verifyFormat("int c = foo(do { do_return 1; }, do [x = 2] -> int { do_return x; });");
+  verifyFormat("int a = b ? do { do_return 1; } : do { do_return 2; };");
+  // A comment between the keyword and the body does not change the layout (the
+  // line parser and the annotator must agree on what the brace opens).
+  verifyFormat("int e = do /*c*/ { do_return 1; };");
+  verifyFormat("if (do { do_return b; })\n"
+               "  return 0;");
+  verifyFormat("for (int i = 0; i < 3; ++i)\n"
+               "  x += do { do_return i; };");
+  // Real do-while statements are unaffected, also as the body of a statement.
+  verifyFormat("do {\n"
+               "  n++;\n"
+               "} while (n < 10);");
+  verifyFormat("if (b)\n"
+               "  do {\n"
+               "    --n;\n"
+               "  } while (n > 0);\n"
+               "else\n"
+               "  do {\n"
+               "    ++n;\n"
+               "  } while (n < 5);");
+  verifyFormat("void f() {\n"
+               "label:\n"
+               "  do {\n"
+               "    n--;\n"
+               "  } while (n);\n"
+               "}");
+  // Idempotent on already wrapped long captures.
+  verifyFormat("auto very_long_variable_name =\n"
+               "    do [captured_value = compute(first_argument, second_argument)]\n"
+               "    -> long { do_return captured_value + 1; };",
+               getLLVMStyleWithColumns(80));
+}
+
+TEST_F(FormatTest, FormatsDoReturn) {
+  // Inside a do expression do_return is a keyword: unary operators and
+  // parentheses after it are formatted like after return.
+  verifyFormat("int a = do { do_return -x; };");
+  verifyFormat("int b = do { do_return +x; };");
+  verifyFormat("int c = do { do_return *p; };");
+  verifyFormat("int d = do { do_return &x != nullptr; };");
+  verifyFormat("int e = do { do_return (x); };");
+  verifyFormat("int g = do { do_return ~x + 1; };");
+  verifyFormat("int h = do {\n"
+               "  if (b)\n"
+               "    do_return -1;\n"
+               "  do_return !b;\n"
+               "};");
+  // Elsewhere it is an ordinary identifier.
+  verifyFormat("int do_return(int x);");
+  verifyFormat("void f() { do_return(x); }");
+  verifyFormat("void f() { do_return - x; }");
+}
+
+TEST_F(FormatTest, BreaksBeforeDoExpressionBody) {
+  FormatStyle Style = getLLVMStyle();
+  Style.BreakBeforeBraces = FormatStyle::BS_Custom;
+  Style.BraceWrapping.BeforeDoExpressionBody = true;
+  verifyFormat("int x = do\n"
+               "{\n"
+               "  if (b)\n"
+               "    do_return 1;\n"
+               "  do_return 2;\n"
+               "};",
+               Style);
+  verifyFormat("int y = do [k = 1] -> int\n"
+               "{\n"
+               "  do_return k;\n"
+               "};",
+               Style);
+  verifyFormat("int z = do\n"
+               "{\n"
+               "  do_return 3;\n"
+               "} + 1;",
+               Style);
+  // A do-while statement is not affected.
+  verifyFormat("do {\n"
+               "  n++;\n"
+               "} while (n < 10);",
+               Style);
+  // Off by default.
+  EXPECT_FALSE(getLLVMStyle().BraceWrapping.BeforeDoExpressionBody);
+  verifyFormat("int x = do { do_return 1; };");
+}
+
 TEST_F(FormatTest, FormatsLambdas) {
   verifyFormat("int c = [b]() mutable { return [&b] { return b++; }(); }();");
   verifyFormat(
@@ -29058,6 +29216,37 @@ TEST_F(FormatTest, UnbalancedAngleBrackets) {
 
   verifyNoCrash("typename foo<bar>::value, const String &>::type f();",
                 getLLVMStyleWithColumns(50));
+}
+
+} // namespace
+} // namespace test
+} // namespace format
+} // namespace clang
+
+namespace clang {
+namespace format {
+namespace test {
+namespace {
+
+// P4380: token sequence literals and expression macro invocations.
+TEST_F(FormatTest, TokenSequenceLiteralsAreKeptAsWritten) {
+  // A literal is one token: its spacing is part of its value. (verifyNoChange:
+  // verifyFormat would first mess up the whitespace between '^^' and '{'.)
+  verifyNoChange("auto t = ^^{ int x=\\(n)+1; return   x; };");
+  verifyNoChange("auto t = ^^{ a b { c } \"str { }\" '}' /* } */ d };");
+  verifyNoChange("auto t = ^^{ int\n  x = \\(n);\n};");
+  // Code around it is still formatted.
+  verifyFormat("auto f(int n) {\n  auto t = ^^{ x   +   y };\n  return t;\n}",
+               "auto f(int n){auto t = ^^{ x   +   y };return t;}");
+  // Two carets that are not a literal are ordinary operators.
+  verifyFormat("int a = b ^ ^c;");
+}
+
+TEST_F(FormatTest, ExpressionMacroInvocations) {
+  verifyFormat("int h() { return add!(1, 2) + add!{3, 4}; }");
+  verifyFormat("auto x = ns::f<int>!(a, b);");
+  verifyFormat("bool b = a != !c;");
+  verifyFormat("bool b = !c;");
 }
 
 } // namespace
